@@ -1,0 +1,1 @@
+"""Trend opportunity demo application."""

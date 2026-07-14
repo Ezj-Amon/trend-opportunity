@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}趋势面板 · 选品助手{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">TREND → EVIDENCE → OPPORTUNITY</p>
+    <h1>趋势新闻自动选品助手</h1>
+    <p class="muted">同时追踪国内热榜与海外搜索、社区和产品发布信号，生成带 Amazon 站点假设的可验证产品方向。</p>
+  </div>
+  <button id="run-button" class="primary" {% if pipeline_running %}disabled{% endif %}>
+    {% if pipeline_running %}采集中…{% else %}立即运行真实采集{% endif %}
+  </button>
+</section>
+
+<section class="metric-grid">
+  <article class="metric"><span>事件</span><strong>{{ events|length }}</strong></article>
+  <article class="metric"><span>最近运行</span><strong>{{ runs[0].status if runs else '尚未运行' }}</strong></article>
+  <article class="metric"><span>最近实际引擎</span><strong>{{ latest_analysis.engine if latest_analysis else ('LLM 待运行' if settings.openai_api_key else '本地规则基线') }}</strong></article>
+  <article class="metric"><span>飞书</span><strong>{{ '已配置' if settings.feishu_webhook_url else '待配置' }}</strong></article>
+</section>
+
+{% if not settings.openai_api_key %}
+<div class="notice"><strong>当前未配置模型 Key。</strong> 热点和网页证据均为真实数据；产品方向由可审计的 local-rules-v1 生成，并在详情中标为“待验证推断”。</div>
+{% endif %}
+
+<div class="layout">
+  <section class="panel grow">
+    <div class="panel-head"><h2>最新趋势事件</h2><span>{{ events|length }} 条</span></div>
+    <nav class="market-filters" aria-label="市场筛选">
+      {% for market in market_options %}
+      <a href="/?market={{ market }}" class="{{ 'active' if selected_market == market else '' }}">
+        {{ '全部' if market == 'ALL' else market }}
+        {% if market == 'ALL' %}{{ market_counts.values()|sum }}{% else %}{{ market_counts.get(market, 0) }}{% endif %}
+      </a>
+      {% endfor %}
+    </nav>
+    {% if events %}
+    <div class="event-list">
+      {% for event in events %}
+      <a class="event-row" href="/events/{{ event.id }}">
+        <div class="score-ring">{{ '%.0f'|format(event.trend_score) }}</div>
+        <div class="event-main">
+          <div class="event-tags"><span>{{ event.market }}</span><span>{{ event.signal_type }}</span></div>
+          <h3>{{ event.canonical_title }}</h3>
+          <p>{{ event.source_count }} 个来源 · {{ event.member_count }} 条记录 · 最后出现 {{ event.last_seen_at[:16].replace('T',' ') }}</p>
+        </div>
+        <div class="opportunity-mark">
+          {% if event.best_opportunity_score is not none %}
+          <strong>{{ '%.1f'|format(event.best_opportunity_score) }}</strong><span>机会分</span>
+          {% elif event.latest_analysis_engine %}<span>已分析 · 无建议</span>
+          {% else %}<span>待分析</span>{% endif %}
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty"><p>当前筛选下还没有数据。</p><p>点击“立即运行真实采集”，系统会访问已配置的真实公共源。</p></div>
+    {% endif %}
+  </section>
+
+  <aside class="side">
+    <section class="panel">
+      <div class="panel-head"><h2>来源健康</h2></div>
+      {% for source in source_health %}
+      <div class="health-row"><span class="dot {{ 'ok' if source.success else 'bad' }}"></span><span>{{ source.source }} <em>{{ source.market }} · {{ source.signal_type }}</em></span><small>{{ source.latency_ms }} ms</small></div>
+      {% else %}<p class="muted">运行后显示</p>{% endfor %}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>最近运行</h2></div>
+      {% for run in runs %}
+      <div class="run-row"><span class="status {{ run.status }}">{{ run.status }}</span><span>{{ run.items_count }} 条</span><small>{{ run.started_at[:16].replace('T',' ') }}</small></div>
+      {% else %}<p class="muted">暂无</p>{% endfor %}
+    </section>
+  </aside>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  const runButton = document.getElementById('run-button');
+  runButton?.addEventListener('click', async () => {
+    runButton.disabled = true; runButton.textContent = '采集中…';
+    const ok = await postAction('/api/run', '真实采集已启动，稍后自动刷新');
+    if (!ok) { runButton.disabled = false; runButton.textContent = '立即运行真实采集'; return; }
+    setTimeout(() => location.reload(), 6000);
+  });
+</script>
+{% endblock %}

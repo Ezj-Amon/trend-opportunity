@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}趋势选品助手{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">Trend Opportunity Lab</a>
+    <span class="tag">真实数据 · 证据优先</span>
+  </header>
+  <main class="container">{% block content %}{% endblock %}</main>
+  <div id="toast" class="toast" hidden></div>
+  <script>
+    function toast(message, error=false) {
+      const node = document.getElementById('toast');
+      node.textContent = message; node.hidden = false;
+      node.className = error ? 'toast error' : 'toast';
+      setTimeout(() => node.hidden = true, 4000);
+    }
+    async function postAction(url, successMessage) {
+      const token = localStorage.getItem('trendAdminToken');
+      const headers = token ? {'X-Admin-Token': token} : {};
+      const response = await fetch(url, {method: 'POST', headers});
+      let body = {}; try { body = await response.json(); } catch (_) {}
+      if (!response.ok) { toast(body.detail || '操作失败', true); return null; }
+      if (successMessage) toast(successMessage);
+      return body;
+    }
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

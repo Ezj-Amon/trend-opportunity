@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ event.canonical_title }} · 选品助手{% endblock %}
+{% block content %}
+<a class="back" href="/">← 返回趋势面板</a>
+<section class="event-hero">
+  <div><p class="eyebrow">TREND EVENT #{{ event.id }} · {{ event.market }} · {{ event.signal_type }}</p><h1>{{ event.canonical_title }}</h1><p class="muted">语言 {{ event.language }} · 首次 {{ event.first_seen_at[:16].replace('T',' ') }} · 最后 {{ event.last_seen_at[:16].replace('T',' ') }}</p></div>
+  <div class="hero-score"><strong>{{ event.trend_score }}</strong><span>趋势分</span></div>
+</section>
+
+<section class="score-grid">
+  {% for label, value in [('跨源覆盖',event.coverage_score),('榜单排名',event.rank_score),('上升速度',event.velocity_score),('持续性',event.persistence_score),('新鲜度',event.freshness_score)] %}
+  <div><span>{{ label }}</span><strong>{{ value }}</strong><div class="bar"><i style="width:{{ value }}%"></i></div></div>
+  {% endfor %}
+</section>
+
+{% if analysis_output %}<div class="notice"><strong>分析说明：</strong>{{ analysis_output.inference_notice }}{% if analysis %}（{{ analysis.engine }} / {{ analysis.model }}）{% endif %}</div>{% endif %}
+
+<section class="panel">
+  <div class="panel-head"><h2>产品机会</h2><span>人工审核后才能推送</span></div>
+  <div class="cards">
+  {% for item in opportunities %}
+    <article class="opportunity-card">
+      <div class="card-top"><div><span class="status {{ item.review_status }}">{{ item.review_status }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>{{ item.opportunity_score }}</strong><span>机会分</span></div></div>
+      <p><b>目标人群：</b>{{ item.target_segment }}</p>
+      <p><b>场景：</b>{{ item.scenario }}</p>
+      <p><b>JTBD：</b>{{ item.jtbd }}</p>
+      <p><b>方案：</b>{{ item.solution }}</p>
+      <p><b>MVP：</b>{{ item.mvp }}</p>
+      <p><b>目标站点：</b>{{ item.marketplace }} · <b>价格带：</b>{{ item.price_band }}</p>
+      <p><b>验证渠道：</b>{{ item.channels|join('、') }}</p>
+      <div class="chips">{% for pain in item.pain_points %}<span>{{ pain }}</span>{% endfor %}</div>
+      <div class="mini-scores">
+        <span>痛点 {{ item.pain_score }}/5</span><span>意图 {{ item.intent_score }}/5</span><span>人群 {{ item.segment_score }}/5</span><span>时机 {{ item.timing_score }}/5</span><span>可行 {{ item.feasibility_score }}/5</span><span>差异 {{ item.differentiation_score }}/5</span>
+      </div>
+      <p class="confidence">证据置信度 <strong>{{ item.evidence_confidence }}</strong> / 100</p>
+      <details><summary>风险与限制</summary><ul>{% for risk in item.risks %}<li>{{ risk }}</li>{% endfor %}</ul></details>
+      <div class="actions">
+        <button onclick="review({{ item.id }}, 'approved')">通过</button>
+        <button class="ghost" onclick="review({{ item.id }}, 'rejected')">驳回</button>
+        <button class="primary" onclick="pushFeishu({{ item.id }})" {% if not feishu_configured %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送飞书</button>
+      </div>
+    </article>
+  {% else %}<div class="empty">该事件尚未生成机会。</div>{% endfor %}
+  </div>
+</section>
+
+<div class="layout">
+  <section class="panel grow"><div class="panel-head"><h2>真实来源证据</h2><span>{{ evidence|length }} 条</span></div>
+    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">{{ '正文' if item.kind == 'article' else '真实热榜条目' }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>HTTP {{ item.http_status or '未抓正文' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.error %} · 正文抓取：{{ item.error }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
+  </section>
+  <aside class="side"><section class="panel"><div class="panel-head"><h2>聚类成员</h2></div>
+    {% for item in members %}<div class="member"><span>{{ item.source }} #{{ item.rank }} · {{ item.market }} · {{ item.signal_type }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><small>{{ item.match_method }} · {{ '%.2f'|format(item.match_score) }}</small></div>{% endfor %}
+  </section></aside>
+</div>
+{% endblock %}
+{% block scripts %}<script>
+async function review(id, status) { if (await postAction(`/api/opportunities/${id}/review/${status}`, `已${status === 'approved' ? '通过' : '驳回'}`)) setTimeout(()=>location.reload(),500); }
+async function pushFeishu(id) {
+  const result = await postAction(`/api/opportunities/${id}/push`, null);
+  if (!result) return;
+  if (result.status === 'in_progress') toast('飞书推送正在处理中，请稍后确认');
+  else toast(result.status === 'already_sent' ? '此前已推送到飞书' : '已推送到飞书');
+}
+</script>{% endblock %}
