@@ -924,6 +924,25 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
     assert bundle["full_text_count"] == 1
     assert bundle["title_only_count"] == 0
     assert bundle["readiness_status"] == "partial"
+    fallback_candidate = db.one(
+        "SELECT * FROM research_candidates WHERE event_id=? AND status='pending'",
+        (event_id,),
+    )
+    assert fallback_candidate is not None
+    assert fallback_candidate["semantic_feature_id"] is None
+    assert json.loads(fallback_candidate["category_candidates_json"]) == []
+    assert fallback_candidate["engine"] == "deterministic-research-rules"
+    assert fallback_candidate["version"] == "research-candidate-v2"
+    assert "无类目候选" in fallback_candidate["candidate_reason"]
+    fallback_candidate_id = fallback_candidate["id"]
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        research_page = client.get("/research")
+        event_page = client.get(f"/events/{event_id}")
+    assert research_page.status_code == 200
+    assert event_page.status_code == 200
+    assert "尚无可靠类目联想" in research_page.text
+    assert "尚无可靠类目联想" in event_page.text
 
     class MissingModelExtractor:
         def extract(self, _text):
@@ -955,6 +974,10 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
     )
     assert candidate is not None
     assert json.loads(candidate["category_candidates_json"])[0]["category"] == "家居收纳"
+    assert candidate["semantic_feature_id"] is not None
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (fallback_candidate_id,)
+    )["status"] == "superseded"
     assert db.all("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,)) == []
 
 
@@ -1690,7 +1713,7 @@ def test_manual_evidence_api_is_idempotent_rebuilds_bundle_and_blocks_private_ur
     assert credential_url.status_code == 400
 
 
-def test_research_candidate_uses_categories_only_and_blocks_sensitive_events() -> None:
+def test_research_candidate_keeps_research_scope_and_blocks_sensitive_events() -> None:
     bundle = {
         "id": 5,
         "readiness_status": "insufficient",
@@ -1719,12 +1742,70 @@ def test_research_candidate_uses_categories_only_and_blocks_sensitive_events() -
     assert "Amazon" not in dumped and "售价" not in dumped and "商品名" not in dumped
     assert candidate.missing_evidence == bundle["missing_evidence"]
 
+    fallback_bundle = {**bundle, "readiness_status": "partial"}
+    without_embedding = candidate_from_event(
+        {"id": 339, "canonical_title": "持续居住空间变化", "trend_score": 70},
+        fallback_bundle,
+        {"id": 10, "status": "disabled", "category_matches_json": "[]"},
+    )
+    assert without_embedding is not None
+    assert without_embedding.semantic_feature_id is None
+    assert without_embedding.category_candidates == []
+    assert without_embedding.positive_similarity is None
+    assert without_embedding.engine == "deterministic-research-rules"
+    assert "可核查的实体商品类目关联证据" in without_embedding.missing_evidence
+    assert "该事件是否与任何低风险实体消费品类目存在可核查关联？" in (
+        without_embedding.research_questions
+    )
+    fallback_dump = without_embedding.model_dump_json()
+    assert (
+        "Amazon" not in fallback_dump
+        and "售价" not in fallback_dump
+        and "商品名" not in fallback_dump
+    )
+
+    without_feature = candidate_from_event(
+        {"id": 340, "canonical_title": "长期消费者场景变化", "trend_score": 68},
+        fallback_bundle,
+        None,
+    )
+    assert without_feature is not None
+    assert without_feature.semantic_feature_id is None
+
+    title_only_without_embedding = candidate_from_event(
+        {"id": 341, "canonical_title": "只有热榜标题", "trend_score": 90},
+        bundle,
+        {"id": 11, "status": "disabled", "category_matches_json": "[]"},
+    )
+    assert title_only_without_embedding is None
+
     blocked = candidate_from_event(
         {"id": 2, "canonical_title": "枪击事件造成伤亡", "trend_score": 99},
-        bundle,
-        semantic,
+        fallback_bundle,
+        None,
     )
     assert blocked is None
+
+    disaster = candidate_from_event(
+        {"id": 3, "canonical_title": "重庆彭水山体垮塌", "trend_score": 95},
+        fallback_bundle,
+        None,
+    )
+    assert disaster is None
+
+    political_discipline = candidate_from_event(
+        {"id": 4, "canonical_title": "某官员被双开", "trend_score": 94},
+        fallback_bundle,
+        None,
+    )
+    assert political_discipline is None
+
+    crime = candidate_from_event(
+        {"id": 5, "canonical_title": "住户遭遇入室盗窃", "trend_score": 93},
+        fallback_bundle,
+        None,
+    )
+    assert crime is None
 
 
 def test_research_candidate_version_and_bundle_change_supersede_previous(

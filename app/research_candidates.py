@@ -32,7 +32,23 @@ COMMERCIAL_RESEARCH_BLOCKLIST = {
     "坠亡",
     "咬伤",
     "重伤",
+    "山体垮塌",
+    "山体滑坡",
+    "建筑坍塌",
+    "房屋坍塌",
+    "桥梁坍塌",
+    "泥石流",
     "刑事拘留",
+    "被双开",
+    "开除党籍",
+    "开除公职",
+    "严重违纪违法",
+    "审查调查",
+    "入室盗窃",
+    "盗窃案",
+    "抢劫",
+    "绑架",
+    "拐卖",
     "警方通报",
     "公安通报",
     "立案调查",
@@ -85,34 +101,58 @@ def candidate_from_event(
     bundle: dict,
     semantic_feature: dict | None,
     *,
-    version: str = "research-candidate-v1",
+    version: str = "research-candidate-v2",
 ) -> ResearchCandidateDraft | None:
-    if is_commercial_research_blocked(event) or not semantic_feature:
+    if is_commercial_research_blocked(event):
         return None
-    if str(semantic_feature.get("status") or "") != "ready":
+
+    semantic_status = str((semantic_feature or {}).get("status") or "")
+    semantic_ready = semantic_status == "ready"
+    readiness = str(bundle.get("readiness_status") or "insufficient")
+    if not semantic_ready and readiness == "insufficient":
         return None
-    categories = semantic_feature.get("category_matches")
-    if categories is None:
+    categories = (semantic_feature or {}).get("category_matches")
+    if semantic_ready and categories is None:
         try:
-            categories = json.loads(semantic_feature.get("category_matches_json") or "[]")
+            categories = json.loads(
+                (semantic_feature or {}).get("category_matches_json") or "[]"
+            )
         except (TypeError, ValueError, json.JSONDecodeError):
             categories = []
+    if not semantic_ready:
+        categories = []
     normalized_categories = []
     for item in categories or []:
+        if not isinstance(item, dict):
+            continue
         category = str(item.get("category") or "").strip()
         similarity = item.get("similarity")
         if category and similarity is not None:
-            normalized_categories.append(
-                {"category": category, "similarity": round(float(similarity), 4)}
-            )
-    if not normalized_categories:
-        return None
+            try:
+                normalized_categories.append(
+                    {"category": category, "similarity": round(float(similarity), 4)}
+                )
+            except (TypeError, ValueError):
+                continue
 
-    readiness = str(bundle.get("readiness_status") or "insufficient")
-    if readiness == "ready_for_assessment":
-        reason = "证据已达到准备门槛，类目联想值得进行结构化机会判断。"
+    if normalized_categories:
+        if readiness == "ready_for_assessment":
+            reason = "证据已达到准备门槛，类目联想值得进行结构化机会判断。"
+        else:
+            reason = "当前证据不足，但类目联想提供了可核查的补证方向。"
     else:
-        reason = "当前证据不足，但类目联想提供了可核查的补证方向。"
+        semantic_reason = (
+            "当前语义特征没有可靠类目联想"
+            if semantic_ready
+            else "语义类目特征未启用或不可用"
+        )
+        if readiness == "ready_for_assessment":
+            reason = (
+                f"证据已达到准备门槛，但{semantic_reason}；"
+                "先以无类目候选进入人工结构化判断。"
+            )
+        else:
+            reason = f"当前证据不足，且{semantic_reason}；先以无类目候选进入补证队列。"
     questions = [
         "该事件反映的是一次性热点，还是会持续影响消费者行为的变化？",
         "哪些具体用户和使用场景受到该变化影响？",
@@ -122,12 +162,25 @@ def candidate_from_event(
         questions.append(
             f"“{item['category']}”类目是否存在可重复验证的新场景或具体未满足需求？"
         )
-    positive = semantic_feature.get("positive_similarity")
-    negative = semantic_feature.get("negative_similarity")
-    delta = semantic_feature.get("opportunity_similarity")
+    if not normalized_categories:
+        questions.append("该事件是否与任何低风险实体消费品类目存在可核查关联？")
+
+    positive = (
+        (semantic_feature or {}).get("positive_similarity") if semantic_ready else None
+    )
+    negative = (
+        (semantic_feature or {}).get("negative_similarity") if semantic_ready else None
+    )
+    delta = (
+        (semantic_feature or {}).get("opportunity_similarity")
+        if semantic_ready
+        else None
+    )
     if delta is None and positive is not None and negative is not None:
         delta = float(positive) - float(negative)
-    top_similarity = max(float(item["similarity"]) for item in normalized_categories)
+    top_similarity = max(
+        (float(item["similarity"]) for item in normalized_categories), default=0.0
+    )
     trend_component = max(0.0, min(float(event.get("trend_score") or 0), 100.0)) * 0.4
     semantic_component = max(0.0, min(top_similarity, 1.0)) * 35
     evidence_component = {
@@ -136,20 +189,43 @@ def candidate_from_event(
         "insufficient": 6.0,
     }.get(readiness, 0.0)
     delta_component = max(-5.0, min(float(delta or 0) * 20, 5.0))
-    priority = round(max(0.0, min(trend_component + semantic_component + evidence_component + delta_component, 100.0)), 2)
+    priority = round(
+        max(
+            0.0,
+            min(
+                trend_component
+                + semantic_component
+                + evidence_component
+                + delta_component,
+                100.0,
+            ),
+        ),
+        2,
+    )
+    missing_evidence = list(bundle.get("missing_evidence") or [])
+    category_evidence = "可核查的实体商品类目关联证据"
+    if not normalized_categories and category_evidence not in missing_evidence:
+        missing_evidence.append(category_evidence)
+    semantic_feature_id = (semantic_feature or {}).get("id") if semantic_ready else None
     return ResearchCandidateDraft(
         event_id=int(event["id"]),
         evidence_bundle_id=int(bundle["id"]),
-        semantic_feature_id=int(semantic_feature["id"]),
+        semantic_feature_id=(
+            int(semantic_feature_id) if semantic_feature_id is not None else None
+        ),
         candidate_reason=reason,
         category_candidates=normalized_categories[:8],
         positive_similarity=float(positive) if positive is not None else None,
         negative_similarity=float(negative) if negative is not None else None,
         opportunity_delta=float(delta) if delta is not None else None,
         research_questions=questions,
-        missing_evidence=list(bundle.get("missing_evidence") or []),
+        missing_evidence=missing_evidence[:12],
         priority=priority,
-        engine="semantic-research-rules",
+        engine=(
+            "semantic-research-rules"
+            if semantic_ready
+            else "deterministic-research-rules"
+        ),
         version=version,
     )
 

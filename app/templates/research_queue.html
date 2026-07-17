@@ -11,7 +11,7 @@
     <article class="research-candidate">
       <div><a href="/events/{{ item.event_id }}"><strong>#{{ item.id }} · {{ item.event_title }}</strong></a><small>{{ item.market }} · 趋势 {{ item.trend_score }} · 优先级 {{ item.priority }}</small></div>
       <p>{{ item.candidate_reason }}</p>
-      <div class="chips">{% for category in item.category_candidates %}<span>{{ category.category }} {{ '%.4f'|format(category.similarity) }}</span>{% endfor %}</div>
+      {% if item.category_candidates %}<div class="chips">{% for category in item.category_candidates %}<span>{{ category.category }} {{ '%.4f'|format(category.similarity) }}</span>{% endfor %}</div>{% else %}<small>尚无可靠类目联想；仅进入补证队列，不代表商品方向或需求结论。</small>{% endif %}
       <small>证据准备度 {{ item.readiness_status }} / {{ item.readiness_score }} · 缺失：{{ item.missing_evidence|join('；') if item.missing_evidence else '无' }}</small>
       {% if item.latest_run %}<small>最近 Run：{{ item.latest_run.executor_type }} / {{ item.latest_run.executor_name }} · {{ item.latest_run.status }}</small>{% endif %}
       {% if item.latest_assessment %}<small>最近 Assessment：{{ item.latest_assessment.assessment_status }} · 审核 {{ item.latest_assessment.review_status }}</small>{% endif %}
