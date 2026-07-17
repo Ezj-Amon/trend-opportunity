@@ -38,12 +38,12 @@
 <section class="metric-grid">
   <article class="metric"><span>事件</span><strong>{{ events|length }}</strong></article>
   <article class="metric"><span>最近运行</span><strong>{{ runs[0].status if runs else '尚未运行' }}</strong></article>
-  <article class="metric"><span>最近实际引擎</span><strong>{{ latest_analysis.engine if latest_analysis else ('LLM 待运行' if settings.openai_api_key else '本地规则基线') }}</strong></article>
+  <article class="metric"><span>研究主链</span><strong>Evidence → Candidate</strong></article>
   <article class="metric"><span>飞书</span><strong>{{ '已配置' if settings.feishu_webhook_url else '待配置' }}</strong></article>
 </section>
 
 {% if not settings.openai_api_key %}
-<div class="notice"><strong>当前未配置生成模型。</strong> 热点和网页证据均为真实数据；local-rules-v2 会主动弃权，不再从新闻关键词生成固定商品模板。</div>
+<div class="notice"><strong>当前未配置云端 OpportunityAssessment。</strong> 定时管道只构建 EvidenceBundle 和 ResearchCandidate；人工研究与审核闭环仍可使用，不会从新闻关键词自动生成线索。</div>
 {% endif %}
 
 <section class="panel digest-panel">
@@ -91,8 +91,8 @@
         <div class="opportunity-mark">
           {% if event.best_signal_score is not none %}
           <strong>{{ '%.1f'|format(event.best_signal_score) }}</strong><span>线索排序分</span>
-          {% elif event.latest_analysis_engine %}<span>已分析 · 无线索</span>
-          {% else %}<span>待分析</span>{% endif %}
+          {% elif event.latest_research_status %}<span>研究候选 · {{ event.latest_research_status }}</span>
+          {% else %}<span>待构建候选</span>{% endif %}
         </div>
       </a>
       {% endfor %}
@@ -145,8 +145,9 @@
     let detail = '';
     if (status.stage === 'ingest') detail = `已完成 ${status.sources_completed || 0}/${status.sources_total || 0} 个数据源，成功 ${status.sources_succeeded || 0} 个。外部源响应慢时预计时间会动态调整。`;
     if (status.stage === 'cluster') detail = `已拿到 ${status.items_count || 0} 条原始记录，正在去重并合并成趋势事件。`;
-    if (status.stage === 'analyze') detail = `已形成 ${status.events_count || 0} 个趋势事件，正在分析第 ${status.analyzed_count || 0}/${status.selected_count || 0} 个重点事件。`;
-    if (status.stage === 'completed') detail = `本次采集完成：${status.items_count || 0} 条原始记录、${status.events_count || 0} 个趋势事件、${status.selected_count || 0} 个重点分析。`;
+    if (status.stage === 'research') detail = `已形成 ${status.events_count || 0} 个趋势事件，正在为第 ${status.researched_count || 0}/${status.selected_count || 0} 个重点事件构建证据包与研究候选。`;
+    if (status.stage === 'analyze') detail = `正在读取历史运行状态。`;
+    if (status.stage === 'completed') detail = `本次采集完成：${status.items_count || 0} 条原始记录、${status.events_count || 0} 个趋势事件、${status.selected_count || 0} 个重点研究候选。`;
     if (status.stage === 'failed') detail = status.error_summary || '本次采集未完成，请查看数据源状态后重试。';
     document.getElementById('run-detail').textContent = detail;
     document.getElementById('run-output').textContent = `${status.items_count || 0} 条记录 · ${status.events_count || 0} 个事件`;

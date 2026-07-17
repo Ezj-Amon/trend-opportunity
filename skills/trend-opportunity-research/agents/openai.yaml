@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trend Opportunity Research"
+  short_description: "Research trends with cited evidence and abstention"
+  default_prompt: "Use $trend-opportunity-research to investigate this trend with public evidence and produce a cited assessment."

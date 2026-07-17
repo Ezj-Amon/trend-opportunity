@@ -13,11 +13,79 @@
   {% endfor %}
 </section>
 
-{% if semantic_feature %}
-<div class="notice"><strong>语义基线：</strong>{{ semantic_feature.status }} · {{ semantic_feature.model_id }}@{{ semantic_feature.model_version }}{% if semantic_feature.status == 'ready' %} · 正向原型相似度 {{ semantic_feature.positive_similarity }} · 负向原型相似度 {{ semantic_feature.negative_similarity }}{% if semantic_feature.category_matches %} · 类目候选 {{ semantic_feature.category_matches|map(attribute='category')|join('、') }}{% endif %}{% elif semantic_feature.error %} · {{ semantic_feature.error }}{% endif %}。相似度不是市场概率。</div>
+<section class="panel research-decision {{ research_view.conclusion_code }}">
+  <div class="panel-head"><h2>当前结论</h2><span>{{ research_view.evidence_summary.readiness_label }}</span></div>
+  <h3>{{ research_view.conclusion_label }}</h3>
+  <p class="muted">{{ research_view.producer_status }}</p>
+  <div class="research-columns">
+    <div><h4>为什么停在这里</h4><ul>{% for reason in research_view.stop_reasons %}<li>{{ reason }}</li>{% endfor %}</ul></div>
+    <div><h4>下一步需要什么</h4><ul>{% for action in research_view.next_actions %}<li>{{ action }}</li>{% endfor %}</ul></div>
+  </div>
+  <p class="research-label"><b>人工标签：</b>{{ research_view.human_label }} · <b>语义特征：</b>{{ research_view.semantic_status }}</p>
+</section>
+
+<section class="panel research-evidence">
+  <div class="panel-head"><h2>证据覆盖</h2><span>准备度质量分 {{ '%.2f'|format(research_view.evidence_summary.readiness_score) }}</span></div>
+  <div class="evidence-metrics">
+    <span>完整正文 {{ research_view.evidence_summary.full_text_count }}</span>
+    <span>标题证据 {{ research_view.evidence_summary.title_only_count }}</span>
+    <span>独立来源 {{ research_view.evidence_summary.independent_source_count }}</span>
+    <span>消费者声音 {{ research_view.evidence_summary.consumer_voice_count }}</span>
+    <span>官方来源 {{ research_view.evidence_summary.official_source_count }}</span>
+  </div>
+  {% if research_view.fetch_failures %}<div class="fetch-failures"><h4>抓取失败原因</h4>{% for failure in research_view.fetch_failures %}<p><b>证据 #{{ failure.evidence_id }} · {{ failure.status_label }}</b>{% if failure.source_name %} · {{ failure.source_name }}{% endif %}{% if failure.detail %}<small>{{ failure.detail }}</small>{% endif %}</p>{% endfor %}</div>{% endif %}
+  {% if research_view.missing_evidence %}<div class="missing-evidence"><h4>仍缺失的证据</h4><ul>{% for item in research_view.missing_evidence %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+</section>
+
+<section class="panel semantic-exploration">
+  <div class="panel-head"><h2>探索性类目联想</h2><span>仅用于研究导航，不是需求概率或商品推荐</span></div>
+  {% if research_view.category_candidates %}<div class="category-candidates">{% for item in research_view.category_candidates %}<article><strong>{{ item.category }}</strong><span>{{ '%.4f'|format(item.similarity) }}</span></article>{% endfor %}</div>{% else %}<p class="muted">当前没有可展示的类目联想。</p>{% endif %}
+  <div class="semantic-comparison">
+    <span>正向原型 {% if research_view.positive_similarity is not none %}<strong>{{ '%.4f'|format(research_view.positive_similarity) }}</strong>{% else %}未计算{% endif %}</span>
+    <span>负向原型 {% if research_view.negative_similarity is not none %}<strong>{{ '%.4f'|format(research_view.negative_similarity) }}</strong>{% else %}未计算{% endif %}</span>
+    <span>机会差值 {% if research_view.opportunity_delta is not none %}<strong>{{ '%.4f'|format(research_view.opportunity_delta) }}</strong>{% else %}未计算{% endif %}</span>
+  </div>
+  <p>{{ research_view.delta_explanation }}</p>
+</section>
+
+{% if research_candidate %}
+<section class="panel research-candidate-detail">
+  <div class="panel-head"><h2>待研究方向</h2><span>{{ research_candidate.status }} · 优先级 {{ research_candidate.priority }}</span></div>
+  <p>{{ research_candidate.candidate_reason }}</p>
+  <div class="chips">{% for item in research_candidate.category_candidates %}<span>{{ item.category }} {{ '%.4f'|format(item.similarity) }}</span>{% endfor %}</div>
+  <h4>研究问题</h4><ul>{% for question in research_candidate.research_questions %}<li>{{ question }}</li>{% endfor %}</ul>
+  {% if research_candidate.status in ['pending','evidence_ready','insufficient_evidence','failed'] %}<button class="compact primary" onclick="startResearchRun({{ research_candidate.id }})">启动人工 ResearchRun</button>{% endif %}
+</section>
 {% endif %}
 
-{% if analysis_output %}<div class="notice"><strong>分析说明：</strong>{{ analysis_output.inference_notice }}{% if analysis %}（{{ analysis.engine }} / {{ analysis.model }}）{% endif %}</div>{% endif %}
+{% if research_candidate %}
+<section class="panel research-run-detail">
+  <div class="panel-head"><h2>Research Agent / Run</h2><span>{% if research_agent_enabled %}自动 Agent 已启用{% else %}自动 Agent 未启用{% endif %}</span></div>
+  <p class="muted">{% if research_agent_enabled %}Agent 仍只能调用受控研究工具，不能直接写数据库或发布推荐。{% else %}ENABLE_RESEARCH_AGENT=false；当前只会由用户明确启动人工或受控 ResearchRun。{% endif %} 浏览器证据：{{ '已启用' if browser_evidence_enabled else '未启用' }}。</p>
+  {% if research_run %}
+  <article class="research-run-card">
+    <p><b>Run：</b>{{ research_run.id }} · {{ research_run.executor_type }} / {{ research_run.executor_name }} · <span class="status {{ research_run.status }}">{{ research_run.status }}</span></p>
+    <p><b>预算：</b>搜索 {{ research_run.budget.max_search_queries|default(0) }} · 公开页面 {{ research_run.budget.max_fetch_pages|default(0) }} · 浏览器页面 {{ research_run.budget.max_browser_pages|default(0) }} · 超时 {{ research_run.budget.timeout_seconds|default(0) }} 秒</p>
+    {% if research_run.error %}<p class="error"><b>运行失败：</b>{{ research_run.error }}</p>{% endif %}
+    {% if research_tool_calls %}<details open><summary>工具调用审计（{{ research_tool_calls|length }}）</summary><ul>{% for call in research_tool_calls %}<li><b>{{ call.tool_name }}</b> · {{ call.status }} · {{ call.latency_ms }} ms · 请求哈希 {{ call.request_hash[:12] }}{% if call.result_evidence_ids %} · 证据 {{ call.result_evidence_ids|join('、') }}{% endif %}{% if call.error %} · {{ call.error }}{% endif %}</li>{% endfor %}</ul></details>{% else %}<p class="muted">此 Run 尚无工具调用记录。</p>{% endif %}
+  </article>
+  {% else %}<p class="muted">尚未启动 ResearchRun；现有事件事实和审核状态不会因此改变。</p>{% endif %}
+</section>
+{% endif %}
+
+{% if opportunity_assessments %}
+<section class="panel assessment-section">
+  <div class="panel-head"><h2>机会评估</h2><span>研究结果 · 不是商品假设</span></div>
+  {% for item in opportunity_assessments %}<article class="assessment-card">
+    <div><span class="status {{ item.review_status }}">{{ item.review_status }}</span> <strong>{{ item.assessment_status }}</strong> · {{ item.engine }}{% if item.model %} / {{ item.model }}{% endif %}</div>
+    {% if item.change_type %}<p><b>变化：</b>{{ item.change_type }}</p><p><b>消费关联：</b>{{ item.consumer_relevance }}</p><p><b>持续性：</b>{{ item.durability }} · <b>交付周期：</b>{{ item.lead_time_fit }}</p>{% endif %}
+    {% if item.fact_claims %}<details><summary>事实与引用</summary><ul>{% for claim in item.fact_claims %}<li>{{ claim.claim }}（证据 {{ claim.evidence_ids|join('、') }}）</li>{% endfor %}</ul></details>{% endif %}
+    {% if item.inferences %}<details><summary>推断与引用</summary><ul>{% for claim in item.inferences %}<li>{{ claim.claim }}（证据 {{ claim.evidence_ids|join('、') }}）</li>{% endfor %}</ul></details>{% endif %}
+    {% if item.abstention_reason %}<p><b>弃权原因：</b>{{ item.abstention_reason }}</p>{% endif %}
+    {% if item.review_status == 'pending' %}<div class="actions"><button class="compact primary" onclick="reviewAssessment({{ item.id }},'approved')" {% if item.assessment_status != 'worth_following' %}disabled{% endif %}>批准为线索</button><button class="compact" onclick="reviewAssessment({{ item.id }},'needs_more_evidence')">需要更多证据</button><button class="compact ghost" onclick="reviewAssessment({{ item.id }},'rejected')">驳回</button></div>{% endif %}
+  </article>{% endfor %}
+</section>
+{% endif %}
 
 <section class="panel signal-section">
   <div class="panel-head"><h2>新品机会线索</h2><span>判断层 · 可为空 · 不是商品推荐</span></div>
@@ -101,7 +169,7 @@
 
 <div class="layout">
   <section class="panel grow"><div class="panel-head"><h2>真实来源证据</h2><span>{{ evidence|length }} 条</span></div>
-    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">证据 #{{ item.id }} · {{ '正文' if item.kind == 'article' else '真实热榜条目' }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>HTTP {{ item.http_status or '未抓正文' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.error %} · 正文抓取：{{ item.error }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
+    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">证据 #{{ item.id }} · {{ evidence_type_labels.get(item.evidence_type, '仅标题') }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>{{ item.source_name or '未知来源' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.http_status %} · HTTP {{ item.http_status }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
   </section>
   <aside class="side"><section class="panel"><div class="panel-head"><h2>聚类成员</h2></div>
     {% for item in members %}<div class="member"><span>{{ item.source }} #{{ item.rank }} · {{ item.market }} · {{ item.signal_type }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><small>{{ item.match_method }} · {{ '%.2f'|format(item.match_score) }}</small></div>{% endfor %}
@@ -117,6 +185,13 @@ async function createSignal(eventId) {
   const evidence_ids=splitValues(prompt('引用证据 ID，多个用分号分隔','')||'').map(Number).filter(Number.isInteger); const consumer_relevance_score=Number(prompt('消费关联排序分 0-100','50')); const product_opportunity_score=Number(prompt('新品机会排序分 0-100','50')); const confidence=Number(prompt('判断置信度 0-100（不是市场概率）','50')); const missing_evidence=splitValues(prompt('仍缺失的证据，可留空','')||'');
   if(!target_users.length||!new_scenarios.length||!unmet_needs.length||!evidence_ids.length){toast('目标用户、新场景、未满足需求和证据 ID 不能为空',true);return;}
   if(await postAction(`/api/events/${eventId}/opportunity-signals`,'人工线索已创建，等待审核',{change_type,consumer_relevance_score,product_opportunity_score,target_users,new_scenarios,unmet_needs,related_product_categories,durability,lead_time_fit,evidence_ids,confidence,missing_evidence}))setTimeout(()=>location.reload(),400);
+}
+async function startResearchRun(candidateId) {
+  if(await postAction(`/api/research-candidates/${candidateId}/runs`,'ResearchRun 已启动',{executor_type:'human',executor_name:'event-workbench',budget:{}}))setTimeout(()=>location.reload(),350);
+}
+async function reviewAssessment(assessmentId, review_status) {
+  const note=prompt('审核说明（可留空）','') ?? null; if(note===null)return;
+  if(await postAction(`/api/opportunity-assessments/${assessmentId}/review`,'Assessment 审核已保存',{review_status,note}))setTimeout(()=>location.reload(),350);
 }
 async function createHypothesis(signalId, suggestedEvidence) {
   const name=prompt('具体实体商品名称',''); if(!name)return; const physical_form=prompt('实体形态、材料或组成（不得是软件/服务）',''); if(!physical_form)return;

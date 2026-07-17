@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from .analysis import OpportunitySignalDraft
 from .amazon import (
     AMAZON_MARKETPLACES,
     is_search_term_ready,
@@ -38,6 +37,20 @@ from .deduplication import (
     deduplicate_events,
     deduplicate_opportunities,
 )
+from .evidence import is_public_url
+from .evidence_bundle import (
+    build_evidence_bundle,
+    bundle_as_dict,
+    decode_evidence_bundle,
+    persist_evidence_bundle,
+)
+from .evidence_collectors import (
+    ManualEvidenceCollector,
+    decode_evidence,
+    persist_collected_evidence,
+)
+from .evidence_types import ManualEvidenceInput
+from .event_research import EVIDENCE_TYPE_LABELS, build_event_research_view
 from .feishu import delivery_timestamp, send_daily_digest, send_opportunity
 from .market_evidence import ManualMarketplaceDataProvider, SellerCentralCsvProvider
 from .market_validation import (
@@ -47,8 +60,18 @@ from .market_validation import (
     result_from_input,
 )
 from .opportunity_signals import (
+    OpportunitySignalInput,
     SIGNAL_FEEDBACK_TYPES,
     decode_signal,
+)
+from .opportunity_assessment import (
+    ASSESSMENT_REVIEW_STATUSES,
+    CloudOpportunityAssessmentProvider,
+    HumanAssessmentProvider,
+    OpportunityAssessmentDraft,
+    decode_opportunity_assessment,
+    persist_opportunity_assessment,
+    validate_assessment_evidence,
 )
 from .pipeline import Pipeline, utc_now
 from .product_hypotheses import (
@@ -65,6 +88,23 @@ from .reports import (
     is_validated_recommendation,
     top_trend_signals,
 )
+from .research import (
+    ResearchBudget,
+    ResearchRunCompleteInput,
+    ResearchRunInput,
+    ResearchToolResultInput,
+    complete_research_run,
+    decode_research_run,
+    record_research_tool_call,
+    start_research_run,
+)
+from .research_candidates import (
+    RESEARCH_CANDIDATE_STATUSES,
+    candidate_from_event,
+    decode_research_candidate,
+    persist_research_candidate,
+)
+from .research_tools import ResearchToolExecutionInput, ResearchToolExecutor
 from .scoring import calculate_final_score, calculate_market_score
 from .semantic import opportunity_precision_at_k
 from .semantic_duplicates import (
@@ -84,7 +124,8 @@ PRODUCT_HYPOTHESIS_WORKBENCH_ENABLED = False
 RUN_STAGE_LABELS = {
     "ingest": "连接数据源并采集",
     "cluster": "整理并合并相似趋势",
-    "analyze": "识别趋势与新品机会线索",
+    "research": "构建证据包与待研究候选",
+    "analyze": "历史机会分析阶段",
     "completed": "采集完成",
     "failed": "采集未完成",
 }
@@ -133,6 +174,19 @@ class DuplicateFeedbackInput(BaseModel):
 class HypothesisReviewInput(BaseModel):
     status: str = Field(min_length=1, max_length=64)
     note: str = Field(default="", max_length=2000)
+
+
+class ResearchCandidateStatusInput(BaseModel):
+    status: str = Field(min_length=1, max_length=64)
+
+
+class AssessmentReviewInput(BaseModel):
+    review_status: str = Field(min_length=1, max_length=64)
+    note: str = Field(default="", max_length=2000)
+
+
+class CloudAssessmentInput(BaseModel):
+    research_run_id: str | None = Field(default=None, max_length=100)
 
 
 def opportunity_signal_rows(review_status: str | None = None, limit: int = 200) -> list[dict]:
@@ -590,7 +644,7 @@ def current_run_status() -> dict[str, Any]:
         result["sources_failed"] = (
             result["sources_completed"] - result["sources_succeeded"]
         )
-        result["analyzed_count"] = result.get("selected_count", 0)
+        result["researched_count"] = result.get("selected_count", 0)
 
     result = dict(result)
     result["stage_label"] = RUN_STAGE_LABELS.get(
@@ -712,8 +766,9 @@ async def dashboard(request: Request, market: str = "ALL"):
         f"""SELECT e.*,
         (SELECT COUNT(*) FROM opportunity_signals s
          WHERE s.event_id=e.id AND s.review_status!='superseded') signal_count,
-        (SELECT engine FROM analyses a WHERE a.event_id=e.id AND a.status!='superseded'
-         ORDER BY a.id DESC LIMIT 1) latest_analysis_engine,
+        (SELECT status FROM research_candidates c
+         WHERE c.event_id=e.id AND c.status!='superseded'
+         ORDER BY c.id DESC LIMIT 1) latest_research_status,
         (SELECT MAX(product_opportunity_score) FROM opportunity_signals s
          WHERE s.event_id=e.id AND s.review_status!='superseded') best_signal_score
         FROM trend_events e {where}
@@ -737,7 +792,6 @@ async def dashboard(request: Request, market: str = "ALL"):
         JOIN (SELECT source, MAX(id) id FROM source_snapshots GROUP BY source) latest
         ON latest.id=s.id ORDER BY s.source"""
     )
-    latest_analysis = db.one("SELECT engine, model, status FROM analyses ORDER BY id DESC LIMIT 1")
     digest = build_daily_digest(db)
     if market == "CN":
         digest["overseas_top3"] = []
@@ -753,7 +807,6 @@ async def dashboard(request: Request, market: str = "ALL"):
             "source_health": source_health,
             "pipeline_running": pipeline.is_running,
             "settings": settings,
-            "latest_analysis": latest_analysis,
             "selected_market": market,
             "market_counts": market_counts,
             "market_options": market_options,
@@ -798,7 +851,6 @@ async def event_detail(request: Request, event_id: int):
             "SELECT * FROM opportunity_outcomes WHERE opportunity_id=? ORDER BY horizon_days",
             (opportunity["id"],),
         )
-    analysis_output = json.loads(analysis["output_json"]) if analysis else None
     semantic_feature = db.one(
         """SELECT * FROM semantic_event_features
         WHERE event_id=? ORDER BY id DESC LIMIT 1""",
@@ -817,6 +869,65 @@ async def event_detail(request: Request, event_id: int):
             (event_id,),
         )
     ]
+    candidate_row = db.one(
+        """SELECT * FROM research_candidates
+        WHERE event_id=? AND status!='superseded' ORDER BY id DESC LIMIT 1""",
+        (event_id,),
+    )
+    research_candidate = (
+        decode_research_candidate(candidate_row) if candidate_row else None
+    )
+    assessment_rows = []
+    research_run = None
+    research_tool_calls = []
+    if research_candidate:
+        run_row = db.one(
+            """SELECT * FROM research_runs
+            WHERE candidate_id=? ORDER BY started_at DESC LIMIT 1""",
+            (research_candidate["id"],),
+        )
+        if run_row:
+            research_run = decode_research_run(run_row)
+            research_tool_calls = [
+                {
+                    **row,
+                    "result_evidence_ids": json.loads(
+                        row.get("result_evidence_ids_json") or "[]"
+                    ),
+                }
+                for row in db.all(
+                    """SELECT * FROM research_tool_calls
+                    WHERE run_id=? ORDER BY id""",
+                    (research_run["id"],),
+                )
+            ]
+        assessment_rows = [
+            decode_opportunity_assessment(row)
+            for row in db.all(
+                """SELECT * FROM opportunity_assessments
+                WHERE candidate_id=? AND review_status!='superseded' ORDER BY id DESC""",
+                (research_candidate["id"],),
+            )
+        ]
+    human_label = db.one(
+        "SELECT * FROM semantic_evaluation_labels WHERE event_id=?", (event_id,)
+    )
+    current_bundle = build_evidence_bundle(
+        event,
+        evidence,
+        settings.evidence_bundle_version,
+        settings.evidence_ready_score,
+    )
+    research_view = build_event_research_view(
+        event,
+        bundle_as_dict(current_bundle),
+        semantic_feature,
+        human_label,
+        signals,
+        analysis,
+        research_candidate,
+        assessment_rows[0] if assessment_rows else None,
+    )
     return templates.TemplateResponse(
         request,
         "event.html",
@@ -825,8 +936,6 @@ async def event_detail(request: Request, event_id: int):
             "members": members,
             "evidence": evidence,
             "opportunities": opportunities,
-            "analysis": analysis,
-            "analysis_output": analysis_output,
             "signals": signals,
             "product_hypotheses": [
                 item
@@ -834,10 +943,582 @@ async def event_detail(request: Request, event_id: int):
                 if int(item["event_id"]) == event_id
             ],
             "semantic_feature": semantic_feature,
+            "research_view": research_view,
+            "research_candidate": research_candidate,
+            "research_run": research_run,
+            "research_tool_calls": research_tool_calls,
+            "research_agent_enabled": settings.enable_research_agent,
+            "browser_evidence_enabled": settings.enable_browser_evidence,
+            "opportunity_assessments": assessment_rows,
+            "evidence_type_labels": EVIDENCE_TYPE_LABELS,
             "feishu_configured": bool(settings.feishu_webhook_url),
             "marketplaces": AMAZON_MARKETPLACES,
         },
     )
+
+
+def _event_or_404(event_id: int) -> dict:
+    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
+    if not event:
+        raise HTTPException(404, "event not found")
+    return event
+
+
+def _rebuild_event_bundle(event: dict) -> dict:
+    evidence = db.all(
+        "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+    )
+    bundle = persist_evidence_bundle(
+        db,
+        build_evidence_bundle(
+            event,
+            evidence,
+            settings.evidence_bundle_version,
+            settings.evidence_ready_score,
+        ),
+    )
+    db.execute(
+        """UPDATE research_candidates
+        SET evidence_bundle_id=?,missing_evidence_json=?,updated_at=?
+        WHERE event_id=? AND status IN
+        ('pending','researching','evidence_ready','insufficient_evidence','failed')""",
+        (
+            bundle["id"],
+            db.json(bundle["missing_evidence"]),
+            utc_now(),
+            event["id"],
+        ),
+    )
+    return bundle
+
+
+@app.get("/api/events/{event_id}/evidence")
+async def api_event_evidence(event_id: int):
+    _event_or_404(event_id)
+    return [
+        decode_evidence(row)
+        for row in db.all(
+            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+        )
+    ]
+
+
+@app.post("/api/events/{event_id}/evidence/manual")
+async def add_manual_evidence(event_id: int, value: ManualEvidenceInput):
+    event = _event_or_404(event_id)
+    if value.url and not await is_public_url(value.url):
+        raise HTTPException(400, "URL must resolve to a public HTTP(S) address")
+    collector = ManualEvidenceCollector([value])
+    items = await collector.collect(
+        event,
+        db.all("SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)),
+        ResearchBudget(
+            max_search_queries=0,
+            max_fetch_pages=0,
+            max_browser_pages=0,
+            timeout_seconds=settings.research_timeout_seconds,
+        ),
+    )
+    saved = persist_collected_evidence(db, event_id, items[0], allow_upgrade=False)
+    return {"evidence": saved, "evidence_bundle": _rebuild_event_bundle(event)}
+
+
+@app.post("/api/events/{event_id}/evidence-bundle/rebuild")
+async def rebuild_event_evidence_bundle(event_id: int):
+    return _rebuild_event_bundle(_event_or_404(event_id))
+
+
+@app.get("/api/events/{event_id}/evidence-bundles")
+async def api_event_evidence_bundles(event_id: int):
+    _event_or_404(event_id)
+    return [
+        decode_evidence_bundle(row)
+        for row in db.all(
+            "SELECT * FROM evidence_bundles WHERE event_id=? ORDER BY id DESC",
+            (event_id,),
+        )
+    ]
+
+
+def research_candidate_rows(status: str | None = None, limit: int = 500) -> list[dict]:
+    clause = ""
+    params: list[Any] = []
+    if status:
+        clause = "WHERE c.status=?"
+        params.append(status)
+    params.append(limit)
+    rows = db.all(
+        f"""SELECT c.*,e.canonical_title event_title,e.market,e.trend_score,
+        b.readiness_status,b.readiness_score
+        FROM research_candidates c
+        JOIN trend_events e ON e.id=c.event_id
+        JOIN evidence_bundles b ON b.id=c.evidence_bundle_id
+        {clause}
+        ORDER BY CASE c.status
+          WHEN 'awaiting_review' THEN 0 WHEN 'researching' THEN 1
+          WHEN 'pending' THEN 2 WHEN 'insufficient_evidence' THEN 3 ELSE 4 END,
+          c.priority DESC,c.id DESC LIMIT ?""",
+        tuple(params),
+    )
+    decoded = [decode_research_candidate(row) for row in rows]
+    for item in decoded:
+        run = db.one(
+            "SELECT * FROM research_runs WHERE candidate_id=? ORDER BY started_at DESC LIMIT 1",
+            (item["id"],),
+        )
+        item["latest_run"] = decode_research_run(run) if run else None
+        assessment = db.one(
+            """SELECT * FROM opportunity_assessments
+            WHERE candidate_id=? ORDER BY id DESC LIMIT 1""",
+            (item["id"],),
+        )
+        item["latest_assessment"] = (
+            decode_opportunity_assessment(assessment) if assessment else None
+        )
+    return decoded
+
+
+@app.get("/research", response_class=HTMLResponse)
+async def research_queue_page(request: Request):
+    candidates = research_candidate_rows()
+    grouped = {
+        status: [item for item in candidates if item["status"] == status]
+        for status in (
+            "pending",
+            "researching",
+            "insufficient_evidence",
+            "awaiting_review",
+            "evidence_ready",
+            "completed",
+            "failed",
+        )
+    }
+    return templates.TemplateResponse(
+        request,
+        "research_queue.html",
+        {"grouped_candidates": grouped, "candidate_count": len(candidates)},
+    )
+
+
+@app.get("/api/research-candidates")
+async def api_research_candidates(status: str | None = None, limit: int = 200):
+    if status and status not in RESEARCH_CANDIDATE_STATUSES:
+        raise HTTPException(400, "invalid research candidate status")
+    if limit < 1 or limit > 500:
+        raise HTTPException(400, "limit must be between 1 and 500")
+    return research_candidate_rows(status, limit)
+
+
+@app.get("/api/research-candidates/{candidate_id}")
+async def api_research_candidate(candidate_id: int):
+    row = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    if not row:
+        raise HTTPException(404, "research candidate not found")
+    return decode_research_candidate(row)
+
+
+@app.post("/api/events/{event_id}/research-candidates")
+async def create_event_research_candidate(event_id: int):
+    event = _event_or_404(event_id)
+    bundle = _rebuild_event_bundle(event)
+    semantic_feature = db.one(
+        """SELECT * FROM semantic_event_features
+        WHERE event_id=? ORDER BY id DESC LIMIT 1""",
+        (event_id,),
+    )
+    human_label = db.one(
+        "SELECT label FROM semantic_evaluation_labels WHERE event_id=?", (event_id,)
+    )
+    draft = candidate_from_event(
+        {**event, "human_label": (human_label or {}).get("label", "")},
+        bundle,
+        semantic_feature,
+        version=settings.research_candidate_version,
+    )
+    if draft is None:
+        return {"status": "abstained", "candidate": None}
+    return {"status": "created", "candidate": persist_research_candidate(db, draft)}
+
+
+@app.post("/api/research-candidates/{candidate_id}/status")
+async def update_research_candidate_status(
+    candidate_id: int, value: ResearchCandidateStatusInput
+):
+    if value.status not in RESEARCH_CANDIDATE_STATUSES - {"superseded"}:
+        raise HTTPException(400, "invalid research candidate status")
+    row = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    if not row:
+        raise HTTPException(404, "research candidate not found")
+    if row["status"] == "superseded":
+        raise HTTPException(409, "research candidate has been superseded")
+    db.execute(
+        "UPDATE research_candidates SET status=?,updated_at=? WHERE id=?",
+        (value.status, utc_now(), candidate_id),
+    )
+    return decode_research_candidate(
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    )
+
+
+def _candidate_or_404(candidate_id: int) -> dict:
+    row = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    if not row:
+        raise HTTPException(404, "research candidate not found")
+    return decode_research_candidate(row)
+
+
+def _research_run_or_404(run_id: str) -> dict:
+    row = db.one("SELECT * FROM research_runs WHERE id=?", (run_id,))
+    if not row:
+        raise HTTPException(404, "research run not found")
+    return decode_research_run(row)
+
+
+@app.post("/api/research-candidates/{candidate_id}/runs")
+async def create_research_run(candidate_id: int, value: ResearchRunInput):
+    candidate = _candidate_or_404(candidate_id)
+    try:
+        return start_research_run(db, candidate, value)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/research-runs/{run_id}")
+async def api_research_run(run_id: str):
+    run = _research_run_or_404(run_id)
+    run["tool_calls"] = [
+        {
+            **row,
+            "result_evidence_ids": json.loads(row["result_evidence_ids_json"] or "[]"),
+        }
+        for row in db.all(
+            "SELECT * FROM research_tool_calls WHERE run_id=? ORDER BY id", (run_id,)
+        )
+    ]
+    return run
+
+
+@app.post("/api/research-runs/{run_id}/tool-results")
+async def save_research_tool_result(run_id: str, value: ResearchToolResultInput):
+    run = _research_run_or_404(run_id)
+    candidate = _candidate_or_404(int(run["candidate_id"]))
+    if value.result_evidence_ids:
+        placeholders = ",".join("?" for _ in value.result_evidence_ids)
+        rows = db.all(
+            f"SELECT id,event_id FROM evidence WHERE id IN ({placeholders})",
+            tuple(value.result_evidence_ids),
+        )
+        if len(rows) != len(set(value.result_evidence_ids)) or any(
+            int(row["event_id"]) != int(candidate["event_id"]) for row in rows
+        ):
+            raise HTTPException(400, "tool result contains unknown or cross-event evidence")
+    try:
+        return record_research_tool_call(db, run, value)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/research-runs/{run_id}/tools/{tool_name}")
+async def execute_research_tool(
+    run_id: str, tool_name: str, value: ResearchToolExecutionInput
+):
+    run = _research_run_or_404(run_id)
+    executor = ResearchToolExecutor(
+        db,
+        evidence_bundle_version=settings.evidence_bundle_version,
+        evidence_ready_score=settings.evidence_ready_score,
+    )
+    try:
+        return await executor.execute(run, tool_name, value.request)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/research-runs/{run_id}/complete")
+async def complete_research_run_api(run_id: str, value: ResearchRunCompleteInput):
+    run = _research_run_or_404(run_id)
+    try:
+        return complete_research_run(db, run, value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def opportunity_assessment_rows(
+    review_status: str | None = None, limit: int = 200
+) -> list[dict]:
+    clause = ""
+    params: list[Any] = []
+    if review_status:
+        clause = "WHERE a.review_status=?"
+        params.append(review_status)
+    params.append(limit)
+    rows = db.all(
+        f"""SELECT a.*,c.event_id,e.canonical_title event_title
+        FROM opportunity_assessments a
+        JOIN research_candidates c ON c.id=a.candidate_id
+        JOIN trend_events e ON e.id=c.event_id
+        {clause} ORDER BY a.id DESC LIMIT ?""",
+        tuple(params),
+    )
+    return [decode_opportunity_assessment(row) for row in rows]
+
+
+@app.get("/api/opportunity-assessments")
+async def api_opportunity_assessments(
+    review_status: str | None = None, limit: int = 200
+):
+    if review_status and review_status not in ASSESSMENT_REVIEW_STATUSES:
+        raise HTTPException(400, "invalid assessment review status")
+    if limit < 1 or limit > 500:
+        raise HTTPException(400, "limit must be between 1 and 500")
+    return opportunity_assessment_rows(review_status, limit)
+
+
+@app.post("/api/research-candidates/{candidate_id}/assessments")
+async def create_opportunity_assessment(
+    candidate_id: int, value: OpportunityAssessmentDraft
+):
+    candidate = _candidate_or_404(candidate_id)
+    if candidate["status"] == "superseded":
+        raise HTTPException(409, "research candidate has been superseded")
+    bundle_row = db.one(
+        "SELECT * FROM evidence_bundles WHERE id=?", (candidate["evidence_bundle_id"],)
+    )
+    if not bundle_row:
+        raise HTTPException(409, "candidate evidence bundle not found")
+    bundle = decode_evidence_bundle(bundle_row)
+    event = _event_or_404(int(candidate["event_id"]))
+    evidence = db.all(
+        "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (candidate["event_id"],)
+    )
+    if value.research_run_id:
+        run = _research_run_or_404(value.research_run_id)
+        if int(run["candidate_id"]) != candidate_id:
+            raise HTTPException(400, "research run belongs to another candidate")
+    provider = HumanAssessmentProvider(value)
+    try:
+        result = await provider.assess(event, bundle, candidate, evidence)
+        validate_assessment_evidence(candidate, bundle, evidence, result.draft)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    assessment = persist_opportunity_assessment(db, candidate, bundle, result)
+    db.execute(
+        "UPDATE research_candidates SET status='awaiting_review',updated_at=? WHERE id=?",
+        (utc_now(), candidate_id),
+    )
+    return assessment
+
+
+@app.post("/api/research-candidates/{candidate_id}/assessments/cloud")
+async def create_cloud_opportunity_assessment(
+    candidate_id: int, value: CloudAssessmentInput
+):
+    if not settings.openai_api_key:
+        raise HTTPException(409, "cloud opportunity assessment is not configured")
+    candidate = _candidate_or_404(candidate_id)
+    if candidate["status"] == "superseded":
+        raise HTTPException(409, "research candidate has been superseded")
+    bundle = decode_evidence_bundle(
+        db.one(
+            "SELECT * FROM evidence_bundles WHERE id=?",
+            (candidate["evidence_bundle_id"],),
+        )
+    )
+    event = _event_or_404(int(candidate["event_id"]))
+    evidence = db.all(
+        "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+    )
+    if value.research_run_id:
+        run = _research_run_or_404(value.research_run_id)
+        if int(run["candidate_id"]) != candidate_id:
+            raise HTTPException(400, "research run belongs to another candidate")
+    provider = CloudOpportunityAssessmentProvider(
+        settings.openai_api_key,
+        settings.openai_model,
+        base_url=settings.openai_base_url,
+    )
+    result = await provider.assess(event, bundle, candidate, evidence)
+    result.draft.research_run_id = value.research_run_id
+    try:
+        validate_assessment_evidence(candidate, bundle, evidence, result.draft)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    assessment = persist_opportunity_assessment(db, candidate, bundle, result)
+    db.execute(
+        "UPDATE research_candidates SET status='awaiting_review',updated_at=? WHERE id=?",
+        (utc_now(), candidate_id),
+    )
+    return assessment
+
+
+def _assessment_draft_from_row(assessment: dict) -> OpportunityAssessmentDraft:
+    return OpportunityAssessmentDraft(
+        assessment_status=assessment["assessment_status"],
+        change_type=assessment["change_type"],
+        consumer_relevance=assessment["consumer_relevance"],
+        durability=assessment["durability"],
+        lead_time_fit=assessment["lead_time_fit"],
+        target_users=assessment["target_users"],
+        new_scenarios=assessment["new_scenarios"],
+        unmet_needs=assessment["unmet_needs"],
+        related_product_categories=assessment["related_product_categories"],
+        fact_claims=assessment["fact_claims"],
+        inferences=assessment["inferences"],
+        evidence_ids=assessment["evidence_ids"],
+        missing_evidence=assessment["missing_evidence"],
+        abstention_reason=assessment["abstention_reason"],
+        research_run_id=assessment["research_run_id"],
+    )
+
+
+def _create_signal_from_assessment(
+    assessment: dict,
+    candidate: dict,
+    bundle: dict,
+    event: dict,
+    evidence: list[dict],
+    note: str,
+) -> dict:
+    existing = db.one(
+        "SELECT * FROM opportunity_signals WHERE opportunity_assessment_id=?",
+        (assessment["id"],),
+    )
+    if existing:
+        return decode_signal(existing)
+    audit_run_id = f"assessment-{assessment['id']}"
+    now = utc_now()
+    db.execute(
+        """INSERT OR IGNORE INTO pipeline_runs
+        (id,trigger,status,stage,started_at,finished_at,config_json)
+        VALUES (?,'assessment-review','completed','completed',?,?,'{}')""",
+        (audit_run_id, now, now),
+    )
+    analysis_id = db.execute(
+        """INSERT INTO analyses
+        (event_id,run_id,engine,model,prompt_version,output_json,status,created_at)
+        VALUES (?,?,?,?,?,?,'succeeded',?)""",
+        (
+            event["id"],
+            audit_run_id,
+            assessment["engine"],
+            assessment["model"],
+            assessment["version"],
+            db.json(
+                {
+                    "opportunity_assessment_id": assessment["id"],
+                    "inference_notice": "由已批准 OpportunityAssessment 映射，不包含商品假设。",
+                }
+            ),
+            now,
+        ),
+    )
+    signal_id = db.execute(
+        """INSERT INTO opportunity_signals
+        (event_id,analysis_id,opportunity_assessment_id,change_type,
+         consumer_relevance_score,product_opportunity_score,target_users_json,
+         new_scenarios_json,unmet_needs_json,related_product_categories_json,
+         durability,lead_time_fit,evidence_ids_json,confidence,
+         missing_evidence_json,review_status,engine,model,version,created_at,updated_at)
+        VALUES (?,?,?, ?,0,0,?,?,?,?,?,?,?,0,?,'pending',?,?,?,?,?)""",
+        (
+            event["id"],
+            analysis_id,
+            assessment["id"],
+            assessment["change_type"],
+            db.json(assessment["target_users"]),
+            db.json(assessment["new_scenarios"]),
+            db.json(assessment["unmet_needs"]),
+            db.json(assessment["related_product_categories"]),
+            assessment["durability"],
+            assessment["lead_time_fit"],
+            db.json(assessment["evidence_ids"]),
+            db.json(assessment["missing_evidence"]),
+            assessment["engine"],
+            assessment["model"],
+            assessment["version"],
+            now,
+            now,
+        ),
+    )
+    signal = decode_signal(
+        db.one("SELECT * FROM opportunity_signals WHERE id=?", (signal_id,))
+    )
+    snapshot = {
+        "event": event,
+        "evidence_bundle": bundle,
+        "research_candidate": candidate,
+        "opportunity_assessment": assessment,
+        "evidence": evidence,
+        "opportunity_signal": signal,
+        "review_note": note,
+    }
+    db.execute(
+        """INSERT INTO opportunity_signal_feedback
+        (signal_id,feedback_type,note,snapshot_json,created_at)
+        VALUES (?,'assessment_approved',?,?,?)""",
+        (signal_id, note, db.json(snapshot), now),
+    )
+    return signal
+
+
+@app.post("/api/opportunity-assessments/{assessment_id}/review")
+async def review_opportunity_assessment(
+    assessment_id: int, value: AssessmentReviewInput
+):
+    if value.review_status not in ASSESSMENT_REVIEW_STATUSES - {"pending", "superseded"}:
+        raise HTTPException(400, "invalid assessment review status")
+    row = db.one("SELECT * FROM opportunity_assessments WHERE id=?", (assessment_id,))
+    if not row:
+        raise HTTPException(404, "opportunity assessment not found")
+    assessment = decode_opportunity_assessment(row)
+    if assessment["review_status"] == "superseded":
+        raise HTTPException(409, "assessment has been superseded")
+    candidate = _candidate_or_404(int(assessment["candidate_id"]))
+    bundle = decode_evidence_bundle(
+        db.one(
+            "SELECT * FROM evidence_bundles WHERE id=?",
+            (assessment["evidence_bundle_id"],),
+        )
+    )
+    event = _event_or_404(int(candidate["event_id"]))
+    evidence = db.all(
+        "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+    )
+    signal = None
+    if value.review_status == "approved":
+        if assessment["assessment_status"] != "worth_following":
+            raise HTTPException(409, "only worth-following assessments can be approved")
+        if bundle["readiness_status"] != "ready_for_assessment":
+            raise HTTPException(409, "evidence bundle is not ready for approval")
+        try:
+            validate_assessment_evidence(
+                candidate, bundle, evidence, _assessment_draft_from_row(assessment)
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        signal = _create_signal_from_assessment(
+            assessment, candidate, bundle, event, evidence, value.note.strip()
+        )
+        candidate_status = "completed"
+    elif value.review_status == "needs_more_evidence":
+        candidate_status = "insufficient_evidence"
+    else:
+        candidate_status = "completed"
+    now = utc_now()
+    db.execute(
+        "UPDATE opportunity_assessments SET review_status=?,updated_at=? WHERE id=?",
+        (value.review_status, now, assessment_id),
+    )
+    db.execute(
+        "UPDATE research_candidates SET status=?,updated_at=? WHERE id=?",
+        (candidate_status, now, candidate["id"]),
+    )
+    return {
+        "assessment": decode_opportunity_assessment(
+            db.one("SELECT * FROM opportunity_assessments WHERE id=?", (assessment_id,))
+        ),
+        "opportunity_signal": signal,
+    }
 
 
 @app.get("/signals", response_class=HTMLResponse)
@@ -928,7 +1609,7 @@ async def save_opportunity_signal_feedback(signal_id: int, value: SignalFeedback
 
 @app.post("/api/events/{event_id}/opportunity-signals")
 async def create_manual_opportunity_signal(
-    event_id: int, value: OpportunitySignalDraft
+    event_id: int, value: OpportunitySignalInput
 ):
     event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
     if not event:
@@ -1829,16 +2510,31 @@ async def api_events(market: str = "ALL"):
 @app.get("/healthz")
 async def healthz():
     latest_run = db.one("SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 1")
-    latest_analysis = db.one("SELECT engine, model, status, error FROM analyses ORDER BY id DESC LIMIT 1")
+    latest_research_run = db.one(
+        "SELECT * FROM research_runs ORDER BY started_at DESC LIMIT 1"
+    )
+    latest_assessment = db.one(
+        """SELECT assessment_status,review_status,engine,model,version,created_at
+        FROM opportunity_assessments ORDER BY id DESC LIMIT 1"""
+    )
+    legacy_latest_analysis = db.one(
+        """SELECT engine,model,status,error,created_at FROM analyses
+        ORDER BY id DESC LIMIT 1"""
+    )
     return {
         "status": "ok",
         "database": str(settings.database_path),
         "pipeline_running": pipeline.is_running,
-        "analysis_engine": "llm" if settings.openai_api_key else "local-rules-v2",
+        "pipeline_mode": "evidence-bundle-research-candidate",
+        "assessment_mode": (
+            "human-and-cloud" if settings.openai_api_key else "human-only"
+        ),
         "feishu_configured": bool(settings.feishu_webhook_url),
         "reddit_configured": bool(
             settings.reddit_client_id and settings.reddit_client_secret
         ),
         "latest_run": latest_run,
-        "latest_analysis": latest_analysis,
+        "latest_research_run": latest_research_run,
+        "latest_assessment": latest_assessment,
+        "legacy_latest_analysis": legacy_latest_analysis,
     }

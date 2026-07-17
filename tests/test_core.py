@@ -9,17 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 import app.main as main_app
 import app.pipeline as pipeline_module
-from app.analysis import (
-    AnalysisOutput,
-    AnalysisResult,
-    Analyzer,
-    OpportunityDraft,
-    OpportunitySignalDraft,
-)
 from app.amazon import is_search_term_ready, pick_search_term
 from app.amazon_validation import (
     COLUMN_LABELS,
@@ -35,10 +29,38 @@ from app.deduplication import (
     deduplicate_opportunities,
     normalized_identity,
 )
-from app.evidence import EvidenceResult
+from app.evidence import EvidenceResult, fetch_evidence
+from app.evidence_bundle import (
+    build_evidence_bundle,
+    calculate_evidence_quality,
+    persist_evidence_bundle,
+)
+from app.evidence_types import EvidenceType, FetchStatus, normalize_fetch_status
+from app.evidence_collectors import RelatedNewsCollector, related_news_targets
+from app.event_research import build_event_research_view
 from app.market_validation import MarketScores
+from app.opportunity_assessment import (
+    CloudOpportunityAssessmentProvider,
+    OpportunityAssessmentDraft,
+    validate_assessment_evidence,
+)
 from app.pipeline import Pipeline
 from app.reports import build_daily_digest, is_validated_recommendation
+from app.research import (
+    ResearchBudget,
+    ResearchRunCompleteInput,
+    ResearchRunInput,
+    ResearchToolResultInput,
+    complete_research_run,
+    record_research_tool_call,
+    start_research_run,
+)
+from app.research_candidates import (
+    candidate_from_event,
+    is_commercial_research_blocked,
+    persist_research_candidate,
+)
+from app.research_tools import ResearchToolExecutor
 from app.risk import assess_product_risk
 from app.scoring import calculate_evidence_confidence, calculate_opportunity_score
 from app.scoring import calculate_final_score, calculate_market_score
@@ -59,8 +81,8 @@ def make_settings(tmp_path: Path) -> Settings:
         database_path=tmp_path / "test.db",
         newsnow_base_url="https://newsnow.busiyi.world",
         source_ids=("weibo",),
-        analysis_top_n=5,
-        overseas_analysis_top_n=5,
+        research_candidate_top_n=5,
+        overseas_research_candidate_top_n=5,
         google_trends_geos=("US",),
         reddit_client_id=None,
         reddit_client_secret=None,
@@ -836,7 +858,7 @@ def test_pending_queue_csv_import_and_target_marketplace_change(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_persists_v2_scores_risks_and_explicit_missing_validation(
+async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "pipeline-v2.db")
@@ -885,16 +907,23 @@ async def test_pipeline_persists_v2_scores_risks_and_explicit_missing_validation
 
     monkeypatch.setattr(pipeline_module, "fetch_evidence", fake_fetch)
     pipeline = Pipeline(db, make_settings(tmp_path))
-    await pipeline._research_and_analyze("r", event_id)
+    await pipeline._build_research_candidate(event_id)
     assert db.all("SELECT * FROM product_opportunities WHERE event_id=?", (event_id,)) == []
     analysis = db.one("SELECT * FROM analyses WHERE event_id=?", (event_id,))
-    assert analysis["engine"] == "local-rules"
-    assert analysis["model"] == "local-rules-v2"
+    assert analysis is None
+    assert db.all("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,)) == []
     assert db.all("SELECT * FROM market_validations") == []
     semantic = db.one("SELECT * FROM semantic_event_features WHERE event_id=?", (event_id,))
     assert semantic["status"] == "disabled"
     assert semantic["embedding_json"] is None
     assert "disabled" in semantic["error"]
+    bundle = db.one(
+        "SELECT * FROM evidence_bundles WHERE event_id=? ORDER BY id DESC LIMIT 1",
+        (event_id,),
+    )
+    assert bundle["full_text_count"] == 1
+    assert bundle["title_only_count"] == 0
+    assert bundle["readiness_status"] == "partial"
 
     class MissingModelExtractor:
         def extract(self, _text):
@@ -908,120 +937,25 @@ async def test_pipeline_persists_v2_scores_risks_and_explicit_missing_validation
     semantic = db.one("SELECT * FROM semantic_event_features WHERE event_id=?", (event_id,))
     assert semantic["status"] == "unavailable"
     assert "local cache" in semantic["error"]
-    pipeline.semantic_extractor = None
+    class ReadyModelExtractor:
+        def extract(self, _text):
+            return SimpleNamespace(
+                embedding=[1.0, 0.0],
+                category_matches=[{"category": "家居收纳", "similarity": 0.82}],
+                positive_similarity=0.76,
+                negative_similarity=0.51,
+                opportunity_similarity=0.25,
+            )
 
-    evidence_id = db.one("SELECT id FROM evidence WHERE event_id=? LIMIT 1", (event_id,))["id"]
-    db.execute("DELETE FROM analyses WHERE event_id=?", (event_id,))
-
-    async def fake_hypothesis(_event, _evidence) -> AnalysisResult:
-        return AnalysisResult(
-            "llm",
-            "test-model",
-            AnalysisOutput(
-                event_summary="test",
-                inference_notice="test hypothesis",
-                signals=[
-                    OpportunitySignalDraft(
-                        change_type="居住空间约束",
-                        consumer_relevance_score=82,
-                        product_opportunity_score=76,
-                        target_users=["小户型住户"],
-                        new_scenarios=["可折叠临时收纳"],
-                        unmet_needs=["不用时可收起且承重明确"],
-                        related_product_categories=["家居收纳"],
-                        durability="中期",
-                        lead_time_fit="适合常规打样周期",
-                        evidence_ids=[evidence_id],
-                        confidence=71,
-                        missing_evidence=["消费者评论"],
-                    )
-                ],
-                opportunities=[
-                    OpportunityDraft(
-                        name="folding shelf",
-                        product_keywords=["folding shelf"],
-                        category="home storage",
-                        target_segment="small apartment residents",
-                        scenario="small homes",
-                        jtbd="store items in limited space",
-                        purchase_motivation="save space",
-                        pain_points=["limited storage"],
-                        solution="foldable physical shelf",
-                        mvp="one shelf",
-                        price_band="$29-49",
-                        marketplace="Amazon.com",
-                        target_marketplace="US",
-                        channels=["Amazon.com"],
-                        risks=["market demand is unverified"],
-                        next_action="create a reviewed product hypothesis",
-                        pain_score=4,
-                        intent_score=3,
-                        segment_score=4,
-                        timing_score=3,
-                        feasibility_score=4,
-                        differentiation_score=3,
-                        evidence_ids=[evidence_id],
-                    )
-                ],
-            ),
-        )
-
-    monkeypatch.setattr(pipeline.analyzer, "analyze", fake_hypothesis)
-    await pipeline._research_and_analyze("r", event_id)
-    hypothesis = db.one("SELECT * FROM product_opportunities WHERE event_id=?", (event_id,))
-    assert hypothesis["amazon_search_term"] == ""
-    assert hypothesis["market_score"] is None
-    assert hypothesis["validated_recommendation_score"] is None
-    assert hypothesis["final_score"] == 0
-    assert hypothesis["opportunity_score"] == hypothesis["hypothesis_score"]
-    assert not is_validated_recommendation(hypothesis)
-    signal = db.one("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,))
-    assert signal["change_type"] == "居住空间约束"
-    assert signal["review_status"] == "pending"
-    assert json.loads(signal["evidence_ids_json"]) == [evidence_id]
-    assert signal["engine"] == "llm"
-    assert signal["model"] == "test-model"
-
-    monkeypatch.setattr(main_app, "db", db)
-    with TestClient(main_app.app) as client:
-        signals_page = client.get("/signals")
-        assert signals_page.status_code == 200
-        assert "不用时可收起且承重明确" in signals_page.text
-        assert client.get("/feedback").status_code == 200
-        api_signals = client.get("/api/opportunity-signals")
-        assert api_signals.status_code == 200
-        assert api_signals.json()[0]["target_users"] == ["小户型住户"]
-        label = client.post(
-            f"/api/events/{event_id}/semantic-label",
-            json={"label": "positive", "expected_category": "家居收纳", "note": "人工评测"},
-        )
-        assert label.status_code == 200
-        evaluation = client.get("/api/semantic/evaluation?k=5")
-        assert evaluation.status_code == 200
-        assert evaluation.json()["labeled_count"] == 1
-        assert evaluation.json()["abstention_rate"] == 1.0
-        saved = client.post(
-            f"/api/opportunity-signals/{signal['id']}/feedback",
-            json={"feedback_type": "follow_up", "note": "值得继续找评论证据"},
-        )
-        assert saved.status_code == 200
-        assert saved.json()["label"] == "值得跟进"
-        assert client.get("/feedback").status_code == 200
-
-    feedback = db.one("SELECT * FROM opportunity_signal_feedback WHERE signal_id=?", (signal["id"],))
-    snapshot = json.loads(feedback["snapshot_json"])
-    assert snapshot["signal"]["model"] == "test-model"
-    assert snapshot["signal"]["version"] == pipeline.analysis_version
-    assert snapshot["event"]["id"] == event_id
-    assert snapshot["evidence"][0]["id"] == evidence_id
-    assert db.one("SELECT review_status FROM opportunity_signals WHERE id=?", (signal["id"],))[
-        "review_status"
-    ] == "follow_up"
-    db.execute("UPDATE analyses SET prompt_version='old-version' WHERE id=?", (signal["analysis_id"],))
-    pipeline._invalidate_old_analysis_versions()
-    assert db.one("SELECT review_status FROM opportunity_signals WHERE id=?", (signal["id"],))[
-        "review_status"
-    ] == "superseded"
+    pipeline.semantic_extractor = ReadyModelExtractor()
+    await pipeline._build_research_candidate(event_id)
+    candidate = db.one(
+        "SELECT * FROM research_candidates WHERE event_id=? AND status='pending'",
+        (event_id,),
+    )
+    assert candidate is not None
+    assert json.loads(candidate["category_candidates_json"])[0]["category"] == "家居收纳"
+    assert db.all("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,)) == []
 
 
 def test_semantic_duplicate_candidates_require_review_and_never_auto_merge(
@@ -1233,100 +1167,51 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
     ] == "validated"
 
 
-@pytest.mark.asyncio
-async def test_sensitive_event_is_not_commercialized(tmp_path: Path) -> None:
-    analyzer = Analyzer(make_settings(tmp_path))
-    result = await analyzer.analyze(
-        {"canonical_title": "中国籍女医生在海外遇害", "trend_score": 80},
-        [{"id": 1, "excerpt": "警方正在调查遇害案件"}],
-    )
-    assert result.output.opportunities == []
-    assert "不生成商业化" in result.output.inference_notice
+@pytest.mark.parametrize(
+    "title",
+    [
+        "中国籍女医生在海外遇害",
+        "枪击事件造成伤亡",
+        "远程解锁BL锁，黑砖概不负责",
+        "17天新生儿被宠物狗咬伤脑袋",
+        "严打编造传播涉汛等涉灾网络谣言",
+        "Victim injured in fatal shooting",
+    ],
+)
+def test_research_candidate_safety_gate_blocks_commercial_research(title: str) -> None:
+    assert is_commercial_research_blocked({"canonical_title": title})
 
 
-@pytest.mark.asyncio
-async def test_sensitive_gate_runs_before_configured_llm(tmp_path: Path) -> None:
-    configured = replace(make_settings(tmp_path), openai_api_key="not-a-real-key")
-    result = await Analyzer(configured).analyze(
-        {"canonical_title": "枪击事件造成伤亡", "trend_score": 90},
-        [{"id": 1, "excerpt": "多人伤亡"}],
-    )
-    assert result.engine == "safety-gate"
-    assert result.output.opportunities == []
-
-
-@pytest.mark.asyncio
-async def test_high_risk_device_operation_is_not_commercialized(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {"canonical_title": "远程解锁BL锁，黑砖概不负责", "trend_score": 88},
-        [{"id": 1, "excerpt": "提供远程测试"}],
-    )
-    assert result.engine == "safety-gate"
-    assert result.output.opportunities == []
-
-
-@pytest.mark.asyncio
-async def test_child_injury_is_not_commercialized(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {"canonical_title": "17天新生儿被宠物狗咬伤脑袋", "trend_score": 75},
-        [{"id": 1, "excerpt": "新生儿接受治疗"}],
-    )
-    assert result.engine == "safety-gate"
-    assert result.output.opportunities == []
-
-
-@pytest.mark.asyncio
-async def test_law_enforcement_event_is_not_commercialized(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {"canonical_title": "严打编造传播涉汛等涉灾网络谣言", "trend_score": 70},
-        [{"id": 1, "excerpt": "公安机关开展专项工作部署"}],
-    )
-    assert result.engine == "safety-gate"
-    assert result.output.opportunities == []
-
-
-@pytest.mark.asyncio
-async def test_local_rules_abstain_instead_of_generating_product_templates(tmp_path: Path) -> None:
-    analyzer = Analyzer(make_settings(tmp_path))
-    result = await analyzer.analyze(
-        {"canonical_title": "新台风生成影响周末出行", "trend_score": 65},
-        [{"id": 1, "excerpt": "多地旅客关注航班和天气变化"}],
-    )
-    assert result.engine == "local-rules"
-    assert result.model == "local-rules-v2"
-    assert result.output.opportunities == []
-    assert "不再从新闻关键词生成固定商品模板" in result.output.inference_notice
-
-
-@pytest.mark.asyncio
-async def test_overseas_rules_do_not_generate_amazon_query_or_product(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {
-            "canonical_title": "Best storage organizer for small apartments",
-            "trend_score": 78,
-            "market": "US",
-            "signal_type": "search",
-        },
-        [{"id": 1, "excerpt": "Shoppers compare durable home storage options"}],
-    )
-    assert result.output.opportunities == []
-    assert "OpportunitySignal" in result.output.inference_notice
-
-
-@pytest.mark.asyncio
-async def test_english_keyword_matching_uses_word_boundaries(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {"canonical_title": "New studies show an unusual result", "trend_score": 70},
-        [{"id": 1, "excerpt": "Researchers said more evidence is needed"}],
-    )
-    assert result.engine == "local-rules"
-    assert result.output.opportunities == []
+def test_dashboard_and_health_report_candidate_pipeline_not_local_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "pipeline-status.db")
+    db.initialize()
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "settings", make_settings(tmp_path))
+    with TestClient(main_app.app) as client:
+        dashboard = client.get("/")
+        health = client.get("/healthz")
+    assert dashboard.status_code == 200
+    assert "Evidence → Candidate" in dashboard.text
+    assert "local-rules-v2" not in dashboard.text
+    assert health.status_code == 200
+    assert health.json()["pipeline_mode"] == "evidence-bundle-research-candidate"
+    assert health.json()["assessment_mode"] == "human-only"
+    assert "analysis_engine" not in health.json()
 
 
 def test_overseas_analysis_quota_is_not_crowded_out(tmp_path: Path) -> None:
     db = Database(tmp_path / "quota.db")
     db.initialize()
-    pipeline = Pipeline(db, replace(make_settings(tmp_path), analysis_top_n=1, overseas_analysis_top_n=1))
+    pipeline = Pipeline(
+        db,
+        replace(
+            make_settings(tmp_path),
+            research_candidate_top_n=1,
+            overseas_research_candidate_top_n=1,
+        ),
+    )
     now = "2026-07-14T00:00:00+00:00"
     event_ids = []
     for market, score in (("CN", 99), ("CN", 98), ("US", 40), ("DE", 30)):
@@ -1343,30 +1228,1105 @@ def test_overseas_analysis_quota_is_not_crowded_out(tmp_path: Path) -> None:
     assert {db.one("SELECT market FROM trend_events WHERE id=?", (event_id,))["market"] for event_id in selected} == {"CN", "US"}
 
 
-@pytest.mark.asyncio
-async def test_local_rules_abstain_for_unknown_demand_category(tmp_path: Path) -> None:
-    result = await Analyzer(make_settings(tmp_path)).analyze(
-        {"canonical_title": "某队申请半决赛穿客场队服", "trend_score": 70},
-        [{"id": 1, "excerpt": "球队公布比赛安排"}],
-    )
-    assert result.output.opportunities == []
-    assert "主动弃权" in result.output.inference_notice
-
-
-@pytest.mark.asyncio
-async def test_llm_failure_remains_explicit_when_rules_abstain(
+def test_event_page_explains_title_only_evidence_and_negative_semantic_delta(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    analyzer = Analyzer(replace(make_settings(tmp_path), openai_api_key="configured"))
-
-    async def fail(*_args, **_kwargs):
-        raise ValueError("invalid model output")
-
-    monkeypatch.setattr(analyzer, "_analyze_with_llm", fail)
-    result = await analyzer.analyze(
-        {"canonical_title": "某队申请半决赛穿客场队服", "trend_score": 70},
-        [{"id": 1, "excerpt": "球队公布比赛安排"}],
+    db = Database(tmp_path / "event-research-view.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('沈阳暴雨','沈阳暴雨','CN','zh','news',82,?,?,?,?)""",
+        (now, now, now, now),
     )
-    assert result.engine == "local-rules-fallback"
-    assert result.degraded_reason
-    assert "明确降级" in result.output.inference_notice
+    for index in range(3):
+        db.execute(
+            """INSERT INTO evidence
+            (event_id,kind,url,title,excerpt,fetched_at,is_consumer_voice,
+             valid_for_analysis,error)
+            VALUES(?,'hotlist',?,?,?, ?,0,1,'content too short')""",
+            (
+                event_id,
+                f"https://s.weibo.com/weibo?q=rain-{index}",
+                "沈阳暴雨",
+                "沈阳暴雨",
+                now,
+            ),
+        )
+    db.execute(
+        """INSERT INTO semantic_event_features
+        (event_id,model_id,model_version,input_hash,feature_version,status,
+         category_matches_json,positive_similarity,negative_similarity,
+         opportunity_similarity,created_at)
+        VALUES(?,'fake-e5','rev-1','rain','semantic-test','ready',?,?,?,?,?)""",
+        (
+            event_id,
+            json.dumps(
+                [
+                    {"category": "出行户外", "similarity": 0.7927},
+                    {"category": "个护整理", "similarity": 0.7824},
+                    {"category": "汽车配件", "similarity": 0.7725},
+                ],
+                ensure_ascii=False,
+            ),
+            0.7487,
+            0.7802,
+            -0.0316,
+            now,
+        ),
+    )
+    db.execute(
+        """INSERT INTO semantic_evaluation_labels
+        (event_id,label,note,created_at) VALUES(?,'too_short_term','短时天气事件',?)""",
+        (event_id, now),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+
+    with TestClient(main_app.app) as client:
+        page = client.get(f"/events/{event_id}")
+
+    assert page.status_code == 200
+    assert "证据不足" in page.text
+    assert "完整正文 0" in page.text
+    assert "标题证据 3" in page.text
+    assert "正文过短" in page.text
+    assert "出行户外" in page.text and "0.7927" in page.text
+    assert "个护整理" in page.text and "0.7824" in page.text
+    assert "汽车配件" in page.text and "0.7725" in page.text
+    assert "负向判断略强" in page.text
+
+
+def test_event_page_explains_ready_evidence_without_semantic_feature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "ready-event-page.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('持续居住空间变化','持续居住空间变化',?,?,?,?)""",
+        (now, now, now, now),
+    )
+    for index, host in enumerate(("official.example", "news.example"), 1):
+        db.execute(
+            """INSERT INTO evidence
+            (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash,
+             evidence_type,fetch_status,source_name,quality_score,valid_for_analysis)
+            VALUES(?,'article',?,?,?, ?,200,?,'full_article','ready',?,0.9,1)""",
+            (
+                event_id,
+                f"https://{host}/story",
+                f"Complete report {index}",
+                "A complete independent report documents a recurring consumer constraint.",
+                now,
+                f"hash-{index}",
+                host,
+            ),
+        )
+    monkeypatch.setattr(main_app, "db", db)
+
+    with TestClient(main_app.app) as client:
+        page = client.get(f"/events/{event_id}")
+
+    assert page.status_code == 200
+    assert "证据已准备，等待机会判断" in page.text
+    assert "完整正文 2" in page.text
+    assert "独立来源 2" in page.text
+    assert "语义特征：</b>尚未运行" in page.text
+
+
+def test_evidence_metadata_migration_classifies_legacy_rows(tmp_path: Path) -> None:
+    db = Database(tmp_path / "legacy-evidence.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('legacy','legacy',?,?,?,?)""",
+        (now, now, now, now),
+    )
+    article_id = db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash)
+        VALUES(?,'article','https://news.example/story','Story',
+        'A complete article excerpt long enough for analysis.',?,200,'article-hash')""",
+        (event_id, now),
+    )
+    title_id = db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,error)
+        VALUES(?,'hotlist','https://hot.example/item','Hot title','Hot title',?,
+        'content too short')""",
+        (event_id, now),
+    )
+
+    db.initialize()
+
+    article = db.one("SELECT * FROM evidence WHERE id=?", (article_id,))
+    title = db.one("SELECT * FROM evidence WHERE id=?", (title_id,))
+    assert article["evidence_type"] == "full_article"
+    assert article["fetch_status"] == "ready"
+    assert article["quality_score"] == 0.9
+    assert title["evidence_type"] == "title_only"
+    assert title["fetch_status"] == "content_too_short"
+    assert title["quality_score"] == 0.1
+    assert title["valid_for_analysis"] == 0
+
+
+def test_evidence_quality_and_failure_status_mapping() -> None:
+    assert normalize_fetch_status({"error": "content too short"}) == FetchStatus.CONTENT_TOO_SHORT
+    assert normalize_fetch_status({"error": "HTTP 403 Forbidden"}) == FetchStatus.ROBOTS_OR_ACCESS_DENIED
+    assert normalize_fetch_status({"error": "request timed out"}) == FetchStatus.TIMEOUT
+    assert calculate_evidence_quality(
+        {
+            "kind": "official_notice",
+            "evidence_type": EvidenceType.OFFICIAL_NOTICE,
+            "fetch_status": "ready",
+            "valid_for_analysis": 1,
+            "excerpt": "Official notice with enough detail for the evidence bundle.",
+        }
+    ) == 1.0
+
+
+def test_evidence_bundle_counts_sources_threshold_and_input_hash() -> None:
+    event = {"id": 338, "canonical_title": "沈阳暴雨"}
+    title_domains = ("s.weibo.com", "douyin.com", "douyin.com")
+    title_only = [
+        {
+            "id": index,
+            "kind": "hotlist",
+            "evidence_type": "title_only",
+            "fetch_status": "content_too_short",
+            "url": f"https://{title_domains[index - 1]}/item/{index}",
+            "title": "沈阳暴雨",
+            "excerpt": "沈阳暴雨",
+            "error": "content too short",
+            "is_consumer_voice": 0,
+        }
+        for index in range(1, 4)
+    ]
+    insufficient = build_evidence_bundle(event, title_only)
+    assert insufficient.readiness_status == "insufficient"
+    assert insufficient.full_text_count == 0
+    assert insufficient.title_only_count == 3
+    assert insufficient.independent_source_count == 2
+    assert insufficient.readiness_score == 0.3
+
+    ready_evidence = [
+        {
+            "id": 10,
+            "kind": "official_notice",
+            "evidence_type": "official_notice",
+            "fetch_status": "ready",
+            "url": "https://weather.gov.example/notice",
+            "title": "Official notice",
+            "excerpt": "Official notice with a complete account of the persistent change.",
+            "valid_for_analysis": 1,
+            "is_consumer_voice": 0,
+        },
+        {
+            "id": 11,
+            "kind": "article",
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "url": "https://news.example/report",
+            "title": "Independent report",
+            "excerpt": "Independent reporting with enough detail about recurring conditions.",
+            "valid_for_analysis": 1,
+            "is_consumer_voice": 0,
+        },
+        {
+            "id": 12,
+            "kind": "discussion",
+            "evidence_type": "consumer_discussion",
+            "fetch_status": "ready",
+            "url": "https://community.example/thread",
+            "title": "Consumer discussion",
+            "excerpt": "People discuss recurring wet-backpack and storage problems.",
+            "valid_for_analysis": 1,
+            "is_consumer_voice": 1,
+        },
+    ]
+    ready = build_evidence_bundle(event, ready_evidence)
+    reordered = build_evidence_bundle(event, list(reversed(ready_evidence)))
+    changed = build_evidence_bundle(
+        event,
+        [{**ready_evidence[0], "excerpt": "Changed content"}, *ready_evidence[1:]],
+    )
+    assert ready.readiness_status == "ready_for_assessment"
+    assert ready.full_text_count == 2
+    assert ready.official_source_count == 1
+    assert ready.consumer_voice_count == 1
+    assert ready.independent_source_count == 3
+    assert ready.readiness_score == 2.75
+    assert ready.input_hash == reordered.input_hash
+    assert ready.input_hash != changed.input_hash
+
+
+def test_evidence_bundle_persistence_is_idempotent_and_clear_is_fk_safe(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bundle.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('bundle','bundle',?,?,?,?)""",
+        (now, now, now, now),
+    )
+    evidence_id = db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,evidence_type,fetch_status,
+         source_name,quality_score,valid_for_analysis)
+        VALUES(?,'article','https://one.example/story','Story',
+        'A complete story excerpt with enough evidence.',?,'full_article','ready',
+        'one.example',0.9,1)""",
+        (event_id, now),
+    )
+    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
+    rows = db.all("SELECT * FROM evidence WHERE event_id=?", (event_id,))
+    bundle = build_evidence_bundle(event, rows)
+    first = persist_evidence_bundle(db, bundle)
+    second = persist_evidence_bundle(db, bundle)
+    assert first["id"] == second["id"]
+    assert first["evidence_ids"] == [evidence_id]
+    assert db.one("SELECT COUNT(*) n FROM evidence_bundles")["n"] == 1
+
+    db.clear_derived_data()
+    assert db.all("PRAGMA foreign_key_check") == []
+    assert db.one("SELECT COUNT(*) n FROM evidence_bundles")["n"] == 0
+
+
+@pytest.mark.parametrize(
+    ("semantic_feature", "expected"),
+    [
+        ({"status": "disabled", "category_matches": []}, "已禁用"),
+        ({"status": "unavailable", "category_matches": []}, "模型不可用"),
+        ({"status": "ready", "category_matches": []}, "已就绪"),
+        (None, "尚未运行"),
+    ],
+)
+def test_event_research_view_handles_semantic_states_and_missing_data(
+    semantic_feature: dict | None, expected: str
+) -> None:
+    view = build_event_research_view(
+        {"id": 1, "canonical_title": "test"},
+        {
+            "readiness_status": "insufficient",
+            "readiness_score": 0,
+            "full_text_count": 0,
+            "title_only_count": 0,
+            "independent_source_count": 0,
+            "consumer_voice_count": 0,
+            "official_source_count": 0,
+            "evidence_ids": [],
+            "fetch_failure_reasons": [],
+            "missing_evidence": [],
+        },
+        semantic_feature,
+        None,
+        [],
+        None,
+    )
+    assert view.semantic_status == expected
+    assert view.conclusion_code == "no_evidence"
+    assert view.human_label == "尚无人工标签"
+
+
+@pytest.mark.asyncio
+async def test_public_page_fetcher_extracts_json_ld_and_follows_safe_redirects() -> None:
+    article_body = (
+        "Residents describe a recurring change in storage constraints and explain "
+        "how the same problem affects daily routines across multiple seasons."
+    )
+
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(
+                302, headers={"location": "https://news.example/story"}
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text=f"""<html><head><title>Independent report</title>
+            <meta name="description" content="A sourced report about a recurring change.">
+            <script type="application/ld+json">{{"@type":"NewsArticle",
+            "articleBody":{json.dumps(article_body)}}}</script></head><body></body></html>""",
+        )
+
+    result = await fetch_evidence(
+        "https://public.example/start",
+        "Fallback",
+        transport=httpx.MockTransport(handler),
+        host_validator=lambda host: host in {"public.example", "news.example"},
+    )
+    assert result.fetch_status == "ready"
+    assert result.evidence_type == "full_article"
+    assert result.url == "https://news.example/story"
+    assert article_body in result.excerpt
+    assert result.raw_metadata["redirect_chain"] == ["https://news.example/story"]
+
+
+@pytest.mark.asyncio
+async def test_public_page_fetcher_blocks_private_redirect_and_labels_login_wall() -> None:
+    redirect_transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            302, headers={"location": "http://127.0.0.1/internal"}
+        )
+    )
+    blocked = await fetch_evidence(
+        "https://public.example/start",
+        "Fallback",
+        transport=redirect_transport,
+        host_validator=lambda host: host == "public.example",
+    )
+    assert blocked.fetch_status == "redirect_blocked"
+    assert blocked.evidence_type == "title_only"
+
+    login = await fetch_evidence(
+        "https://public.example/login",
+        "Fallback",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="<html><title>Sign in to continue</title><body>Login required</body></html>",
+            )
+        ),
+        host_validator=lambda _host: True,
+    )
+    assert login.fetch_status == "login_required"
+    assert login.excerpt == ""
+
+
+@pytest.mark.asyncio
+async def test_related_news_collector_consumes_source_item_raw_urls() -> None:
+    source_items = [
+        {
+            "source": "google-trends-us",
+            "title": "storage trend",
+            "raw_json": json.dumps(
+                {
+                    "news_urls": ["https://one.example/a", "https://two.example/b"],
+                    "news_titles": ["One", "Two"],
+                }
+            ),
+        }
+    ]
+    assert related_news_targets(source_items) == [
+        ("https://one.example/a", "One", "google-trends-us"),
+        ("https://two.example/b", "Two", "google-trends-us"),
+    ]
+
+    async def fake_fetch(url: str, title: str) -> EvidenceResult:
+        return EvidenceResult(
+            url,
+            title,
+            "A complete related report with recurring consumer behavior details.",
+            "2026-07-17T00:00:00+00:00",
+            200,
+            hashlib.sha256(url.encode()).hexdigest(),
+        )
+
+    collector = RelatedNewsCollector(fetcher=fake_fetch)
+    items = await collector.collect(
+        {"id": 1, "canonical_title": "storage trend", "source_items": source_items},
+        [],
+        ResearchBudget(max_fetch_pages=1),
+    )
+    assert len(items) == 1
+    assert items[0].fetch_method == "related-news"
+    assert items[0].evidence_type == "full_article"
+
+
+def test_manual_evidence_api_is_idempotent_rebuilds_bundle_and_blocks_private_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "manual-evidence.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('manual evidence','manualevidence',?,?,?,?)""",
+        (now, now, now, now),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+    payload = {
+        "evidence_type": "full_article",
+        "source_name": "manual interview notes",
+        "url": "",
+        "title": "Recurring storage constraints",
+        "excerpt": "Multiple residents describe the same recurring storage constraint across seasons.",
+        "is_consumer_voice": True,
+        "note": "User supplied text",
+    }
+    with TestClient(main_app.app) as client:
+        first = client.post(f"/api/events/{event_id}/evidence/manual", json=payload)
+        second = client.post(f"/api/events/{event_id}/evidence/manual", json=payload)
+        evidence = client.get(f"/api/events/{event_id}/evidence")
+        bundles = client.get(f"/api/events/{event_id}/evidence-bundles")
+        blocked = client.post(
+            f"/api/events/{event_id}/evidence/manual",
+            json={**payload, "url": "http://127.0.0.1/private"},
+        )
+        credential_url = client.post(
+            f"/api/events/{event_id}/evidence/manual",
+            json={**payload, "url": "https://news.example/story?token=do-not-store"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["evidence"]["id"] == second.json()["evidence"]["id"]
+    assert len(evidence.json()) == 1
+    assert evidence.json()[0]["raw_metadata"]["note"] == "User supplied text"
+    assert len(bundles.json()) == 1
+    assert bundles.json()[0]["full_text_count"] == 1
+    assert blocked.status_code == 400
+    assert credential_url.status_code == 400
+
+
+def test_research_candidate_uses_categories_only_and_blocks_sensitive_events() -> None:
+    bundle = {
+        "id": 5,
+        "readiness_status": "insufficient",
+        "missing_evidence": ["至少需要 1 条完整正文或官方公告"],
+    }
+    semantic = {
+        "id": 9,
+        "status": "ready",
+        "category_matches_json": json.dumps(
+            [{"category": "出行户外", "similarity": 0.7927}], ensure_ascii=False
+        ),
+        "positive_similarity": 0.7487,
+        "negative_similarity": 0.7802,
+        "opportunity_similarity": -0.0316,
+    }
+    candidate = candidate_from_event(
+        {"id": 338, "canonical_title": "沈阳暴雨", "trend_score": 71.4},
+        bundle,
+        semantic,
+    )
+    assert candidate is not None
+    assert candidate.category_candidates == [
+        {"category": "出行户外", "similarity": 0.7927}
+    ]
+    dumped = candidate.model_dump_json()
+    assert "Amazon" not in dumped and "售价" not in dumped and "商品名" not in dumped
+    assert candidate.missing_evidence == bundle["missing_evidence"]
+
+    blocked = candidate_from_event(
+        {"id": 2, "canonical_title": "枪击事件造成伤亡", "trend_score": 99},
+        bundle,
+        semantic,
+    )
+    assert blocked is None
+
+
+def test_research_candidate_version_and_bundle_change_supersede_previous(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "candidate-version.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,trend_score,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('candidate','candidate',80,?,?,?,?)""",
+        (now, now, now, now),
+    )
+    feature_id = db.execute(
+        """INSERT INTO semantic_event_features
+        (event_id,model_id,model_version,input_hash,feature_version,status,
+         category_matches_json,created_at)
+        VALUES(?,'fake','v1','hash','semantic-v1','ready','[]',?)""",
+        (event_id, now),
+    )
+    bundle_ids = []
+    for suffix in ("a", "b"):
+        bundle_ids.append(
+            db.execute(
+                """INSERT INTO evidence_bundles
+                (event_id,input_hash,version,readiness_status,readiness_score,
+                 full_text_count,title_only_count,independent_source_count,
+                 consumer_voice_count,official_source_count,created_at)
+                VALUES(?,?,'evidence-bundle-v1','insufficient',0.1,0,1,1,0,0,?)""",
+                (event_id, suffix, now),
+            )
+        )
+    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
+    semantic = {
+        "id": feature_id,
+        "status": "ready",
+        "category_matches": [{"category": "家居收纳", "similarity": 0.8}],
+    }
+    first_draft = candidate_from_event(
+        event,
+        {"id": bundle_ids[0], "readiness_status": "insufficient", "missing_evidence": []},
+        semantic,
+        version="candidate-v1",
+    )
+    first = persist_research_candidate(db, first_draft)
+    same = persist_research_candidate(db, first_draft)
+    second_draft = candidate_from_event(
+        event,
+        {"id": bundle_ids[1], "readiness_status": "partial", "missing_evidence": []},
+        semantic,
+        version="candidate-v2",
+    )
+    second = persist_research_candidate(db, second_draft)
+    assert first["id"] == same["id"]
+    assert second["id"] != first["id"]
+    assert db.one("SELECT status FROM research_candidates WHERE id=?", (first["id"],))[
+        "status"
+    ] == "superseded"
+
+
+def test_research_candidate_api_and_page_do_not_create_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "candidate-api.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,trend_score,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('持续防雨场景','持续防雨场景',75,?,?,?,?)""",
+        (now, now, now, now),
+    )
+    db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,evidence_type,fetch_status,
+         source_name,quality_score,valid_for_analysis)
+        VALUES(?,'hotlist','https://hot.example/rain','持续防雨场景','持续防雨场景',?,
+        'title_only','ready','hot',0.1,0)""",
+        (event_id, now),
+    )
+    db.execute(
+        """INSERT INTO semantic_event_features
+        (event_id,model_id,model_version,input_hash,feature_version,status,
+         category_matches_json,positive_similarity,negative_similarity,
+         opportunity_similarity,created_at)
+        VALUES(?,'fake','v1','hash','semantic-v1','ready',?,0.7,0.6,0.1,?)""",
+        (
+            event_id,
+            json.dumps([{"category": "出行户外", "similarity": 0.79}], ensure_ascii=False),
+            now,
+        ),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        created = client.post(f"/api/events/{event_id}/research-candidates")
+        listing = client.get("/api/research-candidates?status=pending")
+        page = client.get("/research")
+    assert created.status_code == 200
+    assert created.json()["candidate"]["category_candidates"][0]["category"] == "出行户外"
+    assert len(listing.json()) == 1
+    assert page.status_code == 200 and "持续防雨场景" in page.text
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+
+
+def make_research_chain(db: Database, *, ready: bool = True) -> tuple[int, list[int], int]:
+    now = "2026-07-17T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,trend_score,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('Recurring small-space constraints','recurringsmallspace',82,?,?,?,?)""",
+        (now, now, now, now),
+    )
+    evidence_ids = []
+    sources = ("official.example", "news.example") if ready else ("hot.example",)
+    for index, host in enumerate(sources, 1):
+        if ready:
+            values = (
+                "article",
+                "full_article",
+                "A complete independent report documents recurring consumer constraints over time.",
+                0.9,
+                1,
+            )
+        else:
+            values = ("hotlist", "title_only", "Recurring small-space constraints", 0.1, 0)
+        evidence_ids.append(
+            db.execute(
+                """INSERT INTO evidence
+                (event_id,kind,url,title,excerpt,fetched_at,evidence_type,fetch_status,
+                 source_name,quality_score,valid_for_analysis)
+                VALUES(?,?,?,?,?, ?,?,'ready',?,?,?)""",
+                (
+                    event_id,
+                    values[0],
+                    f"https://{host}/story-{index}",
+                    f"Evidence {index}",
+                    values[2],
+                    now,
+                    values[1],
+                    host,
+                    values[3],
+                    values[4],
+                ),
+            )
+        )
+    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
+    bundle = persist_evidence_bundle(
+        db,
+        build_evidence_bundle(
+            event, db.all("SELECT * FROM evidence WHERE event_id=?", (event_id,))
+        ),
+    )
+    feature_id = db.execute(
+        """INSERT INTO semantic_event_features
+        (event_id,model_id,model_version,input_hash,feature_version,status,
+         category_matches_json,positive_similarity,negative_similarity,
+         opportunity_similarity,created_at)
+        VALUES(?,'fake','v1',?,'semantic-v1','ready',?,0.8,0.5,0.3,?)""",
+        (
+            event_id,
+            f"hash-{event_id}",
+            json.dumps([{"category": "家居收纳", "similarity": 0.84}], ensure_ascii=False),
+            now,
+        ),
+    )
+    semantic = db.one("SELECT * FROM semantic_event_features WHERE id=?", (feature_id,))
+    candidate = persist_research_candidate(
+        db,
+        candidate_from_event(event, bundle, semantic),
+    )
+    return event_id, evidence_ids, candidate["id"]
+
+
+def test_research_run_is_idempotent_and_completes_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "research-run.db")
+    db.initialize()
+    _event_id, _evidence_ids, candidate_id = make_research_chain(db)
+    monkeypatch.setattr(main_app, "db", db)
+    payload = {
+        "executor_type": "human",
+        "executor_name": "researcher",
+        "budget": {"max_search_queries": 2, "max_fetch_pages": 3, "timeout_seconds": 60},
+    }
+    with TestClient(main_app.app) as client:
+        first = client.post(f"/api/research-candidates/{candidate_id}/runs", json=payload)
+        second = client.post(f"/api/research-candidates/{candidate_id}/runs", json=payload)
+        leased = client.post(
+            f"/api/research-candidates/{candidate_id}/runs",
+            json={**payload, "executor_name": "other-researcher"},
+        )
+        completed = client.post(
+            f"/api/research-runs/{first.json()['id']}/complete",
+            json={"status": "completed"},
+        )
+    assert first.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert leased.status_code == 409
+    assert "active executor" in leased.json()["detail"]
+    assert completed.json()["status"] == "completed"
+    assert db.one("SELECT status FROM research_candidates WHERE id=?", (candidate_id,))[
+        "status"
+    ] == "evidence_ready"
+
+
+def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "research-run-page.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    candidate = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    run = start_research_run(
+        db,
+        candidate,
+        ResearchRunInput(
+            executor_type="agent",
+            executor_name="audited-agent",
+            budget=ResearchBudget(max_fetch_pages=2, timeout_seconds=45),
+        ),
+    )
+    record_research_tool_call(
+        db,
+        run,
+        ResearchToolResultInput(
+            tool_name="get_context",
+            request={"event_id": event_id},
+            status="completed",
+            result_evidence_ids=evidence_ids,
+            latency_ms=7,
+        ),
+    )
+    completed = complete_research_run(
+        db,
+        run,
+        ResearchRunCompleteInput(status="completed"),
+    )
+    assert completed["status"] == "completed"
+    assert db.one("SELECT status FROM research_candidates WHERE id=?", (candidate_id,))[
+        "status"
+    ] == "insufficient_evidence"
+
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        audited_page = client.get(f"/events/{event_id}")
+    assert "get_context" in audited_page.text
+    assert "工具调用审计（1）" in audited_page.text
+    assert "公开页面 2" in audited_page.text
+
+    failed_run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="agent", executor_name="failed-agent"),
+    )
+    complete_research_run(
+        db,
+        failed_run,
+        ResearchRunCompleteInput(status="failed", error="provider unavailable"),
+    )
+    with TestClient(main_app.app) as client:
+        page = client.get(f"/events/{event_id}")
+    assert page.status_code == 200
+    assert "自动 Agent 未启用" in page.text
+    assert "failed-agent" in page.text
+    assert "运行失败" in page.text
+    assert "provider unavailable" in page.text
+
+
+def test_write_api_requires_admin_token_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "protected-write.db")
+    db.initialize()
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(
+        main_app, "settings", replace(main_app.settings, admin_token="test-secret")
+    )
+    with TestClient(main_app.app) as client:
+        unauthorized = client.post("/api/events/999/evidence-bundle/rebuild")
+        authorized = client.post(
+            "/api/events/999/evidence-bundle/rebuild",
+            headers={"x-admin-token": "test-secret"},
+        )
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 404
+
+
+def test_research_tool_audit_rejects_and_redacts_credentials(tmp_path: Path) -> None:
+    db = Database(tmp_path / "credential-audit.db")
+    db.initialize()
+    _event_id, _evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="agent", executor_name="credential-test"),
+    )
+    with pytest.raises(ValueError, match="sensitive credential"):
+        record_research_tool_call(
+            db,
+            run,
+            ResearchToolResultInput(
+                tool_name="fetch_public_page",
+                request={"url": "https://example.com", "api_key": "do-not-store"},
+                status="failed",
+            ),
+        )
+    saved = record_research_tool_call(
+        db,
+        run,
+        ResearchToolResultInput(
+            tool_name="get_context",
+            request={"event_id": 1},
+            status="failed",
+            error="provider failed: token=do-not-store Bearer another-secret",
+        ),
+    )
+    assert "do-not-store" not in saved["error"]
+    assert "another-secret" not in saved["error"]
+    assert "[REDACTED]" in saved["error"]
+
+
+def test_human_assessment_requires_bundle_evidence_and_approved_review_creates_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "assessment.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db)
+    other_event = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('other','other','2026-07-17','2026-07-17','2026-07-17','2026-07-17')"""
+    )
+    other_evidence = db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,evidence_type,fetch_status,source_name,quality_score)
+        VALUES(?,'article','https://other.example/x','Other','Other complete evidence text long enough.',
+        '2026-07-17','full_article','ready','other',0.9)""",
+        (other_event,),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+    payload = {
+        "assessment_status": "worth_following",
+        "change_type": "居住空间约束持续变化",
+        "consumer_relevance": "多来源显示小空间住户持续受到储物约束影响。",
+        "durability": "跨季节持续",
+        "lead_time_fit": "适合常规实体商品开发周期",
+        "target_users": ["小空间住户"],
+        "new_scenarios": ["动态调整储物空间"],
+        "unmet_needs": ["现有固定结构无法灵活调整"],
+        "related_product_categories": ["家居收纳"],
+        "fact_claims": [
+            {"claim": "约束在多个时间点重复出现", "evidence_ids": evidence_ids}
+        ],
+        "inferences": [
+            {"claim": "值得继续验证实体收纳方向", "evidence_ids": evidence_ids}
+        ],
+        "evidence_ids": evidence_ids,
+        "missing_evidence": ["平台需求数据"],
+    }
+    with TestClient(main_app.app) as client:
+        invalid = client.post(
+            f"/api/research-candidates/{candidate_id}/assessments",
+            json={
+                **payload,
+                "evidence_ids": [other_evidence],
+                "fact_claims": [
+                    {"claim": "cross event", "evidence_ids": [other_evidence]}
+                ],
+                "inferences": [],
+            },
+        )
+        created = client.post(
+            f"/api/research-candidates/{candidate_id}/assessments", json=payload
+        )
+        reviewed = client.post(
+            f"/api/opportunity-assessments/{created.json()['id']}/review",
+            json={"review_status": "approved", "note": "引用与变化判断已核对"},
+        )
+        reviewed_again = client.post(
+            f"/api/opportunity-assessments/{created.json()['id']}/review",
+            json={"review_status": "approved", "note": "重复请求"},
+        )
+    assert invalid.status_code == 400
+    assert created.status_code == 200
+    assert reviewed.status_code == 200
+    signal = reviewed.json()["opportunity_signal"]
+    assert signal["event_id"] == event_id
+    assert signal["opportunity_assessment_id"] == created.json()["id"]
+    assert signal["product_opportunity_score"] == 0
+    assert reviewed_again.json()["opportunity_signal"]["id"] == signal["id"]
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM product_hypotheses")["n"] == 0
+    feedback = db.one(
+        "SELECT * FROM opportunity_signal_feedback WHERE signal_id=?", (signal["id"],)
+    )
+    snapshot = json.loads(feedback["snapshot_json"])
+    assert snapshot["event"]["id"] == event_id
+    assert snapshot["evidence_bundle"]["id"]
+    assert snapshot["research_candidate"]["id"] == candidate_id
+    assert snapshot["opportunity_assessment"]["id"] == created.json()["id"]
+    assert {item["id"] for item in snapshot["evidence"]} >= set(evidence_ids)
+
+
+def test_insufficient_assessment_cannot_be_approved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "insufficient-assessment.db")
+    db.initialize()
+    _event_id, evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        created = client.post(
+            f"/api/research-candidates/{candidate_id}/assessments",
+            json={
+                "assessment_status": "insufficient_evidence",
+                "evidence_ids": evidence_ids,
+                "missing_evidence": ["完整正文"],
+                "abstention_reason": "只有标题证据",
+            },
+        )
+        reviewed = client.post(
+            f"/api/opportunity-assessments/{created.json()['id']}/review",
+            json={"review_status": "approved"},
+        )
+    assert created.status_code == 200
+    assert reviewed.status_code == 409
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_controlled_research_tools_resume_enforce_budget_and_deduplicate_evidence(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "research-tools.db")
+    db.initialize()
+    event_id, _evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    candidate = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    run = start_research_run(
+        db,
+        candidate,
+        ResearchRunInput(
+            executor_type="agent",
+            executor_name="test-agent",
+            budget=ResearchBudget(max_fetch_pages=1, timeout_seconds=30),
+        ),
+    )
+
+    async def fake_fetch(url: str, title: str) -> EvidenceResult:
+        return EvidenceResult(
+            url,
+            title,
+            "A complete public report documents recurring consumer constraints over time.",
+            "2026-07-17T00:00:00+00:00",
+            200,
+            hashlib.sha256(url.encode()).hexdigest(),
+        )
+
+    executor = ResearchToolExecutor(db, fetcher=fake_fetch)
+    request = {
+        "url": "https://new-source.example/report",
+        "title": "Independent report",
+        "source_name": "new-source",
+    }
+    first = await executor.execute(run, "fetch_public_page", request)
+    replayed = await ResearchToolExecutor(db, fetcher=fake_fetch).execute(
+        run, "fetch_public_page", request
+    )
+    context = await ResearchToolExecutor(db, fetcher=fake_fetch).execute(
+        run, "get_context", {}
+    )
+    assert first["replayed"] is False
+    assert replayed["replayed"] is True
+    assert first["tool_call"]["id"] == replayed["tool_call"]["id"]
+    assert len(
+        db.all(
+            "SELECT * FROM evidence WHERE event_id=? AND url='https://new-source.example/report'",
+            (event_id,),
+        )
+    ) == 1
+    assert context["result"]["candidate"]["id"] == candidate_id
+    assert context["result"]["candidate"]["evidence_bundle_id"] == first["result"][
+        "evidence_bundle"
+    ]["id"]
+    assert context["result"]["candidate"]["evidence_bundle_id"] != candidate[
+        "evidence_bundle_id"
+    ]
+    assert db.one("SELECT COUNT(*) n FROM research_tool_calls")["n"] == 2
+    columns = {row["name"] for row in db.all("PRAGMA table_info(research_tool_calls)")}
+    assert "request_json" not in columns
+    with pytest.raises(ValueError, match="budget exhausted"):
+        await executor.execute(
+            run,
+            "fetch_public_page",
+            {"url": "https://third.example/report", "title": "Third"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_cloud_assessment_preflight_gates_model_and_failure_is_explicit() -> None:
+    class FakeResponses:
+        def __init__(self, parsed=None, error: Exception | None = None):
+            self.parsed = parsed
+            self.error = error
+            self.calls = 0
+
+        async def parse(self, **_kwargs):
+            self.calls += 1
+            if self.error:
+                raise self.error
+            return SimpleNamespace(output_parsed=self.parsed, output=[])
+
+    class FakeClient:
+        def __init__(self, responses):
+            self.responses = responses
+
+    insufficient_responses = FakeResponses()
+    insufficient_provider = CloudOpportunityAssessmentProvider(
+        "key", "test-model", client=FakeClient(insufficient_responses)
+    )
+    insufficient = await insufficient_provider.assess(
+        {"id": 1, "canonical_title": "Rain", "market": "CN"},
+        {
+            "readiness_status": "insufficient",
+            "evidence_ids": [1],
+            "missing_evidence": ["完整正文"],
+        },
+        {"id": 1},
+        [{"id": 1}],
+    )
+    assert insufficient.draft.assessment_status == "insufficient_evidence"
+    assert insufficient_responses.calls == 0
+
+    sensitive_responses = FakeResponses()
+    sensitive_provider = CloudOpportunityAssessmentProvider(
+        "key", "test-model", client=FakeClient(sensitive_responses)
+    )
+    sensitive = await sensitive_provider.assess(
+        {"id": 2, "canonical_title": "枪击事件造成伤亡", "market": "CN"},
+        {"readiness_status": "ready_for_assessment", "evidence_ids": [2]},
+        {"id": 2},
+        [{"id": 2}],
+    )
+    assert sensitive.draft.assessment_status == "abstained"
+    assert sensitive_responses.calls == 0
+
+    failed_responses = FakeResponses(error=RuntimeError("provider unavailable"))
+    failed_provider = CloudOpportunityAssessmentProvider(
+        "key", "test-model", client=FakeClient(failed_responses)
+    )
+    failed = await failed_provider.assess(
+        {"id": 3, "canonical_title": "Recurring storage", "market": "US"},
+        {"readiness_status": "ready_for_assessment", "evidence_ids": [3]},
+        {"id": 3},
+        [{"id": 3, "title": "Report", "excerpt": "Complete report"}],
+    )
+    assert failed.draft.assessment_status == "abstained"
+    assert "provider unavailable" in failed.draft.abstention_reason
+    assert failed.engine.endswith("-failed")
+
+
+@pytest.mark.asyncio
+async def test_cloud_assessment_unknown_citation_is_rejected_after_structured_output() -> None:
+    parsed = OpportunityAssessmentDraft(
+        assessment_status="worth_following",
+        change_type="空间约束变化",
+        consumer_relevance="住户持续受到影响",
+        durability="长期",
+        lead_time_fit="匹配",
+        target_users=["小空间住户"],
+        new_scenarios=["动态收纳"],
+        unmet_needs=["灵活结构"],
+        related_product_categories=["家居收纳"],
+        fact_claims=[{"claim": "事实", "evidence_ids": [999]}],
+        evidence_ids=[999],
+    )
+
+    class FakeResponses:
+        async def parse(self, **_kwargs):
+            return SimpleNamespace(output_parsed=parsed, output=[])
+
+    provider = CloudOpportunityAssessmentProvider(
+        "key", "test-model", client=SimpleNamespace(responses=FakeResponses())
+    )
+    result = await provider.assess(
+        {"id": 1, "canonical_title": "Recurring storage", "market": "US"},
+        {"readiness_status": "ready_for_assessment", "evidence_ids": [1]},
+        {"id": 1, "event_id": 1},
+        [{"id": 1, "event_id": 1, "title": "Report", "excerpt": "Complete report"}],
+    )
+    with pytest.raises(ValueError, match="unknown or cross-event"):
+        validate_assessment_evidence(
+            {"event_id": 1},
+            {"evidence_ids": [1]},
+            [{"id": 1, "event_id": 1}],
+            result.draft,
+        )
+    with pytest.raises(ValueError):
+        OpportunityAssessmentDraft.model_validate(
+            {
+                **parsed.model_dump(),
+                "product_hypothesis": {"name": "forbidden"},
+            }
+        )
