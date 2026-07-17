@@ -17,8 +17,8 @@ class Settings:
     database_path: Path
     newsnow_base_url: str
     source_ids: tuple[str, ...]
-    analysis_top_n: int
-    overseas_analysis_top_n: int
+    research_candidate_top_n: int
+    overseas_research_candidate_top_n: int
     google_trends_geos: tuple[str, ...]
     reddit_client_id: str | None
     reddit_client_secret: str | None
@@ -42,6 +42,15 @@ class Settings:
     semantic_feature_version: str = "semantic-v1"
     semantic_duplicate_threshold: float = 0.90
     semantic_duplicate_window: int = 500
+    evidence_bundle_version: str = "evidence-bundle-v1"
+    evidence_ready_score: float = 1.8
+    research_candidate_version: str = "research-candidate-v1"
+    research_max_search_queries: int = 8
+    research_max_fetch_pages: int = 15
+    research_max_browser_pages: int = 3
+    research_timeout_seconds: int = 300
+    enable_research_agent: bool = False
+    enable_browser_evidence: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -60,9 +69,29 @@ class Settings:
                 "NEWSNOW_BASE_URL", "https://newsnow.busiyi.world"
             ).rstrip("/"),
             source_ids=sources,
-            analysis_top_n=max(1, min(int(os.getenv("ANALYSIS_TOP_N", "5")), 20)),
-            overseas_analysis_top_n=max(
-                1, min(int(os.getenv("OVERSEAS_ANALYSIS_TOP_N", "5")), 20)
+            research_candidate_top_n=max(
+                1,
+                min(
+                    int(
+                        os.getenv(
+                            "RESEARCH_CANDIDATE_TOP_N",
+                            os.getenv("ANALYSIS_TOP_N", "5"),
+                        )
+                    ),
+                    20,
+                ),
+            ),
+            overseas_research_candidate_top_n=max(
+                1,
+                min(
+                    int(
+                        os.getenv(
+                            "OVERSEAS_RESEARCH_CANDIDATE_TOP_N",
+                            os.getenv("OVERSEAS_ANALYSIS_TOP_N", "5"),
+                        )
+                    ),
+                    20,
+                ),
             ),
             google_trends_geos=tuple(
                 part.strip().upper()
@@ -120,4 +149,27 @@ class Settings:
             semantic_duplicate_window=max(
                 10, min(int(os.getenv("SEMANTIC_DUPLICATE_WINDOW", "500")), 5000)
             ),
+            evidence_bundle_version=os.getenv(
+                "EVIDENCE_BUNDLE_VERSION", "evidence-bundle-v1"
+            ).strip(),
+            evidence_ready_score=max(
+                0.0, float(os.getenv("EVIDENCE_READY_SCORE", "1.8"))
+            ),
+            research_candidate_version=os.getenv(
+                "RESEARCH_CANDIDATE_VERSION", "research-candidate-v1"
+            ).strip(),
+            research_max_search_queries=max(
+                0, int(os.getenv("RESEARCH_MAX_SEARCH_QUERIES", "8"))
+            ),
+            research_max_fetch_pages=max(
+                0, int(os.getenv("RESEARCH_MAX_FETCH_PAGES", "15"))
+            ),
+            research_max_browser_pages=max(
+                0, int(os.getenv("RESEARCH_MAX_BROWSER_PAGES", "3"))
+            ),
+            research_timeout_seconds=max(
+                1, int(os.getenv("RESEARCH_TIMEOUT_SECONDS", "300"))
+            ),
+            enable_research_agent=_bool_env("ENABLE_RESEARCH_AGENT"),
+            enable_browser_evidence=_bool_env("ENABLE_BROWSER_EVIDENCE"),
         )

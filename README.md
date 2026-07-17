@@ -8,6 +8,27 @@
 
 固定产品模板、假设分代理市场分和未验证产品榜单已经在 Phase 0 停用。后续设计与开发以 [产品边界与分层架构](docs/product-boundary-and-architecture.md) 为准。
 
+## 目标研究架构
+
+系统已采用“核心程序 + Evidence 工具 + Research Skill + Research Agent”的混合架构，不把系统改造成纯 Agent：
+
+```text
+趋势事件（发现正在发生什么）
+  -> 证据包（区分正文、标题、消费者声音和抓取失败）
+  -> 待研究候选（保存值得调查的方向，不等于机会结论）
+  -> Research Agent + Skill（搜索、抓取、核对和补充证据）
+  -> 机会评估（事实、推断、引用、缺失证据和弃权原因）
+  -> 人工确认
+  -> 新品机会线索 -> 商品假设 -> 市场证据 -> 已验证推荐
+```
+
+- 核心程序继续负责数据库、状态机、审计、风险门和定时运行，是唯一事实来源。
+- Evidence 工具负责公开网页、来源适配、浏览器和人工证据接入；MCP 只是可选工具接口。
+- Skill 固化研究步骤与证据标准，Agent 负责编排工具，大模型只对已有证据做带引用的综合。
+- Embedding 继续用于检索、跨语言匹配、重复候选和类目联想，不承担最终机会判断。
+
+该研究链的核心程序结构和阶段 0–7 接口已实现：包含不可变 `EvidenceBundle`、`ResearchCandidate`、可恢复 `ResearchRun`、受控研究工具、人工/规则/可选云端 `OpportunityAssessment`、引用校验和人工审核。当前仍有一项验收偏差：默认 `ENABLE_EMBEDDINGS=false` 时语义特征不是 `ready`，Pipeline 不会自动创建 ResearchCandidate，因此默认配置下的无模型人工闭环尚未真正贯通。MCP 与浏览器登录态不是核心依赖，默认不启用；系统不会自动创建 OpportunitySignal。详细决策见 [研究架构](docs/research-agent-architecture.md)，表结构、接口与验收标准见 [实施计划](docs/research-agent-implementation-plan.md)，当前状态见 [HANDOFF](HANDOFF.md)。
+
 ## 当前能力
 
 - 国内数据：默认通过 NewsNow 公共 API 采集微博、知乎、百度、抖音、头条、B 站、酷安和贴吧。
@@ -17,9 +38,9 @@
 - 可追溯：保存每次请求的状态、延迟、原始响应哈希、热榜排名和事件聚类关系。
 - 可解释：趋势分由代码计算并显示所有分项；模型判断分、市场分和已验证推荐分分别保存。
 - 证据优先：尝试读取热榜链接正文；失败时保留真实热榜标题、URL 和 HTTP 状态，不伪造正文。
-- 分析降级：OpenAI-compatible 分析路径只允许生成 OpportunitySignal，禁止直接生成商品假设；未配置或调用失败时，`local-rules-v2` 只做事实层安全检查并主动弃权。
+- 研究分层：定时 Pipeline 只构建 EvidenceBundle 和 ResearchCandidate；可选云端模型只能生成带引用的 OpportunityAssessment，不能直接生成 Signal 或商品假设。
 - 安全门：死亡、犯罪和受害者相关敏感事件不生成商业化建议。
-- 主动弃权：本地规则始终返回零商品假设，不用通用模板凑结果。
+- 主动弃权：证据不足、敏感事件或模型失败会形成显式弃权状态，不使用商品模板或本地规则伪装分析结果。
 - 推送门槛：单条商品只有完成人工审核、市场验证和风险门后才能作为已验证推荐推送，重复推送具有幂等保护。
 - 趋势摘要：首页和飞书分别展示中国、海外事实层趋势信号 Top 3，并明确标注它们不是商品推荐。
 - 市场验证分层：假设分、Amazon 一方市场分和可空的已验证推荐分分开保存；未完成市场验证时推荐分为空，不补写搜索量、竞争或利润数据。
@@ -60,7 +81,7 @@ python -m pip install -e .
 
 ```powershell
 $env:GOOGLE_TRENDS_GEOS='US,GB,DE,JP'
-$env:OVERSEAS_ANALYSIS_TOP_N='5'
+$env:OVERSEAS_RESEARCH_CANDIDATE_TOP_N='5'
 python -m app.cli run
 ```
 
@@ -88,7 +109,7 @@ $env:OPENAI_BASE_URL='https://example.com/v1'
 python -m app.cli run
 ```
 
-模型输出必须通过 Pydantic Schema，并且只能引用数据库中存在的证据 ID。如果模型失败，运行会明确记录 `local-rules` 引擎，不会冒充模型结果。
+模型输出必须通过 Pydantic Schema，并且只能引用数据库中存在且属于当前 Bundle 的证据 ID。如果模型失败，OpportunityAssessment 会明确记录 `abstained` 和失败原因，不会回退到本地商品规则。
 
 ## 飞书推送
 

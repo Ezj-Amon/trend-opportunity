@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpportunityAssessmentDraft",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["assessment_status", "evidence_ids", "missing_evidence", "abstention_reason"],
+  "properties": {
+    "assessment_status": {
+      "enum": ["worth_following", "abstained", "insufficient_evidence"]
+    },
+    "change_type": {"type": "string"},
+    "consumer_relevance": {"type": "string"},
+    "durability": {"type": "string"},
+    "lead_time_fit": {"type": "string"},
+    "target_users": {"type": "array", "items": {"type": "string"}},
+    "new_scenarios": {"type": "array", "items": {"type": "string"}},
+    "unmet_needs": {"type": "array", "items": {"type": "string"}},
+    "related_product_categories": {"type": "array", "items": {"type": "string"}},
+    "fact_claims": {"type": "array", "items": {"$ref": "#/$defs/citedClaim"}},
+    "inferences": {"type": "array", "items": {"$ref": "#/$defs/citedClaim"}},
+    "evidence_ids": {"type": "array", "items": {"type": "integer"}},
+    "missing_evidence": {"type": "array", "items": {"type": "string"}},
+    "abstention_reason": {"type": "string"},
+    "research_run_id": {"type": ["string", "null"]}
+  },
+  "$defs": {
+    "citedClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "evidence_ids"],
+      "properties": {
+        "claim": {"type": "string", "minLength": 1},
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}研究队列 · 选品助手{% endblock %}
+{% block content %}
+<section class="hero compact-hero"><div><p class="eyebrow">RESEARCH QUEUE</p><h1>待研究方向</h1><p class="muted">类目联想只是研究导航；ResearchCandidate 不能进入商品假设或推荐队列。</p></div><div class="hero-score"><strong>{{ candidate_count }}</strong><span>候选总数</span></div></section>
+{% set labels = {'pending':'待研究','researching':'研究中','insufficient_evidence':'证据不足','awaiting_review':'等待审核','evidence_ready':'证据已准备','completed':'已完成','failed':'失败'} %}
+{% for status in ['awaiting_review','researching','pending','insufficient_evidence','evidence_ready','failed','completed'] %}
+<section class="panel research-group">
+  <div class="panel-head"><h2>{{ labels[status] }}</h2><span>{{ grouped_candidates[status]|length }} 条</span></div>
+  <div class="research-candidate-list">
+  {% for item in grouped_candidates[status] %}
+    <article class="research-candidate">
+      <div><a href="/events/{{ item.event_id }}"><strong>#{{ item.id }} · {{ item.event_title }}</strong></a><small>{{ item.market }} · 趋势 {{ item.trend_score }} · 优先级 {{ item.priority }}</small></div>
+      <p>{{ item.candidate_reason }}</p>
+      <div class="chips">{% for category in item.category_candidates %}<span>{{ category.category }} {{ '%.4f'|format(category.similarity) }}</span>{% endfor %}</div>
+      <small>证据准备度 {{ item.readiness_status }} / {{ item.readiness_score }} · 缺失：{{ item.missing_evidence|join('；') if item.missing_evidence else '无' }}</small>
+      {% if item.latest_run %}<small>最近 Run：{{ item.latest_run.executor_type }} / {{ item.latest_run.executor_name }} · {{ item.latest_run.status }}</small>{% endif %}
+      {% if item.latest_assessment %}<small>最近 Assessment：{{ item.latest_assessment.assessment_status }} · 审核 {{ item.latest_assessment.review_status }}</small>{% endif %}
+      {% if item.status in ['pending','evidence_ready','insufficient_evidence','failed'] %}<div><button class="compact primary" onclick="startRun({{ item.id }})">启动人工研究</button></div>{% endif %}
+    </article>
+  {% else %}<div class="empty">当前没有{{ labels[status] }}候选。</div>{% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}
+{% block scripts %}<script>
+async function startRun(candidateId){if(await postAction(`/api/research-candidates/${candidateId}/runs`,'ResearchRun 已启动',{executor_type:'human',executor_name:'research-queue',budget:{}}))setTimeout(()=>location.reload(),300);}
+</script>{% endblock %}

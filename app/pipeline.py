@@ -5,17 +5,19 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
 
-from .analysis import Analyzer
-from .amazon import marketplace_code, marketplace_name
 from .clustering import normalize_title, should_merge
 from .config import Settings
 from .db import Database
-from .deduplication import collapse_unworked_duplicate_opportunities
 from .evidence import fetch_evidence
-from .market_validation import UnavailableMarketValidator
-from .risk import assess_product_risk
+from .evidence_bundle import build_evidence_bundle, persist_evidence_bundle
+from .evidence_collectors import (
+    CollectedEvidence,
+    RelatedNewsCollector,
+    persist_collected_evidence,
+)
+from .research import ResearchBudget
+from .research_candidates import candidate_from_event, persist_research_candidate
 from .semantic import (
     EmbeddingUnavailable,
     SemanticFeatureExtractor,
@@ -25,9 +27,6 @@ from .semantic import (
 )
 from .semantic_duplicates import create_duplicate_candidates
 from .scoring import (
-    calculate_evidence_confidence,
-    calculate_final_score,
-    calculate_opportunity_score,
     calculate_trend_scores,
 )
 from .sources import (
@@ -36,9 +35,6 @@ from .sources import (
     RedditOAuthSource,
     SourceResult,
 )
-
-
-ANALYSIS_PROMPT_VERSION = "opportunity-prompt-v7-market-validation"
 
 
 def utc_now() -> str:
@@ -61,8 +57,6 @@ class Pipeline:
             if settings.reddit_client_id and settings.reddit_client_secret
             else None
         )
-        self.analyzer = Analyzer(settings)
-        self.market_validator = UnavailableMarketValidator()
         self.semantic_extractor = (
             SemanticFeatureExtractor(
                 SentenceTransformerEmbedder(
@@ -92,15 +86,6 @@ class Pipeline:
             self._progress = {}
         self._progress.update(updates)
         self._progress["updated_at"] = utc_now()
-
-    @property
-    def analysis_version(self) -> str:
-        engine = (
-            f"llm-{self.settings.openai_model}"
-            if self.settings.openai_api_key
-            else "local-rules-v2"
-        )
-        return f"{ANALYSIS_PROMPT_VERSION}:{engine}"
 
     async def run(self, trigger: str = "manual") -> str:
         if self._lock.locked():
@@ -134,7 +119,6 @@ class Pipeline:
             raise RuntimeError("pipeline lease was lost during execution")
 
     async def _run_locked(self, trigger: str, lease_lost: asyncio.Event) -> str:
-        self._invalidate_old_analysis_versions()
         run_id = str(uuid.uuid4())
         self.db.execute(
             """INSERT INTO pipeline_runs
@@ -150,9 +134,11 @@ class Pipeline:
                         "google_trends_geos": self.settings.google_trends_geos,
                         "reddit_configured": bool(self.reddit_source),
                         "newsnow_base_url": self.settings.newsnow_base_url,
-                        "analysis_top_n": self.settings.analysis_top_n,
-                        "overseas_analysis_top_n": self.settings.overseas_analysis_top_n,
-                        "analysis_engine": "llm" if self.settings.openai_api_key else "local-rules",
+                        "research_candidate_top_n": self.settings.research_candidate_top_n,
+                        "overseas_research_candidate_top_n": (
+                            self.settings.overseas_research_candidate_top_n
+                        ),
+                        "pipeline_mode": "evidence-bundle-research-candidate",
                     }
                 ),
             ),
@@ -176,7 +162,7 @@ class Pipeline:
             "items_count": 0,
             "events_count": 0,
             "selected_count": 0,
-            "analyzed_count": 0,
+            "researched_count": 0,
             "source_results": [],
         }
         try:
@@ -228,20 +214,20 @@ class Pipeline:
             event_ids = self._consolidate_unanalyzed_events(event_ids)
             self._score_events(event_ids)
             self._set_progress(
-                stage="analyze",
+                stage="research",
                 progress_percent=55,
                 events_count=len(event_ids),
             )
-            self._update_run(run_id, stage="analyze", events_count=len(event_ids))
+            self._update_run(run_id, stage="research", events_count=len(event_ids))
             selected_ids = self._select_events(event_ids)
             self._set_progress(selected_count=len(selected_ids))
-            for analyzed_count, event_id in enumerate(selected_ids, 1):
-                await self._research_and_analyze(run_id, event_id)
+            for researched_count, event_id in enumerate(selected_ids, 1):
+                await self._build_research_candidate(event_id)
                 self._ensure_lease(lease_lost)
                 self._set_progress(
-                    analyzed_count=analyzed_count,
+                    researched_count=researched_count,
                     progress_percent=55
-                    + round(40 * analyzed_count / max(len(selected_ids), 1)),
+                    + round(40 * researched_count / max(len(selected_ids), 1)),
                 )
             self._update_run(
                 run_id,
@@ -273,25 +259,6 @@ class Pipeline:
             )
             raise
         return run_id
-
-    def _invalidate_old_analysis_versions(self) -> None:
-        self.db.execute(
-            """UPDATE opportunity_signals SET review_status='superseded', updated_at=?
-            WHERE review_status!='superseded' AND analysis_id IN
-            (SELECT id FROM analyses WHERE prompt_version!=?)""",
-            (utc_now(), self.analysis_version),
-        )
-        self.db.execute(
-            """UPDATE product_opportunities SET review_status='superseded', updated_at=?
-            WHERE review_status!='superseded' AND analysis_id IN
-            (SELECT id FROM analyses WHERE prompt_version!=?)""",
-            (utc_now(), self.analysis_version),
-        )
-        self.db.execute(
-            """UPDATE analyses SET status='superseded'
-            WHERE prompt_version!=? AND status!='superseded'""",
-            (self.analysis_version,),
-        )
 
     def _update_run(self, run_id: str, **updates: Any) -> None:
         allowed = {
@@ -573,37 +540,29 @@ class Pipeline:
             f"""SELECT id FROM trend_events
             WHERE id IN ({placeholders}) AND market='CN'
             ORDER BY trend_score DESC LIMIT ?""",
-            tuple(event_ids) + (self.settings.analysis_top_n,),
+            tuple(event_ids) + (self.settings.research_candidate_top_n,),
         )
         overseas = self.db.all(
             f"""SELECT id FROM trend_events
             WHERE id IN ({placeholders}) AND market!='CN'
             ORDER BY trend_score DESC LIMIT ?""",
-            tuple(event_ids) + (self.settings.overseas_analysis_top_n,),
+            tuple(event_ids) + (self.settings.overseas_research_candidate_top_n,),
         )
         return [int(row["id"]) for row in [*domestic, *overseas]]
 
-    async def _research_and_analyze(self, run_id: str, event_id: int) -> None:
+    async def _build_research_candidate(self, event_id: int) -> None:
         event = self.db.one("SELECT * FROM trend_events WHERE id = ?", (event_id,))
-        recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
-        recent_analysis = self.db.one(
-            """SELECT id FROM analyses WHERE event_id=? AND prompt_version=?
-            AND created_at>=? ORDER BY id DESC LIMIT 1""",
-            (event_id, self.analysis_version, recent_cutoff),
-        )
-        if recent_analysis:
-            return
         members = self.db.all(
             """SELECT i.* FROM source_items i
             JOIN event_members m ON m.source_item_id=i.id
             WHERE m.event_id=? ORDER BY i.rank LIMIT 5""",
             (event_id,),
         )
-        unique_urls: list[tuple[str, str]] = []
+        unique_urls: list[tuple[str, str, str]] = []
         seen_urls: set[str] = set()
         for member in members:
             if member["url"] not in seen_urls:
-                unique_urls.append((member["url"], member["title"]))
+                unique_urls.append((member["url"], member["title"], member["source"]))
                 seen_urls.add(member["url"])
                 raw = json.loads(member["raw_json"])
                 extra = raw.get("extra") if isinstance(raw.get("extra"), dict) else {}
@@ -615,12 +574,18 @@ class Pipeline:
                 self.db.execute(
                     """INSERT INTO evidence
                     (event_id, kind, url, title, excerpt, fetched_at, http_status,
-                     content_hash, is_consumer_voice, valid_for_analysis, error)
-                    VALUES (?, 'hotlist', ?, ?, ?, ?, NULL, NULL, ?, 1, NULL)
+                     content_hash, is_consumer_voice, valid_for_analysis, error,
+                     evidence_type,source_name,fetch_method,fetch_status,quality_score,
+                     quality_version,raw_metadata_json)
+                    VALUES (?, 'hotlist', ?, ?, ?, ?, NULL, NULL, ?, 0, NULL,
+                            'title_only',?,'source_snapshot','ready',0.1,
+                            'evidence-quality-v1',?)
                     ON CONFLICT(event_id, url) DO UPDATE SET
                       title=excluded.title,
                       excerpt=excluded.excerpt,
-                      is_consumer_voice=MAX(evidence.is_consumer_voice, excluded.is_consumer_voice)""",
+                      is_consumer_voice=MAX(evidence.is_consumer_voice, excluded.is_consumer_voice),
+                      source_name=CASE WHEN evidence.source_name='' THEN excluded.source_name ELSE evidence.source_name END,
+                      raw_metadata_json=excluded.raw_metadata_json""",
                     (
                         event_id,
                         member["url"],
@@ -631,258 +596,86 @@ class Pipeline:
                             member["source"] in {"coolapk", "tieba"}
                             or member["source"].startswith("reddit-")
                         ),
+                        member["source"],
+                        member["raw_json"],
                     ),
                 )
         fetched = await asyncio.gather(
-            *[fetch_evidence(url, title) for url, title in unique_urls[:3]]
+            *[fetch_evidence(url, title) for url, title, _source in unique_urls[:3]]
         )
-        for result in fetched:
-            valid_article = (
-                result.error is None
-                and result.http_status == 200
-                and len(result.excerpt.strip()) >= 20
+        for result, (_url, _title, source_name) in zip(fetched, unique_urls[:3], strict=True):
+            persist_collected_evidence(
+                self.db,
+                event_id,
+                CollectedEvidence(
+                    evidence_type=result.evidence_type,
+                    source_name=source_name,
+                    url=result.url,
+                    title=result.title,
+                    excerpt=result.excerpt,
+                    fetch_method=result.fetch_method,
+                    fetch_status=result.fetch_status,
+                    fetched_at=result.fetched_at,
+                    http_status=result.http_status,
+                    content_hash=result.content_hash,
+                    error=result.error,
+                    raw_metadata=result.raw_metadata,
+                ),
+                allow_upgrade=True,
             )
-            self.db.execute(
-                """INSERT INTO evidence
-                (event_id, kind, url, title, excerpt, fetched_at, http_status,
-                 content_hash, is_consumer_voice, valid_for_analysis, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(event_id, url) DO UPDATE SET
-                  kind=CASE WHEN excluded.valid_for_analysis=1 THEN 'article' ELSE evidence.kind END,
-                  title=CASE WHEN excluded.valid_for_analysis=1 THEN excluded.title ELSE evidence.title END,
-                  excerpt=CASE WHEN excluded.valid_for_analysis=1 THEN excluded.excerpt ELSE evidence.excerpt END,
-                  fetched_at=excluded.fetched_at,
-                  http_status=excluded.http_status,
-                  content_hash=CASE WHEN excluded.valid_for_analysis=1 THEN excluded.content_hash ELSE evidence.content_hash END,
-                  error=excluded.error""",
-                (
-                    event_id,
-                    "article" if valid_article else "fetch_failed",
-                    result.url,
-                    result.title,
-                    result.excerpt,
-                    result.fetched_at,
-                    result.http_status,
-                    result.content_hash,
-                    int(valid_article),
-                    result.error if result.error else (None if valid_article else "content too short"),
+        current_evidence = self.db.all(
+            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+        )
+        remaining_fetches = max(0, self.settings.research_max_fetch_pages - len(fetched))
+        if remaining_fetches:
+            related = await RelatedNewsCollector(fetcher=fetch_evidence).collect(
+                {**event, "source_items": members},
+                current_evidence,
+                ResearchBudget(
+                    max_search_queries=0,
+                    max_fetch_pages=remaining_fetches,
+                    max_browser_pages=0,
+                    timeout_seconds=self.settings.research_timeout_seconds,
+                    markets=[str(event.get("market") or "")],
+                    languages=[str(event.get("language") or "")],
                 ),
             )
+            for item in related:
+                persist_collected_evidence(
+                    self.db, event_id, item, allow_upgrade=True
+                )
+        all_evidence = self.db.all(
+            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+        )
+        bundle = persist_evidence_bundle(
+            self.db,
+            build_evidence_bundle(
+                event,
+                all_evidence,
+                self.settings.evidence_bundle_version,
+                self.settings.evidence_ready_score,
+            ),
+        )
         evidence = self.db.all(
             "SELECT * FROM evidence WHERE event_id=? AND valid_for_analysis=1", (event_id,)
         )
         await self._persist_semantic_features(event, evidence)
-        result = await self.analyzer.analyze(event, evidence)
-        created_at = utc_now()
-        self.db.execute(
-            "UPDATE analyses SET status='superseded' WHERE event_id=? AND status!='superseded'",
+        semantic_feature = self.db.one(
+            """SELECT * FROM semantic_event_features
+            WHERE event_id=? ORDER BY id DESC LIMIT 1""",
             (event_id,),
         )
-        self.db.execute(
-            """UPDATE product_opportunities SET review_status='superseded', updated_at=?
-            WHERE event_id=? AND review_status!='superseded'""",
-            (created_at, event_id),
+        human_label = self.db.one(
+            "SELECT label FROM semantic_evaluation_labels WHERE event_id=?", (event_id,)
         )
-        self.db.execute(
-            """UPDATE opportunity_signals SET review_status='superseded', updated_at=?
-            WHERE event_id=? AND review_status!='superseded'""",
-            (created_at, event_id),
+        draft = candidate_from_event(
+            {**event, "human_label": (human_label or {}).get("label", "")},
+            bundle,
+            semantic_feature,
+            version=self.settings.research_candidate_version,
         )
-        analysis_id = self.db.execute(
-            """INSERT INTO analyses
-            (event_id, run_id, engine, model, prompt_version, output_json, status, error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                event_id,
-                run_id,
-                result.engine,
-                result.model,
-                self.analysis_version,
-                result.output.model_dump_json(),
-                "degraded" if result.degraded_reason else "succeeded",
-                result.degraded_reason,
-                created_at,
-            ),
-        )
-        for signal in result.output.signals:
-            self.db.execute(
-                """INSERT INTO opportunity_signals
-                (event_id,analysis_id,change_type,consumer_relevance_score,
-                 product_opportunity_score,target_users_json,new_scenarios_json,
-                 unmet_needs_json,related_product_categories_json,durability,
-                 lead_time_fit,evidence_ids_json,confidence,missing_evidence_json,
-                 review_status,engine,model,version,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)""",
-                (
-                    event_id,
-                    analysis_id,
-                    signal.change_type,
-                    signal.consumer_relevance_score,
-                    signal.product_opportunity_score,
-                    self.db.json(signal.target_users),
-                    self.db.json(signal.new_scenarios),
-                    self.db.json(signal.unmet_needs),
-                    self.db.json(signal.related_product_categories),
-                    signal.durability,
-                    signal.lead_time_fit,
-                    self.db.json(signal.evidence_ids),
-                    signal.confidence,
-                    self.db.json(signal.missing_evidence),
-                    result.engine,
-                    result.model,
-                    self.analysis_version,
-                    created_at,
-                    created_at,
-                ),
-            )
-        article_domains = {
-            urlparse(item["url"]).hostname
-            for item in evidence
-            if item["kind"] == "article" and urlparse(item["url"]).hostname
-        }
-        hotlist_domains = {
-            urlparse(item["url"]).hostname
-            for item in evidence
-            if item["kind"] == "hotlist" and urlparse(item["url"]).hostname
-        }
-        article_count = sum(1 for item in evidence if item["kind"] == "article")
-        hotlist_count = sum(1 for item in evidence if item["kind"] == "hotlist")
-        for draft in result.output.opportunities:
-            score_fields = {
-                key: getattr(draft, key)
-                for key in (
-                    "pain_score",
-                    "intent_score",
-                    "segment_score",
-                    "timing_score",
-                    "feasibility_score",
-                    "differentiation_score",
-                )
-            }
-            hypothesis_score = calculate_opportunity_score(score_fields)
-            evidence_quality = (article_count + hotlist_count * 0.5) / max(len(evidence), 1)
-            cited_ratio = min(
-                len(set(draft.evidence_ids)) / max(len(evidence), 1), 1
-            ) * evidence_quality
-            confidence = calculate_evidence_confidence(
-                evidence_count=article_count + hotlist_count * 0.5,
-                independent_domains=len(article_domains) + 0.5 * len(hotlist_domains - article_domains),
-                consumer_voice_count=sum(int(item["is_consumer_voice"]) for item in evidence),
-                cited_claim_ratio=cited_ratio,
-            )
-            risk_level, risk_flags = assess_product_risk(event, draft)
-            signal_market = str(event.get("market") or "").upper()
-            target_marketplace = marketplace_code(
-                draft.target_marketplace or draft.marketplace,
-                default=(
-                    signal_market
-                    if signal_market in {"US", "GB", "DE", "JP", "CA", "FR", "IT", "ES"}
-                    else self.settings.amazon_default_marketplace
-                ),
-            )
-            marketplace = marketplace_name(target_marketplace)
-            # A query must come from an explicit, reviewed product hypothesis;
-            # news/rule keywords are not buyer-facing Amazon search terms.
-            amazon_search_term = ""
-            validation = await self.market_validator.validate(
-                {
-                    "name": draft.name,
-                    "marketplace": marketplace,
-                    "target_marketplace": target_marketplace,
-                    "product_keywords": draft.product_keywords,
-                },
-                event,
-            )
-            final_score, uncertainty_penalty = calculate_final_score(
-                trend_score=float(event["trend_score"]),
-                hypothesis_score=hypothesis_score,
-                market_score=validation.score,
-                validation_status=validation.status,
-                risk_level=risk_level,
-            )
-            opportunity_id = self.db.execute(
-                """INSERT INTO product_opportunities
-                (analysis_id, event_id, name, product_keywords_json, category,
-                 target_segment, scenario, jtbd, purchase_motivation,
-                 pain_points_json, solution, mvp, price_band, marketplace, target_marketplace,
-                 amazon_search_term,
-                 channels_json, risks_json, next_action, risk_level, risk_flags_json,
-                 pain_score, intent_score, segment_score, timing_score, feasibility_score,
-                  differentiation_score, hypothesis_score, market_score, final_score,
-                  validated_recommendation_score,
-                 validation_status, uncertainty_penalty, opportunity_score,
-                 evidence_confidence, score_formula_version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    analysis_id,
-                    event_id,
-                    draft.name,
-                    self.db.json(draft.product_keywords),
-                    draft.category,
-                    draft.target_segment,
-                    draft.scenario,
-                    draft.jtbd,
-                    draft.purchase_motivation,
-                    self.db.json(draft.pain_points),
-                    draft.solution,
-                    draft.mvp,
-                    draft.price_band,
-                    marketplace,
-                    target_marketplace,
-                    amazon_search_term,
-                    self.db.json(draft.channels),
-                    self.db.json(draft.risks),
-                    draft.next_action,
-                    risk_level,
-                    self.db.json(risk_flags),
-                    draft.pain_score,
-                    draft.intent_score,
-                    draft.segment_score,
-                    draft.timing_score,
-                    draft.feasibility_score,
-                    draft.differentiation_score,
-                    hypothesis_score,
-                    validation.score,
-                    final_score if final_score is not None else 0.0,
-                    final_score,
-                    validation.status,
-                    uncertainty_penalty,
-                    hypothesis_score,
-                    confidence,
-                    "opportunity-v2",
-                    created_at,
-                    created_at,
-                ),
-            )
-            self.db.execute(
-                """INSERT INTO market_validations
-                (opportunity_id,provider,provider_version,status,query_json,
-                 scores_json,metrics_json,sources_json,missing_fields_json,
-                 market_score,raw_response_hash,note,error,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    opportunity_id,
-                    validation.provider,
-                    validation.provider_version,
-                    validation.status,
-                    self.db.json(validation.query),
-                    self.db.json(validation.scores),
-                    self.db.json(validation.metrics),
-                    self.db.json(validation.sources),
-                    self.db.json(validation.missing_fields),
-                    validation.score,
-                    validation.raw_response_hash,
-                    validation.note,
-                    validation.error,
-                    created_at,
-                ),
-            )
-        collapse_unworked_duplicate_opportunities(self.db)
+        if draft:
+            persist_research_candidate(self.db, draft)
 
     async def _persist_semantic_features(
         self, event: dict[str, Any], evidence: list[dict[str, Any]]

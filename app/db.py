@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 
 SCHEMA = """
@@ -101,8 +102,35 @@ CREATE TABLE IF NOT EXISTS evidence (
   is_consumer_voice INTEGER NOT NULL DEFAULT 0,
   valid_for_analysis INTEGER NOT NULL DEFAULT 1,
   error TEXT,
+  evidence_type TEXT NOT NULL DEFAULT 'title_only',
+  source_name TEXT NOT NULL DEFAULT '',
+  fetch_method TEXT NOT NULL DEFAULT 'unknown',
+  fetch_status TEXT NOT NULL DEFAULT 'unknown',
+  quality_score REAL NOT NULL DEFAULT 0,
+  quality_version TEXT NOT NULL DEFAULT 'evidence-quality-v1',
+  raw_metadata_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(event_id, url)
 );
+CREATE TABLE IF NOT EXISTS evidence_bundles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  input_hash TEXT NOT NULL,
+  version TEXT NOT NULL,
+  readiness_status TEXT NOT NULL,
+  readiness_score REAL NOT NULL,
+  full_text_count INTEGER NOT NULL,
+  title_only_count INTEGER NOT NULL,
+  independent_source_count INTEGER NOT NULL,
+  consumer_voice_count INTEGER NOT NULL,
+  official_source_count INTEGER NOT NULL,
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  fetch_failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+  missing_evidence_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  UNIQUE(event_id, input_hash, version)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_bundles_event
+  ON evidence_bundles(event_id, id DESC);
 CREATE TABLE IF NOT EXISTS analyses (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id INTEGER NOT NULL REFERENCES trend_events(id),
@@ -171,6 +199,85 @@ CREATE TABLE IF NOT EXISTS semantic_event_features (
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_features_event
   ON semantic_event_features(event_id, id DESC);
+CREATE TABLE IF NOT EXISTS research_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  evidence_bundle_id INTEGER NOT NULL REFERENCES evidence_bundles(id),
+  semantic_feature_id INTEGER REFERENCES semantic_event_features(id),
+  candidate_reason TEXT NOT NULL,
+  category_candidates_json TEXT NOT NULL DEFAULT '[]',
+  positive_similarity REAL,
+  negative_similarity REAL,
+  opportunity_delta REAL,
+  research_questions_json TEXT NOT NULL DEFAULT '[]',
+  missing_evidence_json TEXT NOT NULL DEFAULT '[]',
+  priority REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  engine TEXT NOT NULL,
+  version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_candidates_event
+  ON research_candidates(event_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_research_candidates_status
+  ON research_candidates(status, priority DESC, id DESC);
+CREATE TABLE IF NOT EXISTS research_runs (
+  id TEXT PRIMARY KEY,
+  candidate_id INTEGER NOT NULL REFERENCES research_candidates(id),
+  executor_type TEXT NOT NULL,
+  executor_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  budget_json TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_research_runs_candidate
+  ON research_runs(candidate_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS research_tool_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES research_runs(id),
+  tool_name TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  latency_ms INTEGER NOT NULL,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_tool_calls_run
+  ON research_tool_calls(run_id, id DESC);
+CREATE TABLE IF NOT EXISTS opportunity_assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id INTEGER NOT NULL REFERENCES research_candidates(id),
+  evidence_bundle_id INTEGER NOT NULL REFERENCES evidence_bundles(id),
+  research_run_id TEXT REFERENCES research_runs(id),
+  assessment_status TEXT NOT NULL,
+  change_type TEXT NOT NULL DEFAULT '',
+  consumer_relevance TEXT NOT NULL DEFAULT '',
+  durability TEXT NOT NULL DEFAULT '',
+  lead_time_fit TEXT NOT NULL DEFAULT '',
+  target_users_json TEXT NOT NULL DEFAULT '[]',
+  new_scenarios_json TEXT NOT NULL DEFAULT '[]',
+  unmet_needs_json TEXT NOT NULL DEFAULT '[]',
+  related_product_categories_json TEXT NOT NULL DEFAULT '[]',
+  fact_claims_json TEXT NOT NULL DEFAULT '[]',
+  inferences_json TEXT NOT NULL DEFAULT '[]',
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  missing_evidence_json TEXT NOT NULL DEFAULT '[]',
+  abstention_reason TEXT NOT NULL DEFAULT '',
+  review_status TEXT NOT NULL DEFAULT 'pending',
+  engine TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_assessments_candidate
+  ON opportunity_assessments(candidate_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_opportunity_assessments_review
+  ON opportunity_assessments(review_status, id DESC);
 CREATE TABLE IF NOT EXISTS semantic_evaluation_labels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id INTEGER NOT NULL REFERENCES trend_events(id),
@@ -402,8 +509,26 @@ class Database:
             conn.executescript(SCHEMA)
             self._ensure_column(conn, "evidence", "valid_for_analysis", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column(conn, "evidence", "error", "TEXT")
+            evidence_columns = {
+                "evidence_type": "TEXT NOT NULL DEFAULT 'title_only'",
+                "source_name": "TEXT NOT NULL DEFAULT ''",
+                "fetch_method": "TEXT NOT NULL DEFAULT 'unknown'",
+                "fetch_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "quality_score": "REAL NOT NULL DEFAULT 0",
+                "quality_version": "TEXT NOT NULL DEFAULT 'evidence-quality-v1'",
+                "raw_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, definition in evidence_columns.items():
+                self._ensure_column(conn, "evidence", column, definition)
+            self._migrate_evidence_metadata(conn)
             self._ensure_column(conn, "analyses", "status", "TEXT NOT NULL DEFAULT 'succeeded'")
             self._ensure_column(conn, "analyses", "error", "TEXT")
+            self._ensure_column(
+                conn,
+                "opportunity_signals",
+                "opportunity_assessment_id",
+                "INTEGER REFERENCES opportunity_assessments(id)",
+            )
             for table in ("source_snapshots", "source_items", "trend_events"):
                 self._ensure_column(conn, table, "market", "TEXT NOT NULL DEFAULT 'CN'")
                 self._ensure_column(conn, table, "language", "TEXT NOT NULL DEFAULT 'zh'")
@@ -476,6 +601,76 @@ class Database:
                 WHERE target_marketplace!=''"""
             )
             self._ensure_column(conn, "market_validations", "note", "TEXT NOT NULL DEFAULT ''")
+        self._backfill_evidence_bundles()
+
+    @staticmethod
+    def _migrate_evidence_metadata(conn: sqlite3.Connection) -> None:
+        from .evidence_bundle import EVIDENCE_QUALITY_VERSION, calculate_evidence_quality
+        from .evidence_types import normalize_fetch_status
+
+        conn.execute(
+            """UPDATE evidence SET evidence_type=CASE
+                WHEN kind='article' AND valid_for_analysis=1
+                     AND LENGTH(TRIM(excerpt))>=20 AND error IS NULL THEN 'full_article'
+                WHEN kind IN ('official','official_notice') THEN 'official_notice'
+                WHEN kind IN ('manual','manual_evidence') THEN 'manual_evidence'
+                ELSE evidence_type END"""
+        )
+        conn.execute(
+            """UPDATE evidence SET fetch_method=CASE
+                WHEN kind='article' THEN 'direct_public_page'
+                WHEN kind='hotlist' THEN 'source_snapshot'
+                WHEN kind IN ('manual','manual_evidence') THEN 'manual'
+                ELSE fetch_method END
+            WHERE fetch_method='unknown'"""
+        )
+        conn.execute(
+            """UPDATE evidence SET source_name=COALESCE((
+                SELECT i.source FROM source_items i
+                JOIN event_members m ON m.source_item_id=i.id
+                WHERE m.event_id=evidence.event_id AND i.url=evidence.url
+                ORDER BY i.id DESC LIMIT 1
+            ), source_name) WHERE source_name=''"""
+        )
+        rows = conn.execute("SELECT * FROM evidence ORDER BY id").fetchall()
+        for sqlite_row in rows:
+            row = dict(sqlite_row)
+            source_name = str(row.get("source_name") or "").strip()
+            if not source_name:
+                source_name = (
+                    urlparse(str(row.get("url") or "")).hostname or "unknown"
+                ).casefold()
+            fetch_status = normalize_fetch_status(row).value
+            migrated = {**row, "fetch_status": fetch_status}
+            quality_score = calculate_evidence_quality(migrated)
+            conn.execute(
+                """UPDATE evidence SET source_name=?,fetch_status=?,quality_score=?,
+                   quality_version=?,valid_for_analysis=CASE
+                     WHEN evidence_type='title_only' THEN 0 ELSE valid_for_analysis END
+                WHERE id=?""",
+                (
+                    source_name,
+                    fetch_status,
+                    quality_score,
+                    EVIDENCE_QUALITY_VERSION,
+                    row["id"],
+                ),
+            )
+
+    def _backfill_evidence_bundles(self) -> None:
+        from .evidence_bundle import build_evidence_bundle, persist_evidence_bundle
+
+        events = self.all(
+            """SELECT DISTINCT e.* FROM trend_events e
+            JOIN analyses a ON a.event_id=e.id
+            JOIN evidence v ON v.event_id=e.id
+            ORDER BY e.id"""
+        )
+        for event in events:
+            evidence = self.all(
+                "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+            )
+            persist_evidence_bundle(self, build_evidence_bundle(event, evidence))
 
     @staticmethod
     def _ensure_column(
@@ -564,8 +759,13 @@ class Database:
                 "product_hypotheses",
                 "opportunity_signal_feedback",
                 "opportunity_signals",
+                "opportunity_assessments",
+                "research_tool_calls",
+                "research_runs",
                 "semantic_duplicate_feedback",
                 "semantic_duplicate_candidates",
+                "research_candidates",
+                "evidence_bundles",
                 "semantic_event_features",
                 "semantic_evaluation_labels",
                 "analyses",

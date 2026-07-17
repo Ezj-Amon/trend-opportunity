@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 
 SIGNAL_JSON_FIELDS = (
     "target_users_json",
@@ -21,6 +23,23 @@ SIGNAL_FEEDBACK_TYPES = {
     "wrong_category": "类目错误",
     "insufficient_evidence": "证据不足",
 }
+
+
+class OpportunitySignalInput(BaseModel):
+    """Human-authored signal input; automated research uses OpportunityAssessment."""
+
+    change_type: str
+    consumer_relevance_score: float = Field(ge=0, le=100)
+    product_opportunity_score: float = Field(ge=0, le=100)
+    target_users: list[str] = Field(min_length=1, max_length=8)
+    new_scenarios: list[str] = Field(min_length=1, max_length=8)
+    unmet_needs: list[str] = Field(min_length=1, max_length=8)
+    related_product_categories: list[str] = Field(default_factory=list, max_length=8)
+    durability: str
+    lead_time_fit: str
+    evidence_ids: list[int] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=100)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=8)
 
 
 def decode_signal(row: dict[str, Any]) -> dict[str, Any]:
