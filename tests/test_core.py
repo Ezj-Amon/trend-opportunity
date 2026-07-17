@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,13 @@ from fastapi.testclient import TestClient
 
 import app.main as main_app
 import app.pipeline as pipeline_module
-from app.analysis import Analyzer
+from app.analysis import (
+    AnalysisOutput,
+    AnalysisResult,
+    Analyzer,
+    OpportunityDraft,
+    OpportunitySignalDraft,
+)
 from app.amazon import is_search_term_ready, pick_search_term
 from app.amazon_validation import (
     COLUMN_LABELS,
@@ -31,10 +38,20 @@ from app.deduplication import (
 from app.evidence import EvidenceResult
 from app.market_validation import MarketScores
 from app.pipeline import Pipeline
-from app.reports import build_daily_digest
+from app.reports import build_daily_digest, is_validated_recommendation
 from app.risk import assess_product_risk
 from app.scoring import calculate_evidence_confidence, calculate_opportunity_score
 from app.scoring import calculate_final_score, calculate_market_score
+from app.semantic import (
+    CATEGORY_PROTOTYPES,
+    EmbeddingUnavailable,
+    NEGATIVE_OPPORTUNITY_PROTOTYPES,
+    POSITIVE_OPPORTUNITY_PROTOTYPES,
+    SemanticFeatureExtractor,
+    duplicate_rate,
+    opportunity_precision_at_k,
+)
+from app.semantic_duplicates import create_duplicate_candidates
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -81,6 +98,32 @@ def test_title_normalization_and_clustering() -> None:
     )[0]
     assert not should_merge("YSL推出透明高跟鞋", "具俊晔回应遗产争议")[0]
     assert not should_merge("iPhone16销量创新高", "iPhone20外观设计曝光")[0]
+
+
+def test_semantic_prototype_retrieval_and_offline_metrics_use_fake_embedder() -> None:
+    class FakeEmbedder:
+        model_id = "fake-multilingual"
+        model_version = "test"
+
+        def encode(self, texts):
+            values = []
+            for index, _text in enumerate(texts):
+                if index == 0 or 1 <= index <= len(POSITIVE_OPPORTUNITY_PROTOTYPES):
+                    values.append([1.0, 0.0])
+                elif index <= len(POSITIVE_OPPORTUNITY_PROTOTYPES) + len(NEGATIVE_OPPORTUNITY_PROTOTYPES):
+                    values.append([0.0, 1.0])
+                elif index == 1 + len(POSITIVE_OPPORTUNITY_PROTOTYPES) + len(NEGATIVE_OPPORTUNITY_PROTOTYPES):
+                    values.append([1.0, 0.0])
+                else:
+                    values.append([0.2, 0.8])
+            return values
+
+    result = SemanticFeatureExtractor(FakeEmbedder()).extract("小户型需要可折叠实体收纳")
+    assert result.positive_similarity == 1.0
+    assert result.negative_similarity == 0.0
+    assert result.category_matches[0]["category"] == next(iter(CATEGORY_PROTOTYPES))
+    assert opportunity_precision_at_k([1, 2, 3], {1, 3}, 2) == 0.5
+    assert duplicate_rate([1, 1, 2, 3]) == 0.25
 
 
 def test_us_amazon_search_term_quality_gate() -> None:
@@ -187,7 +230,7 @@ def test_market_score_does_not_reweight_missing_dimensions() -> None:
         validation_status="unavailable",
         risk_level="low",
     )
-    assert (final, penalty) == (50.0, 30.0)
+    assert (final, penalty) == (None, 30.0)
     blocked, _ = calculate_final_score(
         trend_score=100,
         hypothesis_score=100,
@@ -196,6 +239,33 @@ def test_market_score_does_not_reweight_missing_dimensions() -> None:
         risk_level="blocking",
     )
     assert blocked == 0
+
+
+def test_unvalidated_hypothesis_never_qualifies_as_recommendation() -> None:
+    base = {
+        "validation_status": "unavailable",
+        "market_score": None,
+        "validated_recommendation_score": None,
+        "review_status": "approved",
+        "risk_level": "low",
+    }
+    assert not is_validated_recommendation(base)
+    assert not is_validated_recommendation(
+        {
+            **base,
+            "validation_status": "partial",
+            "market_score": 80.0,
+            "validated_recommendation_score": None,
+        }
+    )
+    assert is_validated_recommendation(
+        {
+            **base,
+            "validation_status": "completed",
+            "market_score": 80.0,
+            "validated_recommendation_score": 78.0,
+        }
+    )
 
 
 def test_structured_product_risk_can_block_or_warn() -> None:
@@ -230,6 +300,12 @@ def test_database_schema_and_foreign_keys(tmp_path: Path) -> None:
         "market_validations",
         "opportunity_outcomes",
         "digest_deliveries",
+        "semantic_duplicate_candidates",
+        "semantic_duplicate_feedback",
+        "product_hypotheses",
+        "product_hypothesis_feedback",
+        "market_evidence",
+        "validated_recommendations",
     }.issubset(tables)
     assert {"market", "language", "signal_type"}.issubset(
         {row["name"] for row in db.all("PRAGMA table_info(trend_events)")}
@@ -367,8 +443,12 @@ def test_push_api_distinguishes_in_progress_and_unknown(
         """INSERT INTO product_opportunities(
         analysis_id,event_id,name,target_segment,scenario,jtbd,pain_points_json,solution,mvp,price_band,
         channels_json,risks_json,pain_score,intent_score,segment_score,timing_score,feasibility_score,
-        differentiation_score,opportunity_score,evidence_confidence,review_status,created_at,updated_at)
-        VALUES(?,?,'n','s','s','j','[]','x','m','p','[]','[]',1,1,1,1,1,1,0,0,'approved',?,?)""",
+        differentiation_score,opportunity_score,evidence_confidence,review_status,
+        risk_level,validation_status,market_score,validated_recommendation_score,
+        score_formula_version,
+        created_at,updated_at)
+        VALUES(?,?,'n','s','s','j','[]','x','m','p','[]','[]',1,1,1,1,1,1,0,0,
+        'approved','low','completed',80,80,'opportunity-v2',?,?)""",
         (analysis_id, event_id, now, now),
     )
     destination_hash = hashlib.sha256(b"unconfigured").hexdigest()[:16]
@@ -450,9 +530,10 @@ def test_digest_has_separate_cn_and_overseas_top_three(tmp_path: Path) -> None:
     assert len(digest["overseas_top3"]) == 3
     assert {item["market"] for item in digest["cn_top3"]} == {"CN"}
     assert {item["market"] for item in digest["overseas_top3"]} == {"US"}
-    assert all(item["risk_level"] != "blocking" for item in [*digest["cn_top3"], *digest["overseas_top3"]])
-    assert len({item["name"] for item in digest["cn_top3"]}) == 3
-    assert len({item["name"] for item in digest["overseas_top3"]}) == 3
+    assert digest["policy"]["content_type"] == "trend_event"
+    assert digest["policy"]["not_a_product_recommendation"] is True
+    assert [item["event_title"] for item in digest["cn_top3"]] == ["CN-0", "CN-1", "CN-2"]
+    assert [item["event_title"] for item in digest["overseas_top3"]] == ["US-0", "US-1", "US-2"]
 
 
 def test_duplicate_candidates_are_collapsed_and_all_lists_share_identity(
@@ -543,8 +624,7 @@ def test_duplicate_candidates_are_collapsed_and_all_lists_share_identity(
     with TestClient(main_app.app) as client:
         queue = client.get("/api/opportunities/pending-validation?marketplace=US")
         assert queue.status_code == 200
-        names = [item["name"] for item in queue.json()]
-        assert len([name for name in names if normalized_identity(name) == "新技术选购包"]) == 1
+        assert queue.json() == []
 
 
 def test_market_validation_review_and_outcome_apis(
@@ -598,14 +678,15 @@ def test_market_validation_review_and_outcome_apis(
         assert outcome.status_code == 200
         detail = client.get(f"/events/{event_id}")
         assert detail.status_code == 200
-        assert "最终排序分" in detail.text
+        assert "已验证推荐分" in detail.text
         assert "SellerSprite export" in detail.text
         dashboard = client.get("/")
         assert dashboard.status_code == 200
-        assert "中国信号 Top 3" in dashboard.text
-        assert "海外信号 Top 3" in dashboard.text
+        assert "中国趋势信号 Top 3" in dashboard.text
+        assert "海外趋势信号 Top 3" in dashboard.text
     saved = db.one("SELECT * FROM product_opportunities WHERE id=?", (opportunity_id,))
     assert saved["validation_status"] == "completed"
+    assert saved["validated_recommendation_score"] is not None
     assert saved["review_status"] == "approved"
     assert saved["reviewer_note"] == "关键词和毛利已人工复核"
     assert db.one(
@@ -695,9 +776,7 @@ def test_pending_queue_csv_import_and_target_marketplace_change(
     with TestClient(main_app.app) as client:
         queue = client.get("/api/opportunities/pending-validation?marketplace=US")
         assert queue.status_code == 200
-        assert queue.json()[0]["signal_market"] == "CN"
-        assert queue.json()[0]["target_marketplace"] == "US"
-        assert queue.json()[0]["query_readiness"] == "ready"
+        assert queue.json() == []
         assert client.post(
             f"/api/opportunities/{opportunity_id}/search-term",
             json={"search_term": "AI"},
@@ -722,10 +801,10 @@ def test_pending_queue_csv_import_and_target_marketplace_change(
         assert raw_import.json()["source_rows_scanned"]["商机探测器"] == 1
         page = client.get("/validation?marketplace=US")
         assert page.status_code == 200
-        assert "CN → US" in page.text
+        assert "当前没有可进入市场验证的商品假设" in page.text
         template = client.get("/api/market-validations/template.csv?marketplace=US")
         assert template.status_code == 200
-        assert "backpack" in template.text
+        assert "backpack" not in template.text
 
         imported = client.post(
             "/api/market-validations/import",
@@ -807,17 +886,351 @@ async def test_pipeline_persists_v2_scores_risks_and_explicit_missing_validation
     monkeypatch.setattr(pipeline_module, "fetch_evidence", fake_fetch)
     pipeline = Pipeline(db, make_settings(tmp_path))
     await pipeline._research_and_analyze("r", event_id)
-    opportunities = db.all("SELECT * FROM product_opportunities WHERE event_id=?", (event_id,))
-    assert opportunities
-    assert all(item["score_formula_version"] == "opportunity-v2" for item in opportunities)
-    assert all(item["hypothesis_score"] >= item["opportunity_score"] for item in opportunities)
-    assert all(item["market_score"] is None for item in opportunities)
-    assert all(item["validation_status"] == "unavailable" for item in opportunities)
-    assert all(item["product_keywords_json"] != "[]" for item in opportunities)
-    validations = db.all("SELECT * FROM market_validations")
-    assert len(validations) == len(opportunities)
-    assert all(item["provider"] == "unconfigured" for item in validations)
-    assert all("尚未录入" in item["error"] for item in validations)
+    assert db.all("SELECT * FROM product_opportunities WHERE event_id=?", (event_id,)) == []
+    analysis = db.one("SELECT * FROM analyses WHERE event_id=?", (event_id,))
+    assert analysis["engine"] == "local-rules"
+    assert analysis["model"] == "local-rules-v2"
+    assert db.all("SELECT * FROM market_validations") == []
+    semantic = db.one("SELECT * FROM semantic_event_features WHERE event_id=?", (event_id,))
+    assert semantic["status"] == "disabled"
+    assert semantic["embedding_json"] is None
+    assert "disabled" in semantic["error"]
+
+    class MissingModelExtractor:
+        def extract(self, _text):
+            raise EmbeddingUnavailable("model is not present in the local cache")
+
+    pipeline.semantic_extractor = MissingModelExtractor()
+    await pipeline._persist_semantic_features(
+        db.one("SELECT * FROM trend_events WHERE id=?", (event_id,)),
+        db.all("SELECT * FROM evidence WHERE event_id=?", (event_id,)),
+    )
+    semantic = db.one("SELECT * FROM semantic_event_features WHERE event_id=?", (event_id,))
+    assert semantic["status"] == "unavailable"
+    assert "local cache" in semantic["error"]
+    pipeline.semantic_extractor = None
+
+    evidence_id = db.one("SELECT id FROM evidence WHERE event_id=? LIMIT 1", (event_id,))["id"]
+    db.execute("DELETE FROM analyses WHERE event_id=?", (event_id,))
+
+    async def fake_hypothesis(_event, _evidence) -> AnalysisResult:
+        return AnalysisResult(
+            "llm",
+            "test-model",
+            AnalysisOutput(
+                event_summary="test",
+                inference_notice="test hypothesis",
+                signals=[
+                    OpportunitySignalDraft(
+                        change_type="居住空间约束",
+                        consumer_relevance_score=82,
+                        product_opportunity_score=76,
+                        target_users=["小户型住户"],
+                        new_scenarios=["可折叠临时收纳"],
+                        unmet_needs=["不用时可收起且承重明确"],
+                        related_product_categories=["家居收纳"],
+                        durability="中期",
+                        lead_time_fit="适合常规打样周期",
+                        evidence_ids=[evidence_id],
+                        confidence=71,
+                        missing_evidence=["消费者评论"],
+                    )
+                ],
+                opportunities=[
+                    OpportunityDraft(
+                        name="folding shelf",
+                        product_keywords=["folding shelf"],
+                        category="home storage",
+                        target_segment="small apartment residents",
+                        scenario="small homes",
+                        jtbd="store items in limited space",
+                        purchase_motivation="save space",
+                        pain_points=["limited storage"],
+                        solution="foldable physical shelf",
+                        mvp="one shelf",
+                        price_band="$29-49",
+                        marketplace="Amazon.com",
+                        target_marketplace="US",
+                        channels=["Amazon.com"],
+                        risks=["market demand is unverified"],
+                        next_action="create a reviewed product hypothesis",
+                        pain_score=4,
+                        intent_score=3,
+                        segment_score=4,
+                        timing_score=3,
+                        feasibility_score=4,
+                        differentiation_score=3,
+                        evidence_ids=[evidence_id],
+                    )
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(pipeline.analyzer, "analyze", fake_hypothesis)
+    await pipeline._research_and_analyze("r", event_id)
+    hypothesis = db.one("SELECT * FROM product_opportunities WHERE event_id=?", (event_id,))
+    assert hypothesis["amazon_search_term"] == ""
+    assert hypothesis["market_score"] is None
+    assert hypothesis["validated_recommendation_score"] is None
+    assert hypothesis["final_score"] == 0
+    assert hypothesis["opportunity_score"] == hypothesis["hypothesis_score"]
+    assert not is_validated_recommendation(hypothesis)
+    signal = db.one("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,))
+    assert signal["change_type"] == "居住空间约束"
+    assert signal["review_status"] == "pending"
+    assert json.loads(signal["evidence_ids_json"]) == [evidence_id]
+    assert signal["engine"] == "llm"
+    assert signal["model"] == "test-model"
+
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        signals_page = client.get("/signals")
+        assert signals_page.status_code == 200
+        assert "不用时可收起且承重明确" in signals_page.text
+        assert client.get("/feedback").status_code == 200
+        api_signals = client.get("/api/opportunity-signals")
+        assert api_signals.status_code == 200
+        assert api_signals.json()[0]["target_users"] == ["小户型住户"]
+        label = client.post(
+            f"/api/events/{event_id}/semantic-label",
+            json={"label": "positive", "expected_category": "家居收纳", "note": "人工评测"},
+        )
+        assert label.status_code == 200
+        evaluation = client.get("/api/semantic/evaluation?k=5")
+        assert evaluation.status_code == 200
+        assert evaluation.json()["labeled_count"] == 1
+        assert evaluation.json()["abstention_rate"] == 1.0
+        saved = client.post(
+            f"/api/opportunity-signals/{signal['id']}/feedback",
+            json={"feedback_type": "follow_up", "note": "值得继续找评论证据"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["label"] == "值得跟进"
+        assert client.get("/feedback").status_code == 200
+
+    feedback = db.one("SELECT * FROM opportunity_signal_feedback WHERE signal_id=?", (signal["id"],))
+    snapshot = json.loads(feedback["snapshot_json"])
+    assert snapshot["signal"]["model"] == "test-model"
+    assert snapshot["signal"]["version"] == pipeline.analysis_version
+    assert snapshot["event"]["id"] == event_id
+    assert snapshot["evidence"][0]["id"] == evidence_id
+    assert db.one("SELECT review_status FROM opportunity_signals WHERE id=?", (signal["id"],))[
+        "review_status"
+    ] == "follow_up"
+    db.execute("UPDATE analyses SET prompt_version='old-version' WHERE id=?", (signal["analysis_id"],))
+    pipeline._invalidate_old_analysis_versions()
+    assert db.one("SELECT review_status FROM opportunity_signals WHERE id=?", (signal["id"],))[
+        "review_status"
+    ] == "superseded"
+
+
+def test_semantic_duplicate_candidates_require_review_and_never_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "semantic-duplicates.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    event_ids = []
+    for title, market, language in (
+        ("Reusable rain cover demand rises", "US", "en"),
+        ("可重复使用防雨罩需求上升", "CN", "zh"),
+    ):
+        event_ids.append(
+            db.execute(
+                """INSERT INTO trend_events
+                (canonical_title,normalized_title,market,language,trend_score,
+                 first_seen_at,last_seen_at,created_at,updated_at)
+                VALUES (?,?,?,?,80,?,?,?,?)""",
+                (title, title.casefold(), market, language, now, now, now, now),
+            )
+        )
+    feature_ids = []
+    for event_id, input_hash, embedding in (
+        (event_ids[0], "a", [1.0, 0.0]),
+        (event_ids[1], "b", [0.999, 0.001]),
+    ):
+        feature_ids.append(
+            db.execute(
+                """INSERT INTO semantic_event_features
+                (event_id,model_id,model_version,input_hash,feature_version,status,
+                 embedding_json,category_matches_json,created_at)
+                VALUES (?,'fake-e5','rev-1',?,'semantic-test','ready',?,'[]',?)""",
+                (event_id, input_hash, db.json(embedding), now),
+            )
+        )
+    assert create_duplicate_candidates(db, feature_ids[1], threshold=0.8) == 1
+    candidate = db.one("SELECT * FROM semantic_duplicate_candidates")
+    assert candidate["review_status"] == "pending"
+    assert db.one("SELECT COUNT(*) n FROM trend_events")["n"] == 2
+
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        page = client.get("/semantic-review")
+        assert page.status_code == 200
+        assert "相似度不是同一事件概率" in page.text
+        reviewed = client.post(
+            f"/api/semantic/duplicate-candidates/{candidate['id']}/feedback",
+            json={"feedback_type": "related_not_same", "note": "同主题，不同市场事件"},
+        )
+        assert reviewed.status_code == 200
+        assert reviewed.json()["merged"] is False
+        evaluation = client.get("/api/semantic/evaluation?k=5")
+        assert evaluation.status_code == 200
+        assert evaluation.json()["duplicate_reviewed_count"] == 1
+        assert evaluation.json()["duplicate_candidate_precision"] == 0.0
+    feedback = db.one("SELECT * FROM semantic_duplicate_feedback")
+    snapshot = json.loads(feedback["snapshot_json"])
+    assert snapshot["candidate"]["model_version"] == "rev-1"
+    assert db.one("SELECT COUNT(*) n FROM trend_events")["n"] == 2
+
+
+def test_new_evidence_chain_only_recommends_after_all_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "evidence-chain.db")
+    db.initialize()
+    now = "2026-07-17T00:00:00+00:00"
+    db.execute(
+        """INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,config_json)
+        VALUES('run','test','completed','completed',?,'{}')""",
+        (now,),
+    )
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES('Small homes need flexible pantry storage','smallhomes','US','en','search',80,?,?,?,?)""",
+        (now, now, now, now),
+    )
+    db.execute(
+        """INSERT INTO analyses
+        (event_id,run_id,engine,model,prompt_version,output_json,status,created_at)
+        VALUES(?,'run','rules','rules','v1','{}','succeeded',?)""",
+        (event_id, now),
+    )
+    evidence_id = db.execute(
+        """INSERT INTO evidence
+        (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash)
+        VALUES(?,'article','https://example.com/storage','Storage survey',
+        'Residents describe a recurring need for flexible pantry storage.',?,200,'hash')""",
+        (event_id, now),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        created_signal = client.post(
+            f"/api/events/{event_id}/opportunity-signals",
+            json={
+                "change_type": "居住空间约束",
+                "consumer_relevance_score": 82,
+                "product_opportunity_score": 76,
+                "target_users": ["小户型住户"],
+                "new_scenarios": ["灵活调整食品储物空间"],
+                "unmet_needs": ["不用时可折叠且承重明确"],
+                "related_product_categories": ["家居收纳"],
+                "durability": "结构性",
+                "lead_time_fit": "适合常规打样周期",
+                "evidence_ids": [evidence_id],
+                "confidence": 70,
+                "missing_evidence": ["平台搜索证据"],
+            },
+        )
+        assert created_signal.status_code == 200
+        signal_id = created_signal.json()["signal_id"]
+        hypothesis_payload = {
+            "name": "Foldable pantry shelf insert",
+            "physical_form": "可折叠钢架与可替换防滑脚垫组成的实体收纳架",
+            "target_users": ["small apartment residents"],
+            "scenarios": ["adjusting pantry shelf height"],
+            "problem": "fixed shelves waste vertical space",
+            "expected_difference": "folds flat and publishes a tested load rating",
+            "product_keywords": ["foldable pantry shelf"],
+            "query_terms": ["foldable pantry shelf organizer"],
+            "target_marketplace": "US",
+            "evidence_ids": [evidence_id],
+        }
+        blocked_by_signal = client.post(
+            f"/api/opportunity-signals/{signal_id}/product-hypotheses",
+            json=hypothesis_payload,
+        )
+        assert blocked_by_signal.status_code == 409
+        assert client.post(
+            f"/api/opportunity-signals/{signal_id}/feedback",
+            json={"feedback_type": "follow_up", "note": "场景和需求证据明确"},
+        ).status_code == 200
+
+        non_physical = dict(hypothesis_payload)
+        non_physical["name"] = "Pantry planning software"
+        non_physical["physical_form"] = "软件订阅服务"
+        blocked_draft = client.post(
+            f"/api/opportunity-signals/{signal_id}/product-hypotheses",
+            json=non_physical,
+        )
+        assert blocked_draft.status_code == 200
+        blocked_id = blocked_draft.json()["hypothesis_id"]
+        assert blocked_draft.json()["risk_level"] == "blocking"
+        assert client.post(
+            f"/api/product-hypotheses/{blocked_id}/review",
+            json={"status": "ready_for_validation", "note": ""},
+        ).status_code == 409
+
+        created = client.post(
+            f"/api/opportunity-signals/{signal_id}/product-hypotheses",
+            json=hypothesis_payload,
+        )
+        assert created.status_code == 200
+        hypothesis_id = created.json()["hypothesis_id"]
+        assert client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/review",
+            json={"status": "ready_for_validation", "note": "实体结构和查询词已确认"},
+        ).status_code == 200
+        assert client.get("/validation").status_code == 200
+
+        partial_scores = {
+            "search_demand_score": 4, "purchase_intent_score": 4,
+            "competition_score": 4, "unit_economics_score": None,
+            "differentiation_score": 4, "execution_score": 4,
+            "timing_score": 4, "evidence_score": 4,
+        }
+        partial = client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/market-evidence",
+            json={
+                "provider": "manual", "provider_version": "manual-v1",
+                "marketplace": "US", "query": {"term": "foldable pantry shelf organizer"},
+                "scores": partial_scores, "metrics": {}, "sources": ["review sheet"],
+            },
+        )
+        assert partial.status_code == 200
+        assert partial.json()["recommendation"] is None
+        assert db.one("SELECT COUNT(*) n FROM validated_recommendations")["n"] == 0
+
+        completed_scores = {key: None for key in partial_scores}
+        completed_scores["unit_economics_score"] = 4
+        completed = client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/market-evidence",
+            json={
+                "provider": "amazon-first-party-manual",
+                "provider_version": "manual-v1", "marketplace": "US",
+                "query": {"term": "foldable pantry shelf organizer"},
+                "scores": completed_scores,
+                "metrics": {"search_volume_90d": 12000},
+                "sources": ["Seller Central export"],
+            },
+        )
+        assert completed.status_code == 200
+        assert completed.json()["recommendation"]["recommendation_score"] > 0
+        assert completed.json()["market_evidence"]["provider"] == "evidence-composite"
+        assert client.get("/recommendations").status_code == 200
+        assert "Foldable pantry shelf insert" in client.get("/recommendations").text
+
+    recommendation = db.one("SELECT * FROM validated_recommendations")
+    snapshot = json.loads(recommendation["snapshot_json"])
+    assert snapshot["event"]["id"] == event_id
+    assert snapshot["opportunity_signal"]["id"] == signal_id
+    assert snapshot["product_hypothesis"]["id"] == hypothesis_id
+    assert snapshot["market_evidence"]["product_hypothesis_id"] == hypothesis_id
+    assert db.one("SELECT status FROM product_hypotheses WHERE id=?", (hypothesis_id,))[
+        "status"
+    ] == "validated"
 
 
 @pytest.mark.asyncio
@@ -873,19 +1286,20 @@ async def test_law_enforcement_event_is_not_commercialized(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_local_rules_are_labeled_as_inference(tmp_path: Path) -> None:
+async def test_local_rules_abstain_instead_of_generating_product_templates(tmp_path: Path) -> None:
     analyzer = Analyzer(make_settings(tmp_path))
     result = await analyzer.analyze(
         {"canonical_title": "新台风生成影响周末出行", "trend_score": 65},
         [{"id": 1, "excerpt": "多地旅客关注航班和天气变化"}],
     )
     assert result.engine == "local-rules"
-    assert result.output.opportunities
-    assert "待验证推断" in result.output.inference_notice
+    assert result.model == "local-rules-v2"
+    assert result.output.opportunities == []
+    assert "不再从新闻关键词生成固定商品模板" in result.output.inference_notice
 
 
 @pytest.mark.asyncio
-async def test_overseas_rules_bind_opportunity_to_amazon_marketplace(tmp_path: Path) -> None:
+async def test_overseas_rules_do_not_generate_amazon_query_or_product(tmp_path: Path) -> None:
     result = await Analyzer(make_settings(tmp_path)).analyze(
         {
             "canonical_title": "Best storage organizer for small apartments",
@@ -895,12 +1309,8 @@ async def test_overseas_rules_bind_opportunity_to_amazon_marketplace(tmp_path: P
         },
         [{"id": 1, "excerpt": "Shoppers compare durable home storage options"}],
     )
-    assert result.output.opportunities
-    opportunity = result.output.opportunities[0]
-    assert opportunity.marketplace == "Amazon.com"
-    assert opportunity.price_band.startswith("$")
-    assert "Amazon.com" in opportunity.channels
-    assert any("Amazon.com" in risk for risk in opportunity.risks)
+    assert result.output.opportunities == []
+    assert "OpportunitySignal" in result.output.inference_notice
 
 
 @pytest.mark.asyncio

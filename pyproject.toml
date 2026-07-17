@@ -11,6 +11,7 @@ dependencies = [
   "jinja2>=3.1,<4",
   "openai>=2.15,<3",
   "pydantic>=2.12,<3",
+  "tzdata>=2025.2; sys_platform == 'win32'",
   "uvicorn>=0.41,<1",
 ]
 
@@ -26,6 +27,9 @@ exclude = ["data*", "docs*", "tests*"]
 dev = [
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
+]
+ml = [
+  "sentence-transformers>=3,<6",
 ]
 
 [tool.pytest.ini_options]

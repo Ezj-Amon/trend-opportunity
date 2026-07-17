@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}反馈队列 · 新品机会系统{% endblock %}
+{% block content %}
+<section class="hero compact-hero"><div><p class="eyebrow">HUMAN FEEDBACK</p><h1>反馈队列</h1><p class="muted">一次点击修正线索；系统同时保存当时的趋势、证据、文本和模型版本。</p></div></section>
+<section class="panel">
+  <div class="panel-head"><h2>待反馈</h2><span>{{ signals|length }} 条</span></div>
+  <div class="feedback-list">
+  {% for signal in signals %}
+    <article class="feedback-row">
+      <div><a href="/events/{{ signal.event_id }}"><strong>{{ signal.event_title }}</strong></a><p>{{ signal.change_type }} · {{ signal.target_users|join('、') }} · 线索排序 {{ signal.product_opportunity_score }}</p></div>
+      <div>{% for key, label in feedback_types.items() %}<button class="compact {{ 'primary' if key == 'follow_up' else 'ghost' }}" onclick="saveSignalFeedback({{ signal.id }}, '{{ key }}')">{{ label }}</button>{% endfor %}</div>
+    </article>
+  {% else %}<div class="empty">没有待反馈线索。</div>{% endfor %}
+  </div>
+</section>
+<section class="panel">
+  <div class="panel-head"><h2>最近反馈</h2><span>{{ history|length }} 条</span></div>
+  {% for item in history %}<div class="history-row"><strong>{{ feedback_types.get(item.feedback_type, item.feedback_type) }}</strong><span>{{ item.event_title }} · {{ item.change_type }}</span><small>{{ item.created_at[:16].replace('T',' ') }}</small></div>{% else %}<p class="muted">尚无反馈</p>{% endfor %}
+</section>
+{% endblock %}
+{% block scripts %}<script>
+async function saveSignalFeedback(id, feedbackType) {
+  const note = prompt('可选：补充判断原因', '') ?? '';
+  if (await postAction(`/api/opportunity-signals/${id}/feedback`, '反馈已保存', {feedback_type:feedbackType,note})) setTimeout(()=>location.reload(),400);
+}
+</script>{% endblock %}

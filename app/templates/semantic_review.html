@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}语义去重与评测 · 新品机会系统{% endblock %}
+{% block content %}
+<section class="hero compact-hero"><div><p class="eyebrow">SEMANTIC REVIEW</p><h1>语义去重与评测</h1><p class="muted">向量只生成复核候选，不自动合并事件；人工反馈会连同模型版本和证据快照保存。</p></div><a class="button-link" href="/api/semantic/evaluation">查看评测 JSON</a></section>
+<div class="notice"><strong>相似度不是同一事件概率。</strong> 跨语言、同主题或上下游事件可能很相似，必须逐对判断。</div>
+<section class="panel"><div class="panel-head"><h2>重复候选</h2><span>{{ candidates|length }} 对</span></div>
+  <div class="duplicate-list">{% for item in candidates %}<article class="duplicate-row">
+    <div><span class="status {{ item.review_status }}">{{ item.review_status }}</span><b>语义 {{ item.semantic_similarity }}</b><small>词面 {{ item.lexical_similarity }} · {{ item.model_id }} / {{ item.model_version }} / {{ item.feature_version }}</small></div>
+    <div class="duplicate-events"><a href="/events/{{ item.event_a_id }}">#{{ item.event_a_id }} {{ item.event_a_title }}</a><span>{{ item.event_a_market }} / {{ item.event_a_language }}</span><a href="/events/{{ item.event_b_id }}">#{{ item.event_b_id }} {{ item.event_b_title }}</a><span>{{ item.event_b_market }} / {{ item.event_b_language }}</span></div>
+    <div>{% for key,label in duplicate_feedback_types.items() %}<button class="compact {{ 'primary' if key == 'same_event' else 'ghost' }}" onclick="reviewDuplicate({{ item.id }}, '{{ key }}')">{{ label }}</button>{% endfor %}</div>
+  </article>{% else %}<div class="empty">当前没有语义重复候选。Embedding 禁用或尚无高相似特征时这是正常结果。</div>{% endfor %}</div>
+</section>
+<section class="panel evaluation-samples"><div class="panel-head"><h2>真实事件评测样本</h2><span>{{ samples|length }} 条</span></div>
+  {% for item in samples %}<article class="sample-row"><div><a href="/events/{{ item.id }}"><b>#{{ item.id }} {{ item.canonical_title }}</b></a><small>{{ item.market }} · 趋势 {{ item.trend_score }} · 语义 {{ item.semantic_status or '未运行' }}{% if item.opportunity_similarity is not none %} / 差值 {{ item.opportunity_similarity }}{% endif %}</small></div><div><select id="label-{{ item.id }}"><option value="positive" {% if item.label=='positive' %}selected{% endif %}>值得跟进的实体新品机会</option><option value="no_physical_product" {% if item.label=='no_physical_product' %}selected{% endif %}>无实体商品机会</option><option value="weak_consumer_relevance" {% if item.label=='weak_consumer_relevance' %}selected{% endif %}>消费关联弱</option><option value="too_short_term" {% if item.label=='too_short_term' %}selected{% endif %}>短时热点</option><option value="high_risk" {% if item.label=='high_risk' %}selected{% endif %}>高风险/悲剧</option><option value="software_service" {% if item.label=='software_service' %}selected{% endif %}>软件/服务类</option><option value="insufficient_evidence" {% if item.label=='insufficient_evidence' %}selected{% endif %}>证据不足</option></select><input id="category-{{ item.id }}" value="{{ item.expected_category or '' }}" placeholder="期望实体类目（可空）"><button class="compact" onclick="labelEvent({{ item.id }})">保存标注</button></div></article>{% endfor %}
+</section>
+{% endblock %}
+{% block scripts %}<script>
+async function reviewDuplicate(id, feedbackType) { const note=prompt('可选：说明判断依据','') ?? ''; if(await postAction(`/api/semantic/duplicate-candidates/${id}/feedback`,'重复候选反馈已保存',{feedback_type:feedbackType,note})) setTimeout(()=>location.reload(),350); }
+async function labelEvent(id) { const label=document.getElementById(`label-${id}`).value; const expected_category=document.getElementById(`category-${id}`).value.trim(); if(await postAction(`/api/events/${id}/semantic-label`,'评测标签已保存',{label,expected_category,note:''})) setTimeout(()=>location.reload(),250); }
+</script>{% endblock %}

@@ -1,24 +1,37 @@
-# 趋势新闻自动选品助手 Demo
+# 全球趋势驱动新品机会系统
 
-一个使用真实热点数据的个人验证项目：采集国内外热榜、搜索和社区信号，聚类成事件，计算趋势分，抓取来源证据，生成绑定目标 Amazon 站点的产品机会并评分，经过人工审核后可推送到飞书。
+一个使用真实热点数据的个人验证项目：采集国内外热榜、搜索和社区信号，聚类成趋势事件，计算趋势分并保存来源证据，再逐步识别值得跟进的新品机会线索。
+
+## 产品方向
+
+本项目的核心定位是：从全球新闻趋势中发现可能孕育新品的消费变化，并将其整理成可验证的新品机会线索。趋势事件、机会线索、具体商品假设、平台市场证据和已验证推荐必须分层处理；没有平台证据时不得把商品假设包装成最终选品推荐。
+
+固定产品模板、假设分代理市场分和未验证产品榜单已经在 Phase 0 停用。后续设计与开发以 [产品边界与分层架构](docs/product-boundary-and-architecture.md) 为准。
 
 ## 当前能力
 
 - 国内数据：默认通过 NewsNow 公共 API 采集微博、知乎、百度、抖音、头条、B 站、酷安和贴吧。
 - 海外数据：默认采集 US/GB/DE/JP Google Trends RSS，以及 Hacker News、Product Hunt、GitHub Trending；后台可按市场筛选。
 - 海外社媒：提供 Reddit OAuth 可选适配器，使用 Async PRAW 管理鉴权、分页和限流，不依赖不稳定的匿名抓取。
-- Amazon 语义：海外机会显式标注 Amazon.com、Amazon.co.uk、Amazon.de 或 Amazon.co.jp，并保留关键词、竞品、价格带和评论痛点的后续验证项。
+- Amazon 验证能力：已将 Seller Central CSV 解析封装为 `MarketplaceDataProvider`，证据写入独立 `market_evidence`，不再依赖旧机会表。
 - 可追溯：保存每次请求的状态、延迟、原始响应哈希、热榜排名和事件聚类关系。
-- 可解释：趋势分和机会总分由代码计算，并显示所有分项。
+- 可解释：趋势分由代码计算并显示所有分项；模型判断分、市场分和已验证推荐分分别保存。
 - 证据优先：尝试读取热榜链接正文；失败时保留真实热榜标题、URL 和 HTTP 状态，不伪造正文。
-- 双分析引擎：配置 OpenAI-compatible API 时使用真实模型；未配置时使用 `local-rules-v1`，界面明确标记为待验证推断。
+- 分析降级：OpenAI-compatible 分析路径只允许生成 OpportunitySignal，禁止直接生成商品假设；未配置或调用失败时，`local-rules-v2` 只做事实层安全检查并主动弃权。
 - 安全门：死亡、犯罪和受害者相关敏感事件不生成商业化建议。
-- 主动弃权：本地规则无法识别稳定消费类别时返回零机会，不用通用模板凑结果。
-- 人工审核：机会通过后才能推送飞书，重复推送具有幂等保护。
-- 双榜摘要：控制台分别展示中国信号 Top 3 和海外信号 Top 3；按事件与产品方向去重，允许当天无合格候选。
-- 市场验证分层：产品假设分、Amazon 一方市场分和最终排序分分开保存；未录入 Product Opportunity Explorer / Brand Analytics 时明确显示 `unavailable`，不补写搜索量、竞争或利润数据。
+- 主动弃权：本地规则始终返回零商品假设，不用通用模板凑结果。
+- 推送门槛：单条商品只有完成人工审核、市场验证和风险门后才能作为已验证推荐推送，重复推送具有幂等保护。
+- 趋势摘要：首页和飞书分别展示中国、海外事实层趋势信号 Top 3，并明确标注它们不是商品推荐。
+- 市场验证分层：假设分、Amazon 一方市场分和可空的已验证推荐分分开保存；未完成市场验证时推荐分为空，不补写搜索量、竞争或利润数据。
 - 产品风险门：合规、IP、物流、季节性、供应链和单位经济性风险结构化记录，阻断级机会不能进入榜单、通过审核或推送。
 - 反馈闭环：支持保存审核原因、7 天结果和 30 天结果，为后续复盘提供标签。
+- OpportunitySignal 主链路：趋势事件与商品假设之间已有独立机会线索表，保存变化类型、消费关联、目标用户、新场景、未满足需求、实体类目、耐久性、交付周期、证据引用、缺失证据以及引擎/模型/版本。
+- 线索反馈：`/signals` 展示新品机会线索，`/feedback` 提供“值得跟进、无实体商品机会、消费关联弱、过于短期、类目错误、证据不足”六类反馈；每次反馈保存当时的趋势、证据、线索文本和模型版本快照。
+- 可选语义基线：以 `intfloat/multilingual-e5-small` 为默认模型，用事件标题和短证据摘要生成向量，保存模型 ID、revision、输入哈希和特征版本；正负机会原型相似度与实体类目候选只用于发现和排序，不显示为需求概率。
+- 语义去重闭环：`/semantic-review` 展示语义重复候选和真实事件评测样本；候选保存模型/特征版本、输入哈希、词面相似度、市场和语言，人工反馈保留完整快照，永不自动合并事件。
+- 人工线索入口：事件详情可人工创建引用本事件证据的 OpportunitySignal，仍需在反馈队列审核为“值得跟进”。
+- 独立商品假设：`/hypotheses` 展示 `product_hypotheses`；只有已审核线索能创建实体商品草稿，非实体类型、阻断风险、缺少证据或查询词时不能进入验证。
+- 独立推荐链：`/validation` 写入 MarketEvidence；只有证据完整、单位经济和证据评分至少为 3、风险为低或中时，才在 `/recommendations` 生成可回溯的 ValidatedRecommendation。
 
 ## 快速启动
 
@@ -87,26 +100,30 @@ $env:FEISHU_SECRET='机器人签名密钥（未开启签名可不填）'
 $env:PUBLIC_BASE_URL='http://你的可访问地址:8000'
 ```
 
-在事件详情页先点击“通过”，再点击“推送飞书”。Webhook 和 Secret 只从环境变量读取，不写入 SQLite。
+单条商品必须完成市场验证并通过人工审核，才能点击“推送已验证推荐”。Webhook 和 Secret 只从环境变量读取，不写入 SQLite。
 
-首页还提供“推送双榜到飞书”：一次发送中国信号 Top 3 和海外信号 Top 3。摘要不会强制凑满三个候选，并会标出市场验证缺口。
-升级前生成的 `opportunity-v1` 机会不会混入新榜单；升级后请运行一次采集，生成带风险和市场验证状态的 `opportunity-v2` 候选。
+首页还提供“推送趋势摘要到飞书”：一次发送中国与海外趋势信号 Top 3。摘要只包含事实层趋势事件，不包含商品、查询词或选品推荐。
 
-## 市场验证
+## 商品假设、市场验证与推荐
 
-当前优先使用专业卖家账户中的 Amazon 一方数据，不依赖卖家精灵或 SP-API。打开 `/validation` 工作台，可以按目标站点查看待验证队列，并直接上传“商机探测器”和“品牌分析 → 热门搜索词”的中文 Seller Central 原始 CSV；程序会跳过文件开头的筛选条件，精确匹配查询词并生成保守的部分市场评分。也保留中文标准化 CSV 作为人工补分入口。完整操作见 [Amazon 一方数据验证流程](docs/amazon-first-party-validation.md)。
+先在线索页把 OpportunitySignal 审核为“值得跟进”，再从事件详情人工创建具体实体商品假设。商品假设通过结构、证据引用和风险检查，并经人工审核后进入 `/validation`。完整操作见 [Amazon 一方数据验证流程](docs/amazon-first-party-validation.md)。
 
-美国站待验证机会必须先具备具体英文商品查询词。过短、纯中文或类似 `AI` 的泛化词会标为 `needs_keyword`，不会直接交给人工查询；查询词可在工作台修正，修正后旧市场验证自动失效。
+系统不再从新闻关键词或规则类目自动生成 Amazon 查询词。查询词必须来自具体商品形态、目标用户和使用场景，并通过人工确认；修正查询词后旧市场验证自动失效。
 
 程序明确区分事件的信号来源市场和产品的目标 Amazon 站点。默认目标站点由 `AMAZON_DEFAULT_MARKETPLACE` 控制；更换目标站点会让旧站点验证失效并把审核状态重置为待审核。
 
-程序同时保留可插拔 `MarketValidator` 契约和单条工作流回写 API：
+新主链路使用可插拔 `MarketplaceDataProvider` 契约和以下 API：
 
 ```text
-POST /api/opportunities/{opportunity_id}/validation
+POST /api/events/{event_id}/opportunity-signals
+POST /api/opportunity-signals/{signal_id}/product-hypotheses
+POST /api/product-hypotheses/{hypothesis_id}/review
+POST /api/product-hypotheses/{hypothesis_id}/amazon-raw-import
+POST /api/product-hypotheses/{hypothesis_id}/market-evidence
+GET  /api/validated-recommendations
 ```
 
-也提供 `GET /api/opportunities/pending-validation` 给后续 Skill/Agent 读取待验证队列。页面上的“录入市场验证”可用于单条手动验证。八个维度依次为搜索需求、购买意图、竞争机会、单位经济性、差异化、执行可行性、时机持续性和证据完整度；未知项必须留空。
+旧 `product_opportunities`、`market_validations` 及对应 API 仅作迁移兼容，不再生产新主链路推荐。八个市场维度依次为搜索需求、购买意图、竞争机会、单位经济性、差异化、执行可行性、时机持续性和证据完整度，未知项必须留空；任何缺失都会阻止最终推荐。
 
 审核时可填写原因，机会详情页还可记录 7 天和 30 天结果。写接口仍遵守本机或 `ADMIN_TOKEN` 限制。
 
@@ -119,6 +136,23 @@ python -m pytest -q -m live
 
 `live` 测试会真实访问 NewsNow 和 Google Trends RSS，不使用 Mock。由于它依赖外部服务，网络或上游故障会真实导致测试失败。Reddit 需要个人 OAuth 凭证，因此不放入无凭证 CI 测试。
 
+## 可选语义模型
+
+默认安装不包含 PyTorch 或 `sentence-transformers`，默认测试不会下载模型。需要启用时先显式安装并准备本地缓存：
+
+```powershell
+pip install -e ".[ml]"
+$env:ENABLE_EMBEDDINGS='true'
+$env:EMBEDDING_MODEL_ID='intfloat/multilingual-e5-small'
+$env:EMBEDDING_MODEL_REVISION='614241f622f53c4eeff9890bdc4f31cfecc418b3'
+$env:EMBEDDING_CACHE_DIR='data/models'
+$env:EMBEDDING_LOCAL_FILES_ONLY='true'
+```
+
+模型或依赖不可用时，`semantic_event_features.status` 会明确记录 `unavailable`；未启用时记录 `disabled`。系统不会静默下载，也不会回退到固定商品模板。人工评测可通过 `/semantic-review` 或 `POST /api/events/{event_id}/semantic-label` 保存；`GET /api/semantic/evaluation?k=10` 返回 embedding 与趋势规则基线的 Precision@K、类目准确率、弃权率、无消费意义标签占比、重复候选精度和模型版本对比。
+
+当前工作机已经在 `.venv` 安装 ML extra，并将固定 revision `614241f622f53c4eeff9890bdc4f31cfecc418b3` 缓存到被 Git 忽略的 `data/models`。7 条覆盖性人工样本上，embedding Precision@5 为 0.20，与趋势规则基线 0.20 持平；原 0.84 去重阈值的 11 对候选均为误报，因此默认候选阈值收紧为 0.90。样本太小且效果未超过基线，`ENABLE_EMBEDDINGS` 继续默认为 `false`，不得据此自动创建线索或合并事件。
+
 ## 评分
 
 趋势分：跨源覆盖 30%、榜单排名 25%、上升速度 20%、持续性 15%、新鲜度 10%。首次采集没有历史基线时，上升速度取中性值 50。
@@ -127,7 +161,7 @@ python -m pytest -q -m live
 
 市场分：搜索需求 20%、购买意图 15%、竞争机会 15%、单位经济性 20%、差异化 10%、执行可行性 10%、时机持续性 5%、证据完整度 5%。缺失维度按零贡献计算，不重新分配权重。
 
-最终排序分：趋势分 25% + 市场分 75%，再扣除验证缺失和产品风险惩罚。市场数据完全缺失时，暂用假设分作为带有 30 分不确定性惩罚的代理值；界面始终标为 `unavailable`。阻断风险直接得到零分。证据置信度继续独立显示。
+已验证推荐分：仅当市场验证状态为 `completed` 且市场分存在时计算，公式为趋势分 25% + 市场分 75%，再扣除产品风险。缺少或只有部分市场证据时保持为空，绝不使用假设分代理；阻断风险不得成为推荐。证据置信度继续独立显示。
 
 ## 重要边界
 

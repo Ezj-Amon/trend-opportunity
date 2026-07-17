@@ -13,14 +13,40 @@
   {% endfor %}
 </section>
 
+{% if semantic_feature %}
+<div class="notice"><strong>语义基线：</strong>{{ semantic_feature.status }} · {{ semantic_feature.model_id }}@{{ semantic_feature.model_version }}{% if semantic_feature.status == 'ready' %} · 正向原型相似度 {{ semantic_feature.positive_similarity }} · 负向原型相似度 {{ semantic_feature.negative_similarity }}{% if semantic_feature.category_matches %} · 类目候选 {{ semantic_feature.category_matches|map(attribute='category')|join('、') }}{% endif %}{% elif semantic_feature.error %} · {{ semantic_feature.error }}{% endif %}。相似度不是市场概率。</div>
+{% endif %}
+
 {% if analysis_output %}<div class="notice"><strong>分析说明：</strong>{{ analysis_output.inference_notice }}{% if analysis %}（{{ analysis.engine }} / {{ analysis.model }}）{% endif %}</div>{% endif %}
 
+<section class="panel signal-section">
+  <div class="panel-head"><h2>新品机会线索</h2><span>判断层 · 可为空 · 不是商品推荐</span></div>
+  <details class="manual-create"><summary>人工创建一条可审计的机会线索</summary><p class="muted">只填写从本页证据能够支持的判断；多个值用分号分隔，证据 ID 在页面底部可见。</p><button class="compact" onclick="createSignal({{ event.id }})">开始填写</button></details>
+  <div class="signal-grid">
+  {% for signal in signals %}
+    <article class="signal-card">
+      <div class="signal-card-head"><span class="status {{ signal.review_status }}">{{ signal.review_status }}</span><strong>{{ signal.change_type }}</strong><b>{{ signal.product_opportunity_score }}</b></div>
+      <p><b>目标用户：</b>{{ signal.target_users|join('、') }}</p>
+      <p><b>新场景：</b>{{ signal.new_scenarios|join('、') }}</p>
+      <p><b>未满足需求：</b>{{ signal.unmet_needs|join('、') }}</p>
+      <small>消费关联 {{ signal.consumer_relevance_score }} · 置信度 {{ signal.confidence }} · {{ signal.engine }} / {{ signal.model }}</small>
+      {% if signal.review_status == 'follow_up' %}<div class="signal-feedback"><button class="compact primary" onclick="createHypothesis({{ signal.id }}, '{{ signal.evidence_ids|join(',') }}')">基于该线索创建实体商品假设</button></div>{% endif %}
+    </article>
+  {% else %}<div class="empty">当前只有趋势事实，没有达到线索门槛的消费变化判断。</div>{% endfor %}
+  </div>
+</section>
+
 <section class="panel">
-  <div class="panel-head"><h2>产品机会</h2><span>人工审核后才能推送</span></div>
+  <div class="panel-head"><h2>商品假设</h2><span>构思层 · 待市场验证 · 不是推荐</span></div>
+  <div class="cards">{% for item in product_hypotheses %}<article class="opportunity-card"><div class="card-top"><div><span class="status {{ item.status }}">{{ item.status }}</span><span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>#{{ item.id }}</strong><span>假设编号</span></div></div><p><b>实体形态：</b>{{ item.physical_form }}</p><p><b>目标用户：</b>{{ item.target_users|join('、') }}</p><p><b>场景：</b>{{ item.scenarios|join('、') }}</p><p><b>问题：</b>{{ item.problem }}</p><p><b>预期差异：</b>{{ item.expected_difference }}</p><p><b>查询词候选：</b>{{ item.query_terms|join('、') if item.query_terms else '尚未填写' }} · {{ item.target_marketplace }}</p><a class="button-link compact" href="/hypotheses">进入商品假设工作台</a></article>{% else %}<div class="empty">尚无独立商品假设。只有标记为“值得跟进”的线索可创建。</div>{% endfor %}</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>商品假设（旧版）</h2><span>不是推荐；仅作迁移期审计</span></div>
   <div class="cards">
   {% for item in opportunities %}
     <article class="opportunity-card">
-      <div class="card-top"><div><span class="status {{ item.review_status }}">{{ item.review_status }}</span> <span class="status {{ item.validation_status }}">{{ item.validation_status }}</span> <span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>{{ item.opportunity_score }}</strong><span>最终排序分</span></div></div>
+      <div class="card-top"><div><span class="status {{ item.review_status }}">{{ item.review_status }}</span> <span class="status {{ item.validation_status }}">{{ item.validation_status }}</span> <span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>{{ item.validated_recommendation_score if item.validated_recommendation_score is not none else '待验证' }}</strong><span>已验证推荐分</span></div></div>
       <p><b>关键词：</b>{{ item.product_keywords|join('、') }} · <b>类目：</b>{{ item.category or '待确认' }}</p>
       <p><b>目标人群：</b>{{ item.target_segment }}</p>
       <p><b>场景：</b>{{ item.scenario }}</p>
@@ -66,16 +92,16 @@
         <button class="ghost" onclick="changeMarketplace({{ item.id }})">更换目标站点</button>
         <button class="ghost" onclick="saveOutcome({{ item.id }}, 7)">记录 7 天</button>
         <button class="ghost" onclick="saveOutcome({{ item.id }}, 30)">记录 30 天</button>
-        <button class="primary" onclick="pushFeishu({{ item.id }})" {% if not feishu_configured %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送飞书</button>
+        <button class="primary" onclick="pushFeishu({{ item.id }})" {% if not feishu_configured or item.validated_recommendation_score is none or item.validation_status != 'completed' or item.review_status != 'approved' %}disabled title="仅已审核且完成市场验证的推荐可推送"{% endif %}>推送已验证推荐</button>
       </div>
     </article>
-  {% else %}<div class="empty">该事件尚未生成机会。</div>{% endfor %}
+  {% else %}<div class="empty">该事件只有事实层趋势，当前没有合格的商品假设。</div>{% endfor %}
   </div>
 </section>
 
 <div class="layout">
   <section class="panel grow"><div class="panel-head"><h2>真实来源证据</h2><span>{{ evidence|length }} 条</span></div>
-    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">{{ '正文' if item.kind == 'article' else '真实热榜条目' }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>HTTP {{ item.http_status or '未抓正文' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.error %} · 正文抓取：{{ item.error }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
+    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">证据 #{{ item.id }} · {{ '正文' if item.kind == 'article' else '真实热榜条目' }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>HTTP {{ item.http_status or '未抓正文' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.error %} · 正文抓取：{{ item.error }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
   </section>
   <aside class="side"><section class="panel"><div class="panel-head"><h2>聚类成员</h2></div>
     {% for item in members %}<div class="member"><span>{{ item.source }} #{{ item.rank }} · {{ item.market }} · {{ item.signal_type }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><small>{{ item.match_method }} · {{ '%.2f'|format(item.match_score) }}</small></div>{% endfor %}
@@ -83,6 +109,21 @@
 </div>
 {% endblock %}
 {% block scripts %}<script>
+function splitValues(value) { return value.split(/[;；]/).map(v=>v.trim()).filter(Boolean); }
+async function createSignal(eventId) {
+  const change_type=prompt('变化类型（行为变化/环境约束/法规变化/技术能力/生活方式变化等）',''); if(!change_type)return;
+  const target_users=splitValues(prompt('目标用户，多个用分号分隔','')||''); const new_scenarios=splitValues(prompt('新场景，多个用分号分隔','')||''); const unmet_needs=splitValues(prompt('未满足需求，多个用分号分隔','')||'');
+  const related_product_categories=splitValues(prompt('相关实体类目，可留空，多个用分号分隔','')||''); const durability=prompt('持续性：短时/季节性/中期/结构性','中期')||''; const lead_time_fit=prompt('开发交付周期是否匹配','需评估')||'';
+  const evidence_ids=splitValues(prompt('引用证据 ID，多个用分号分隔','')||'').map(Number).filter(Number.isInteger); const consumer_relevance_score=Number(prompt('消费关联排序分 0-100','50')); const product_opportunity_score=Number(prompt('新品机会排序分 0-100','50')); const confidence=Number(prompt('判断置信度 0-100（不是市场概率）','50')); const missing_evidence=splitValues(prompt('仍缺失的证据，可留空','')||'');
+  if(!target_users.length||!new_scenarios.length||!unmet_needs.length||!evidence_ids.length){toast('目标用户、新场景、未满足需求和证据 ID 不能为空',true);return;}
+  if(await postAction(`/api/events/${eventId}/opportunity-signals`,'人工线索已创建，等待审核',{change_type,consumer_relevance_score,product_opportunity_score,target_users,new_scenarios,unmet_needs,related_product_categories,durability,lead_time_fit,evidence_ids,confidence,missing_evidence}))setTimeout(()=>location.reload(),400);
+}
+async function createHypothesis(signalId, suggestedEvidence) {
+  const name=prompt('具体实体商品名称',''); if(!name)return; const physical_form=prompt('实体形态、材料或组成（不得是软件/服务）',''); if(!physical_form)return;
+  const target_users=splitValues(prompt('目标用户，多个用分号分隔','')||''); const scenarios=splitValues(prompt('使用场景，多个用分号分隔','')||''); const problem=prompt('要解决的新问题或约束','')||''; const expected_difference=prompt('相对现有商品的预期差异','')||''; const product_keywords=splitValues(prompt('商品中心词，多个用分号分隔','')||''); const query_terms=splitValues(prompt('人工确认的平台查询词候选，多个用分号分隔','')||''); const target_marketplace=prompt('目标 Amazon 站点代码','US')||'US'; const evidence_ids=splitValues(prompt('引用证据 ID，必须来自该线索',suggestedEvidence)||'').map(Number).filter(Number.isInteger);
+  if(!target_users.length||!scenarios.length||!problem||!expected_difference||!product_keywords.length||!evidence_ids.length){toast('请完整填写商品假设结构',true);return;}
+  if(await postAction(`/api/opportunity-signals/${signalId}/product-hypotheses`,'商品假设草稿已创建',{name,physical_form,target_users,scenarios,problem,expected_difference,product_keywords,query_terms,target_marketplace,evidence_ids}))setTimeout(()=>location.reload(),400);
+}
 async function reviewWithNote(id, status) {
   const note = prompt('请填写审核原因（可留空）', '') ?? null;
   if (note === null) return;

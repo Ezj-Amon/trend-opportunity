@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}新品机会线索 · 新品机会系统{% endblock %}
+{% block content %}
+<section class="hero compact-hero">
+  <div><p class="eyebrow">OPPORTUNITY SIGNALS</p><h1>新品机会线索</h1><p class="muted">这里展示消费变化判断，不创造具体商品，也不代表市场验证或最终推荐。</p></div>
+  <a class="button-link" href="/feedback">进入反馈队列</a>
+</section>
+<div class="notice"><strong>允许零线索。</strong> 当证据不足、没有实体商品空间或来不及开发时，系统应主动弃权。</div>
+<section class="signal-grid">
+{% for signal in signals %}
+  <article class="panel signal-card" id="signal-{{ signal.id }}">
+    <div class="signal-card-head"><div><span class="status {{ signal.review_status }}">{{ signal.review_status }}</span><span>{{ signal.market }} · {{ signal.signal_type }}</span></div><b>{{ signal.product_opportunity_score }}</b></div>
+    <a href="/events/{{ signal.event_id }}"><h2>{{ signal.event_title }}</h2></a>
+    <p class="signal-type">{{ signal.change_type }} · {{ signal.durability }} · 交付周期 {{ signal.lead_time_fit }}</p>
+    <p><b>目标用户：</b>{{ signal.target_users|join('、') }}</p>
+    <p><b>新场景：</b>{{ signal.new_scenarios|join('、') }}</p>
+    <p><b>未满足需求：</b>{{ signal.unmet_needs|join('、') }}</p>
+    <p><b>相关实体类目：</b>{{ signal.related_product_categories|join('、') if signal.related_product_categories else '暂不判断' }}</p>
+    {% if signal.missing_evidence %}<p class="muted"><b>缺失证据：</b>{{ signal.missing_evidence|join('、') }}</p>{% endif %}
+    <div class="signal-meta"><span>消费关联 {{ signal.consumer_relevance_score }}</span><span>线索排序 {{ signal.product_opportunity_score }}</span><span>模型置信度 {{ signal.confidence }}</span></div>
+    <small>{{ signal.engine }} / {{ signal.model }} / {{ signal.version }}</small>
+    <div class="signal-feedback">
+      {% for key, label in feedback_types.items() %}<button class="compact {{ 'primary' if key == 'follow_up' else 'ghost' }}" onclick="saveSignalFeedback({{ signal.id }}, '{{ key }}')">{{ label }}</button>{% endfor %}
+    </div>
+  </article>
+{% else %}<section class="panel empty"><p>当前没有新品机会线索。</p><p>趋势事件仍会正常保留；零线索是合法结果。</p></section>{% endfor %}
+</section>
+{% endblock %}
+{% block scripts %}<script>
+async function saveSignalFeedback(id, feedbackType) {
+  const note = prompt('可选：补充判断原因', '') ?? '';
+  if (await postAction(`/api/opportunity-signals/${id}/feedback`, '反馈已保存', {feedback_type:feedbackType,note})) setTimeout(()=>location.reload(),400);
+}
+</script>{% endblock %}

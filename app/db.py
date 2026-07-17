@@ -115,6 +115,179 @@ CREATE TABLE IF NOT EXISTS analyses (
   error TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS opportunity_signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  analysis_id INTEGER NOT NULL REFERENCES analyses(id),
+  change_type TEXT NOT NULL,
+  consumer_relevance_score REAL NOT NULL,
+  product_opportunity_score REAL NOT NULL,
+  target_users_json TEXT NOT NULL DEFAULT '[]',
+  new_scenarios_json TEXT NOT NULL DEFAULT '[]',
+  unmet_needs_json TEXT NOT NULL DEFAULT '[]',
+  related_product_categories_json TEXT NOT NULL DEFAULT '[]',
+  durability TEXT NOT NULL,
+  lead_time_fit TEXT NOT NULL,
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  confidence REAL NOT NULL,
+  missing_evidence_json TEXT NOT NULL DEFAULT '[]',
+  review_status TEXT NOT NULL DEFAULT 'pending',
+  engine TEXT NOT NULL,
+  model TEXT NOT NULL,
+  version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_opportunity_signals_rank
+  ON opportunity_signals(review_status, product_opportunity_score DESC, confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_opportunity_signals_event
+  ON opportunity_signals(event_id, id DESC);
+CREATE TABLE IF NOT EXISTS opportunity_signal_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_id INTEGER NOT NULL REFERENCES opportunity_signals(id),
+  feedback_type TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signal_feedback_signal
+  ON opportunity_signal_feedback(signal_id, id DESC);
+CREATE TABLE IF NOT EXISTS semantic_event_features (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  model_id TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  feature_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  embedding_json TEXT,
+  category_matches_json TEXT NOT NULL DEFAULT '[]',
+  positive_similarity REAL,
+  negative_similarity REAL,
+  opportunity_similarity REAL,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(event_id, model_id, model_version, input_hash, feature_version)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_features_event
+  ON semantic_event_features(event_id, id DESC);
+CREATE TABLE IF NOT EXISTS semantic_evaluation_labels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  label TEXT NOT NULL,
+  expected_category TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  UNIQUE(event_id)
+);
+CREATE TABLE IF NOT EXISTS semantic_duplicate_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_a_id INTEGER NOT NULL REFERENCES trend_events(id),
+  event_b_id INTEGER NOT NULL REFERENCES trend_events(id),
+  semantic_similarity REAL NOT NULL,
+  lexical_similarity REAL NOT NULL,
+  model_id TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  feature_version TEXT NOT NULL,
+  event_a_input_hash TEXT NOT NULL,
+  event_b_input_hash TEXT NOT NULL,
+  event_a_market TEXT NOT NULL DEFAULT '',
+  event_b_market TEXT NOT NULL DEFAULT '',
+  event_a_language TEXT NOT NULL DEFAULT '',
+  event_b_language TEXT NOT NULL DEFAULT '',
+  review_status TEXT NOT NULL DEFAULT 'pending',
+  reviewer_note TEXT NOT NULL DEFAULT '',
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK(event_a_id < event_b_id),
+  UNIQUE(event_a_id, event_b_id, model_id, model_version, feature_version,
+         event_a_input_hash, event_b_input_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_duplicate_review
+  ON semantic_duplicate_candidates(review_status, semantic_similarity DESC);
+CREATE TABLE IF NOT EXISTS semantic_duplicate_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id INTEGER NOT NULL REFERENCES semantic_duplicate_candidates(id),
+  feedback_type TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_duplicate_feedback_candidate
+  ON semantic_duplicate_feedback(candidate_id, id DESC);
+CREATE TABLE IF NOT EXISTS product_hypotheses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_signal_id INTEGER NOT NULL REFERENCES opportunity_signals(id),
+  name TEXT NOT NULL,
+  physical_form TEXT NOT NULL,
+  target_users_json TEXT NOT NULL DEFAULT '[]',
+  scenarios_json TEXT NOT NULL DEFAULT '[]',
+  problem TEXT NOT NULL,
+  expected_difference TEXT NOT NULL,
+  product_keywords_json TEXT NOT NULL DEFAULT '[]',
+  query_terms_json TEXT NOT NULL DEFAULT '[]',
+  target_marketplace TEXT NOT NULL DEFAULT 'US',
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  generator_type TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL,
+  risk_level TEXT NOT NULL DEFAULT 'unassessed',
+  risk_flags_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'draft',
+  reviewer_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_hypotheses_signal
+  ON product_hypotheses(opportunity_signal_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_product_hypotheses_status
+  ON product_hypotheses(status, id DESC);
+CREATE TABLE IF NOT EXISTS product_hypothesis_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hypothesis_id INTEGER NOT NULL REFERENCES product_hypotheses(id),
+  status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_hypothesis_feedback
+  ON product_hypothesis_feedback(hypothesis_id, id DESC);
+CREATE TABLE IF NOT EXISTS market_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_hypothesis_id INTEGER NOT NULL REFERENCES product_hypotheses(id),
+  provider TEXT NOT NULL,
+  provider_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  marketplace TEXT NOT NULL,
+  query_json TEXT NOT NULL DEFAULT '{}',
+  scores_json TEXT NOT NULL DEFAULT '{}',
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  sources_json TEXT NOT NULL DEFAULT '[]',
+  missing_fields_json TEXT NOT NULL DEFAULT '[]',
+  market_score REAL,
+  raw_response_hash TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  error TEXT,
+  collected_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_evidence_hypothesis
+  ON market_evidence(product_hypothesis_id, id DESC);
+CREATE TABLE IF NOT EXISTS validated_recommendations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_hypothesis_id INTEGER NOT NULL REFERENCES product_hypotheses(id),
+  market_evidence_id INTEGER NOT NULL UNIQUE REFERENCES market_evidence(id),
+  recommendation_score REAL NOT NULL,
+  risk_level TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  snapshot_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_validated_recommendations_score
+  ON validated_recommendations(status, recommendation_score DESC);
 CREATE TABLE IF NOT EXISTS product_opportunities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   analysis_id INTEGER NOT NULL REFERENCES analyses(id),
@@ -147,6 +320,7 @@ CREATE TABLE IF NOT EXISTS product_opportunities (
   hypothesis_score REAL NOT NULL DEFAULT 0,
   market_score REAL,
   final_score REAL NOT NULL DEFAULT 0,
+  validated_recommendation_score REAL,
   validation_status TEXT NOT NULL DEFAULT 'unavailable',
   uncertainty_penalty REAL NOT NULL DEFAULT 30,
   opportunity_score REAL NOT NULL,
@@ -252,6 +426,7 @@ class Database:
                 "hypothesis_score": "REAL NOT NULL DEFAULT 0",
                 "market_score": "REAL",
                 "final_score": "REAL NOT NULL DEFAULT 0",
+                "validated_recommendation_score": "REAL",
                 "validation_status": "TEXT NOT NULL DEFAULT 'unavailable'",
                 "uncertainty_penalty": "REAL NOT NULL DEFAULT 30",
                 "target_marketplace": "TEXT NOT NULL DEFAULT ''",
@@ -262,10 +437,17 @@ class Database:
             conn.execute(
                 """UPDATE product_opportunities
                 SET hypothesis_score=opportunity_score,
-                    final_score=opportunity_score,
+                    final_score=0,
+                    validated_recommendation_score=NULL,
                     risk_level='unassessed',
                     validation_status='unavailable'
                 WHERE score_formula_version='opportunity-v1'"""
+            )
+            conn.execute(
+                """UPDATE product_opportunities
+                SET validated_recommendation_score=final_score
+                WHERE validated_recommendation_score IS NULL
+                  AND validation_status='completed' AND market_score IS NOT NULL"""
             )
             conn.execute(
                 """UPDATE product_opportunities SET target_marketplace=CASE
@@ -376,6 +558,16 @@ class Database:
                 "opportunity_outcomes",
                 "market_validations",
                 "product_opportunities",
+                "validated_recommendations",
+                "market_evidence",
+                "product_hypothesis_feedback",
+                "product_hypotheses",
+                "opportunity_signal_feedback",
+                "opportunity_signals",
+                "semantic_duplicate_feedback",
+                "semantic_duplicate_candidates",
+                "semantic_event_features",
+                "semantic_evaluation_labels",
                 "analyses",
                 "evidence",
                 "event_members",

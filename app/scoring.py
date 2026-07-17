@@ -112,15 +112,13 @@ def calculate_final_score(
     market_score: float | None,
     validation_status: str,
     risk_level: str,
-) -> tuple[float, float]:
-    """Combine discovery and validation while making uncertainty visible.
+) -> tuple[float | None, float]:
+    """Calculate a recommendation score only from completed market evidence.
 
-    Until market evidence exists, the hypothesis score is only a provisional
-    proxy and receives a large penalty. Blocking product risks always veto the
-    candidate regardless of popularity.
+    ``hypothesis_score`` remains in the signature while the legacy product
+    opportunity model is being retired, but it is deliberately not used as a
+    substitute for marketplace evidence.
     """
-    if risk_level == "blocking":
-        return 0.0, 100.0
 
     status_penalties = {
         "completed": 0.0,
@@ -131,10 +129,12 @@ def calculate_final_score(
     }
     risk_penalties = {"low": 0.0, "medium": 8.0, "high": 20.0}
     uncertainty_penalty = status_penalties.get(validation_status, 30.0)
+    if validation_status != "completed" or market_score is None:
+        return None, uncertainty_penalty
+    if risk_level == "blocking":
+        return 0.0, 100.0
     risk_penalty = risk_penalties.get(risk_level, 20.0)
-    market_component = hypothesis_score if market_score is None else market_score
-    value = 0.25 * trend_score + 0.75 * market_component
-    value -= uncertainty_penalty + risk_penalty
+    value = 0.25 * trend_score + 0.75 * market_score - risk_penalty
     return round(max(0.0, min(value, 100.0)), 1), uncertainty_penalty
 
 

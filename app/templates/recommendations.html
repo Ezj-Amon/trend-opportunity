@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}已验证推荐 · 新品机会系统{% endblock %}
+{% block content %}
+<section class="hero compact-hero"><div><p class="eyebrow">VALIDATED RECOMMENDATIONS</p><h1>已验证推荐</h1><p class="muted">仅展示市场证据完整、单位经济与证据门槛通过、且风险为低或中的实体商品。</p></div><a class="button-link" href="/validation">进入市场验证</a></section>
+<div class="notice"><strong>完整回溯：</strong>TrendEvent → OpportunitySignal → ProductHypothesis → MarketEvidence。空榜是合法结果。</div>
+<section class="signal-grid">{% for item in recommendations %}<article class="panel signal-card"><div class="signal-card-head"><div><span class="status completed">已验证</span><span>{{ item.target_marketplace }} · 风险 {{ item.risk_level }}</span></div><b>{{ item.recommendation_score }}</b></div><a href="/events/{{ item.event_id }}"><h2>{{ item.hypothesis_name }}</h2></a><p class="signal-type">{{ item.physical_form }}</p><p><b>趋势事件：</b>{{ item.event_title }}</p><p><b>证据链：</b>事件 #{{ item.event_id }} → 线索 #{{ item.opportunity_signal_id }} → 假设 #{{ item.product_hypothesis_id }} → 市场证据 #{{ item.market_evidence_id }}</p><p><b>平台证据：</b>{{ item.provider }} / {{ item.provider_version }} · 市场分 {{ item.market_score }}</p><small>{{ item.collected_at }}</small></article>{% else %}<section class="panel empty"><p>当前没有通过全部门槛的已验证推荐。</p><p>系统不会用趋势分、假设分或向量相似度填满榜单。</p></section>{% endfor %}</section>
+{% endblock %}

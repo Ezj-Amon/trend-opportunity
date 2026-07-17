@@ -4,7 +4,7 @@
 
 打开 `/validation` 后，从第 1 条“可立即验证”的任务开始：
 
-1. 复制系统给出的查询词。目标站点和查询词都由系统准备，只有明显不准确时才修正。
+1. 复制已经在 ProductHypothesis 中由人工确认的具体商品查询词。系统不会从新闻标题或类目自动生成查询词。
 2. 在对应站点的 Seller Central 中用这个词分别导出“商机探测器”和“品牌分析 → 热门搜索词”两个 CSV。
 3. 回到同一条任务，上传这两个原始 CSV。系统负责匹配指标、评分并更新排序。
 
@@ -12,10 +12,21 @@
 
 ## 系统会替你完成什么
 
-- 根据产品机会生成买家会输入的具体商品查询词，并选择目标 Amazon 站点。
+- 校验商品假设已完成审核、目标站点明确且查询词来自具体实体商品形态。
 - 从两份原始 CSV 中精确匹配查询词，自动读取需求、购买意图、竞争、差异化、时机和证据指标。
 - 明确保留仍缺少的单位经济性或执行数据，不要求用户猜数。
-- 站点或查询词被修正时自动作废旧验证，避免沿用错误结论。
+- 将每次结果独立保存为 MarketEvidence；新证据不会覆盖旧证据快照。
+- 只有证据完整、单位经济和证据评分达到门槛、风险为低或中时，创建 ValidatedRecommendation。
+
+主链路 API 为：
+
+```text
+POST /api/product-hypotheses/{hypothesis_id}/amazon-raw-import
+GET  /api/product-hypotheses/{hypothesis_id}/market-evidence
+GET  /api/validated-recommendations
+```
+
+旧 `opportunity_id` 标准表和旧机会 API 只用于历史数据迁移。
 
 ## Seller Central 下载操作
 

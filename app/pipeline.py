@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .analysis import Analyzer
-from .amazon import marketplace_code, marketplace_name, pick_search_term
+from .amazon import marketplace_code, marketplace_name
 from .clustering import normalize_title, should_merge
 from .config import Settings
 from .db import Database
@@ -16,6 +16,14 @@ from .deduplication import collapse_unworked_duplicate_opportunities
 from .evidence import fetch_evidence
 from .market_validation import UnavailableMarketValidator
 from .risk import assess_product_risk
+from .semantic import (
+    EmbeddingUnavailable,
+    SemanticFeatureExtractor,
+    SentenceTransformerEmbedder,
+    semantic_input,
+    semantic_input_hash,
+)
+from .semantic_duplicates import create_duplicate_candidates
 from .scoring import (
     calculate_evidence_confidence,
     calculate_final_score,
@@ -55,6 +63,18 @@ class Pipeline:
         )
         self.analyzer = Analyzer(settings)
         self.market_validator = UnavailableMarketValidator()
+        self.semantic_extractor = (
+            SemanticFeatureExtractor(
+                SentenceTransformerEmbedder(
+                    settings.embedding_model_id,
+                    settings.embedding_model_revision,
+                    settings.embedding_cache_dir,
+                    settings.embedding_local_files_only,
+                )
+            )
+            if settings.enable_embeddings
+            else None
+        )
         self._lock = asyncio.Lock()
         self._progress: dict[str, Any] | None = None
 
@@ -78,7 +98,7 @@ class Pipeline:
         engine = (
             f"llm-{self.settings.openai_model}"
             if self.settings.openai_api_key
-            else "local-rules-v1"
+            else "local-rules-v2"
         )
         return f"{ANALYSIS_PROMPT_VERSION}:{engine}"
 
@@ -255,6 +275,12 @@ class Pipeline:
         return run_id
 
     def _invalidate_old_analysis_versions(self) -> None:
+        self.db.execute(
+            """UPDATE opportunity_signals SET review_status='superseded', updated_at=?
+            WHERE review_status!='superseded' AND analysis_id IN
+            (SELECT id FROM analyses WHERE prompt_version!=?)""",
+            (utc_now(), self.analysis_version),
+        )
         self.db.execute(
             """UPDATE product_opportunities SET review_status='superseded', updated_at=?
             WHERE review_status!='superseded' AND analysis_id IN
@@ -645,6 +671,7 @@ class Pipeline:
         evidence = self.db.all(
             "SELECT * FROM evidence WHERE event_id=? AND valid_for_analysis=1", (event_id,)
         )
+        await self._persist_semantic_features(event, evidence)
         result = await self.analyzer.analyze(event, evidence)
         created_at = utc_now()
         self.db.execute(
@@ -653,6 +680,11 @@ class Pipeline:
         )
         self.db.execute(
             """UPDATE product_opportunities SET review_status='superseded', updated_at=?
+            WHERE event_id=? AND review_status!='superseded'""",
+            (created_at, event_id),
+        )
+        self.db.execute(
+            """UPDATE opportunity_signals SET review_status='superseded', updated_at=?
             WHERE event_id=? AND review_status!='superseded'""",
             (created_at, event_id),
         )
@@ -672,6 +704,37 @@ class Pipeline:
                 created_at,
             ),
         )
+        for signal in result.output.signals:
+            self.db.execute(
+                """INSERT INTO opportunity_signals
+                (event_id,analysis_id,change_type,consumer_relevance_score,
+                 product_opportunity_score,target_users_json,new_scenarios_json,
+                 unmet_needs_json,related_product_categories_json,durability,
+                 lead_time_fit,evidence_ids_json,confidence,missing_evidence_json,
+                 review_status,engine,model,version,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)""",
+                (
+                    event_id,
+                    analysis_id,
+                    signal.change_type,
+                    signal.consumer_relevance_score,
+                    signal.product_opportunity_score,
+                    self.db.json(signal.target_users),
+                    self.db.json(signal.new_scenarios),
+                    self.db.json(signal.unmet_needs),
+                    self.db.json(signal.related_product_categories),
+                    signal.durability,
+                    signal.lead_time_fit,
+                    self.db.json(signal.evidence_ids),
+                    signal.confidence,
+                    self.db.json(signal.missing_evidence),
+                    result.engine,
+                    result.model,
+                    self.analysis_version,
+                    created_at,
+                    created_at,
+                ),
+            )
         article_domains = {
             urlparse(item["url"]).hostname
             for item in evidence
@@ -718,9 +781,9 @@ class Pipeline:
                 ),
             )
             marketplace = marketplace_name(target_marketplace)
-            amazon_search_term = pick_search_term(
-                "", draft.product_keywords, target_marketplace
-            )
+            # A query must come from an explicit, reviewed product hypothesis;
+            # news/rule keywords are not buyer-facing Amazon search terms.
+            amazon_search_term = ""
             validation = await self.market_validator.validate(
                 {
                     "name": draft.name,
@@ -745,7 +808,8 @@ class Pipeline:
                  amazon_search_term,
                  channels_json, risks_json, next_action, risk_level, risk_flags_json,
                  pain_score, intent_score, segment_score, timing_score, feasibility_score,
-                 differentiation_score, hypothesis_score, market_score, final_score,
+                  differentiation_score, hypothesis_score, market_score, final_score,
+                  validated_recommendation_score,
                  validation_status, uncertainty_penalty, opportunity_score,
                  evidence_confidence, score_formula_version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?,
@@ -753,7 +817,7 @@ class Pipeline:
                         ?, ?,
                         ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?)""",
+                        ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     analysis_id,
                     event_id,
@@ -784,10 +848,11 @@ class Pipeline:
                     draft.differentiation_score,
                     hypothesis_score,
                     validation.score,
+                    final_score if final_score is not None else 0.0,
                     final_score,
                     validation.status,
                     uncertainty_penalty,
-                    final_score,
+                    hypothesis_score,
                     confidence,
                     "opportunity-v2",
                     created_at,
@@ -818,3 +883,73 @@ class Pipeline:
                 ),
             )
         collapse_unworked_duplicate_opportunities(self.db)
+
+    async def _persist_semantic_features(
+        self, event: dict[str, Any], evidence: list[dict[str, Any]]
+    ) -> None:
+        text = semantic_input(
+            event["canonical_title"],
+            [str(item.get("excerpt") or "") for item in evidence],
+        )
+        input_hash = semantic_input_hash(text)
+        identity = (
+            event["id"],
+            self.settings.embedding_model_id,
+            self.settings.embedding_model_revision,
+            input_hash,
+            self.settings.semantic_feature_version,
+        )
+        existing = self.db.one(
+            """SELECT id FROM semantic_event_features
+            WHERE event_id=? AND model_id=? AND model_version=?
+              AND input_hash=? AND feature_version=?""",
+            identity,
+        )
+        if existing:
+            current = self.db.one(
+                "SELECT status FROM semantic_event_features WHERE id=?", (existing["id"],)
+            )
+            if current["status"] == "ready" or (
+                self.semantic_extractor is None and current["status"] == "disabled"
+            ):
+                return
+            self.db.execute("DELETE FROM semantic_event_features WHERE id=?", (existing["id"],))
+        status = "disabled"
+        result = None
+        error = "embedding baseline is disabled"
+        if self.semantic_extractor is not None:
+            try:
+                result = await asyncio.to_thread(self.semantic_extractor.extract, text)
+                status = "ready"
+                error = None
+            except EmbeddingUnavailable as exc:
+                status = "unavailable"
+                error = str(exc)[:1000]
+            except Exception as exc:
+                status = "failed"
+                error = f"{type(exc).__name__}: {str(exc)[:900]}"
+        feature_id = self.db.execute(
+            """INSERT INTO semantic_event_features
+            (event_id,model_id,model_version,input_hash,feature_version,status,
+             embedding_json,category_matches_json,positive_similarity,
+             negative_similarity,opportunity_similarity,error,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                *identity,
+                status,
+                self.db.json(result.embedding) if result else None,
+                self.db.json(result.category_matches) if result else "[]",
+                result.positive_similarity if result else None,
+                result.negative_similarity if result else None,
+                result.opportunity_similarity if result else None,
+                error,
+                utc_now(),
+            ),
+        )
+        if status == "ready":
+            create_duplicate_candidates(
+                self.db,
+                feature_id,
+                threshold=self.settings.semantic_duplicate_threshold,
+                window=self.settings.semantic_duplicate_window,
+            )

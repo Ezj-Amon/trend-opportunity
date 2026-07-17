@@ -46,7 +46,7 @@ async def send_opportunity(
         f" ({opportunity.get('target_marketplace') or '待确认'})\n"
         f"目标人群：{opportunity['target_segment']}\n"
         f"产品方向：{opportunity['solution']}\n"
-        f"机会分：{opportunity['opportunity_score']} / 100\n"
+        f"已验证推荐分：{opportunity['validated_recommendation_score']} / 100\n"
         f"证据置信度：{opportunity['evidence_confidence']} / 100\n"
         f"[查看证据与评分]({detail_url})"
     )
@@ -54,7 +54,7 @@ async def send_opportunity(
         "msg_type": "interactive",
         "card": {
             "schema": "2.0",
-            "header": {"title": {"tag": "plain_text", "content": "趋势选品机会"}},
+            "header": {"title": {"tag": "plain_text", "content": "已验证选品推荐"}},
             "body": {"elements": [{"tag": "markdown", "content": content}]},
         },
     }
@@ -87,24 +87,16 @@ async def send_opportunity(
         return DeliveryResult(False, None, "", f"{type(exc).__name__}: {str(exc)[:300]}")
 
 
-def _digest_section(title: str, opportunities: list[dict[str, Any]]) -> str:
+def _digest_section(title: str, signals: list[dict[str, Any]]) -> str:
     lines = [f"### {title}"]
-    if not opportunities:
-        return "\n".join([*lines, "今日没有达到候选条件的机会。"])
-    for index, item in enumerate(opportunities, 1):
-        validation = {
-            "completed": "已完成市场验证",
-            "partial": "市场验证不完整",
-            "unavailable": "缺市场数据",
-            "failed": "市场验证失败",
-        }.get(item.get("validation_status"), "待市场验证")
+    if not signals:
+        return "\n".join([*lines, "今日没有趋势事件。"])
+    for index, item in enumerate(signals, 1):
         lines.extend(
             [
-                f"**{index}. {item['name']}｜{item['opportunity_score']} 分**",
-                f"信号 {item.get('market', '')} → 目标 {item.get('marketplace', '')}"
-                f" ({item.get('target_marketplace', '')}) · {validation}",
-                f"信号：{item.get('event_title', '')}",
-                f"下一步：{item.get('next_action') or '补充市场验证和人工判断'}",
+                f"**{index}. {item['event_title']}｜趋势分 {item['trend_score']}**",
+                f"市场 {item.get('market', '')} · 类型 {item.get('signal_type', '')}"
+                f" · {item.get('source_count', 0)} 个来源",
                 f"[查看详情]({item.get('detail_url', '')})",
             ]
         )
@@ -121,17 +113,17 @@ async def send_daily_digest(
             item["detail_url"] = f"{settings.public_base_url}/events/{item['event_id']}"
     content = "\n\n".join(
         [
-            f"数据日期：{digest['date']}。榜单允许为空，并按事件和产品方向去重。",
-            _digest_section("中国信号 Top 3", digest["cn_top3"]),
-            _digest_section("海外信号 Top 3", digest["overseas_top3"]),
-            "注：趋势热度不等于销量；缺少的市场数据不会由 AI 补写。",
+            f"数据日期：{digest['date']}。以下仅为事实层趋势事件，不是商品或选品推荐。",
+            _digest_section("中国趋势信号 Top 3", digest["cn_top3"]),
+            _digest_section("海外趋势信号 Top 3", digest["overseas_top3"]),
+            "注：趋势热度不等于消费需求、市场销量或商业成功率。",
         ]
     )
     payload: dict[str, Any] = {
         "msg_type": "interactive",
         "card": {
             "schema": "2.0",
-            "header": {"title": {"tag": "plain_text", "content": "每日选品候选摘要"}},
+            "header": {"title": {"tag": "plain_text", "content": "每日全球趋势信号摘要"}},
             "body": {"elements": [{"tag": "markdown", "content": content}]},
         },
     }

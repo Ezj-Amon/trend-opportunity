@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}趋势面板 · 选品助手{% endblock %}
+{% block title %}全球趋势 · 新品机会系统{% endblock %}
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">TREND → EVIDENCE → OPPORTUNITY</p>
-    <h1>趋势新闻自动选品助手</h1>
-    <p class="muted">同时追踪国内热榜与海外搜索、社区和产品发布信号，生成带 Amazon 站点假设的可验证产品方向。</p>
+    <p class="eyebrow">TREND → SIGNAL → HYPOTHESIS → EVIDENCE</p>
+    <h1>全球趋势与新品机会系统</h1>
+    <p class="muted">持续追踪国内外趋势信号。当前摘要只展示事实层趋势事件，不把规则推断包装成商品推荐。</p>
   </div>
   <button id="run-button" class="primary" {% if pipeline_running %}disabled{% endif %}>
     {% if pipeline_running %}采集中…{% else %}立即运行真实采集{% endif %}
@@ -43,25 +43,25 @@
 </section>
 
 {% if not settings.openai_api_key %}
-<div class="notice"><strong>当前未配置模型 Key。</strong> 热点和网页证据均为真实数据；产品方向由可审计的 local-rules-v1 生成，并在详情中标为“待验证推断”。</div>
+<div class="notice"><strong>当前未配置生成模型。</strong> 热点和网页证据均为真实数据；local-rules-v2 会主动弃权，不再从新闻关键词生成固定商品模板。</div>
 {% endif %}
 
 <section class="panel digest-panel">
   <div class="panel-head">
-    <div><h2>今日候选摘要</h2><span>{{ digest.date }} · 事件与产品方向去重 · 允许为空</span></div>
-    <button id="digest-button" class="primary" {% if not settings.feishu_webhook_url %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送双榜到飞书</button>
+    <div><h2>今日趋势信号摘要</h2><span>{{ digest.date }} · 事实层事件 · 不是商品推荐</span></div>
+    <button id="digest-button" class="primary" {% if not settings.feishu_webhook_url %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送趋势摘要到飞书</button>
   </div>
   <div class="top-grid">
-    {% for title, items in [('中国信号 Top 3', digest.cn_top3), ('海外信号 Top 3', digest.overseas_top3)] %}
+    {% for title, items in [('中国趋势信号 Top 3', digest.cn_top3), ('海外趋势信号 Top 3', digest.overseas_top3)] %}
     <div class="top-list">
       <h3>{{ title }}</h3>
       {% for item in items %}
       <a href="/events/{{ item.event_id }}" class="top-item">
-        <strong>{{ loop.index }}. {{ item.name }}</strong>
-        <span>信号 {{ item.market }} → {{ item.marketplace }} ({{ item.target_marketplace }}) · {{ item.opportunity_score }} 分</span>
-        <small>{{ item.validation_status }} · 风险 {{ item.risk_level }} · {{ item.event_title }}</small>
+        <strong>{{ loop.index }}. {{ item.event_title }}</strong>
+        <span>{{ item.market }} · {{ item.signal_type }} · 趋势分 {{ item.trend_score }}</span>
+        <small>{{ item.source_count }} 个来源 · {{ item.member_count }} 条记录</small>
       </a>
-      {% else %}<p class="muted">当前没有达到候选条件的机会。</p>{% endfor %}
+      {% else %}<p class="muted">当前没有趋势事件。</p>{% endfor %}
     </div>
     {% endfor %}
   </div>
@@ -89,9 +89,9 @@
           <p>{{ event.source_count }} 个来源 · {{ event.member_count }} 条记录 · 最后出现 {{ event.last_seen_at[:16].replace('T',' ') }}</p>
         </div>
         <div class="opportunity-mark">
-          {% if event.best_opportunity_score is not none %}
-          <strong>{{ '%.1f'|format(event.best_opportunity_score) }}</strong><span>机会分</span>
-          {% elif event.latest_analysis_engine %}<span>已分析 · 无建议</span>
+          {% if event.best_signal_score is not none %}
+          <strong>{{ '%.1f'|format(event.best_signal_score) }}</strong><span>线索排序分</span>
+          {% elif event.latest_analysis_engine %}<span>已分析 · 无线索</span>
           {% else %}<span>待分析</span>{% endif %}
         </div>
       </a>

@@ -34,6 +34,14 @@ class Settings:
     public_base_url: str
     admin_token: str | None
     amazon_default_marketplace: str = "US"
+    enable_embeddings: bool = False
+    embedding_model_id: str = "intfloat/multilingual-e5-small"
+    embedding_model_revision: str = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+    embedding_cache_dir: Path = Path("data/models")
+    embedding_local_files_only: bool = True
+    semantic_feature_version: str = "semantic-v1"
+    semantic_duplicate_threshold: float = 0.90
+    semantic_duplicate_window: int = 500
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,4 +96,28 @@ class Settings:
             amazon_default_marketplace=os.getenv(
                 "AMAZON_DEFAULT_MARKETPLACE", "US"
             ).strip().upper(),
+            enable_embeddings=_bool_env("ENABLE_EMBEDDINGS"),
+            embedding_model_id=os.getenv(
+                "EMBEDDING_MODEL_ID", "intfloat/multilingual-e5-small"
+            ).strip(),
+            embedding_model_revision=os.getenv(
+                "EMBEDDING_MODEL_REVISION",
+                "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+            ).strip(),
+            embedding_cache_dir=Path(
+                os.getenv("EMBEDDING_CACHE_DIR", "data/models")
+            ),
+            embedding_local_files_only=_bool_env(
+                "EMBEDDING_LOCAL_FILES_ONLY", True
+            ),
+            semantic_feature_version=os.getenv(
+                "SEMANTIC_FEATURE_VERSION", "semantic-v1"
+            ).strip(),
+            semantic_duplicate_threshold=max(
+                -1.0,
+                min(float(os.getenv("SEMANTIC_DUPLICATE_THRESHOLD", "0.90")), 1.0),
+            ),
+            semantic_duplicate_window=max(
+                10, min(int(os.getenv("SEMANTIC_DUPLICATE_WINDOW", "500")), 5000)
+            ),
         )
