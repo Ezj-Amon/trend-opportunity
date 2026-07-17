@@ -20,23 +20,52 @@
   <div class="cards">
   {% for item in opportunities %}
     <article class="opportunity-card">
-      <div class="card-top"><div><span class="status {{ item.review_status }}">{{ item.review_status }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>{{ item.opportunity_score }}</strong><span>机会分</span></div></div>
+      <div class="card-top"><div><span class="status {{ item.review_status }}">{{ item.review_status }}</span> <span class="status {{ item.validation_status }}">{{ item.validation_status }}</span> <span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>{{ item.opportunity_score }}</strong><span>最终排序分</span></div></div>
+      <p><b>关键词：</b>{{ item.product_keywords|join('、') }} · <b>类目：</b>{{ item.category or '待确认' }}</p>
       <p><b>目标人群：</b>{{ item.target_segment }}</p>
       <p><b>场景：</b>{{ item.scenario }}</p>
       <p><b>JTBD：</b>{{ item.jtbd }}</p>
+      <p><b>购买动机：</b>{{ item.purchase_motivation }}</p>
       <p><b>方案：</b>{{ item.solution }}</p>
       <p><b>MVP：</b>{{ item.mvp }}</p>
-      <p><b>目标站点：</b>{{ item.marketplace }} · <b>价格带：</b>{{ item.price_band }}</p>
+      <p><b>信号来源：</b>{{ event.market }} · <b>目标站点：</b>{{ item.marketplace }} ({{ item.target_marketplace }}) · <b>价格带：</b>{{ item.price_band }}</p>
       <p><b>验证渠道：</b>{{ item.channels|join('、') }}</p>
       <div class="chips">{% for pain in item.pain_points %}<span>{{ pain }}</span>{% endfor %}</div>
       <div class="mini-scores">
         <span>痛点 {{ item.pain_score }}/5</span><span>意图 {{ item.intent_score }}/5</span><span>人群 {{ item.segment_score }}/5</span><span>时机 {{ item.timing_score }}/5</span><span>可行 {{ item.feasibility_score }}/5</span><span>差异 {{ item.differentiation_score }}/5</span>
       </div>
+      <p><b>下一步：</b>{{ item.next_action }}</p>
+      <div class="score-summary">
+        <span>假设分 <strong>{{ item.hypothesis_score }}</strong></span>
+        <span>市场分 <strong>{{ item.market_score if item.market_score is not none else '缺数据' }}</strong></span>
+        <span>不确定性扣分 <strong>-{{ item.uncertainty_penalty }}</strong></span>
+      </div>
       <p class="confidence">证据置信度 <strong>{{ item.evidence_confidence }}</strong> / 100</p>
       <details><summary>风险与限制</summary><ul>{% for risk in item.risks %}<li>{{ risk }}</li>{% endfor %}</ul></details>
+      <details><summary>结构化产品风险</summary><ul>{% for risk in item.risk_flags %}<li><b>{{ risk.category }} / {{ risk.severity }}</b>：{{ risk.reason }}</li>{% endfor %}</ul></details>
+      {% if item.market_validation %}
+      <details><summary>最近市场验证 · {{ item.market_validation.provider }}</summary>
+        <p>状态：{{ item.market_validation.status }}{% if item.market_validation.market_score is not none %} · 市场分 {{ item.market_validation.market_score }}{% endif %}</p>
+        {% if item.market_validation.missing_fields %}<p>缺失：{{ item.market_validation.missing_fields|join('、') }}</p>{% endif %}
+        {% if item.market_validation.sources %}<p>来源：{{ item.market_validation.sources|join('、') }}</p>{% endif %}
+        {% if item.market_validation.note %}<p>说明：{{ item.market_validation.note }}</p>{% endif %}
+        {% if item.market_validation.error %}<p>{{ item.market_validation.error }}</p>{% endif %}
+      </details>
+      {% endif %}
+      {% if item.reviewer_note %}<p class="review-note"><b>审核备注：</b>{{ item.reviewer_note }}</p>{% endif %}
+      <div class="outcomes"><b>结果回流：</b>
+        {% for outcome in item.outcomes %}<span>{{ outcome.horizon_days }} 天 {{ outcome.result }}{% if outcome.note %} · {{ outcome.note }}{% endif %}</span>{% else %}<span>尚未记录</span>{% endfor %}
+      </div>
       <div class="actions">
-        <button onclick="review({{ item.id }}, 'approved')">通过</button>
-        <button class="ghost" onclick="review({{ item.id }}, 'rejected')">驳回</button>
+        <button onclick="reviewWithNote({{ item.id }}, 'approved')">通过</button>
+        <button class="ghost" onclick="reviewWithNote({{ item.id }}, 'rejected')">驳回</button>
+        <button class="ghost" onclick="saveValidation({{ item.id }})">录入市场验证</button>
+        <select id="marketplace-{{ item.id }}" aria-label="目标 Amazon 站点">
+          {% for code, name in marketplaces.items() %}<option value="{{ code }}" {% if code == item.target_marketplace %}selected{% endif %}>{{ code }} · {{ name }}</option>{% endfor %}
+        </select>
+        <button class="ghost" onclick="changeMarketplace({{ item.id }})">更换目标站点</button>
+        <button class="ghost" onclick="saveOutcome({{ item.id }}, 7)">记录 7 天</button>
+        <button class="ghost" onclick="saveOutcome({{ item.id }}, 30)">记录 30 天</button>
         <button class="primary" onclick="pushFeishu({{ item.id }})" {% if not feishu_configured %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送飞书</button>
       </div>
     </article>
@@ -54,7 +83,32 @@
 </div>
 {% endblock %}
 {% block scripts %}<script>
-async function review(id, status) { if (await postAction(`/api/opportunities/${id}/review/${status}`, `已${status === 'approved' ? '通过' : '驳回'}`)) setTimeout(()=>location.reload(),500); }
+async function reviewWithNote(id, status) {
+  const note = prompt('请填写审核原因（可留空）', '') ?? null;
+  if (note === null) return;
+  if (await postAction(`/api/opportunities/${id}/review`, `已${status === 'approved' ? '通过' : '驳回'}`, {status, note})) setTimeout(()=>location.reload(),500);
+}
+async function saveValidation(id) {
+  const raw = prompt('录入 8 个 1-5 分，逗号分隔：需求,购买意图,竞争机会,单位经济,差异化,执行,时机,证据。未知写空，例如 4,3,,2,3,4,3,2', '');
+  if (raw === null) return;
+  const values = raw.split(',').map(v => v.trim() ? Number(v.trim()) : null);
+  if (values.length !== 8 || values.some(v => v !== null && (!Number.isInteger(v) || v < 1 || v > 5))) { toast('必须提供 8 项，分数为 1-5，未知项留空', true); return; }
+  const note = prompt('数据来源和说明', '') ?? '';
+  const keys = ['search_demand_score','purchase_intent_score','competition_score','unit_economics_score','differentiation_score','execution_score','timing_score','evidence_score'];
+  const scores = Object.fromEntries(keys.map((key, index) => [key, values[index]]));
+  if (await postAction(`/api/opportunities/${id}/validation`, '市场验证已保存', {provider:'manual',provider_version:'manual-v1',scores,metrics:{},sources:note ? [note] : [],note:''})) setTimeout(()=>location.reload(),500);
+}
+async function changeMarketplace(id) {
+  const target = document.getElementById(`marketplace-${id}`).value;
+  if (!confirm(`确认将目标站点改为 ${target}？旧站点验证分会失效，审核状态会回到 pending。`)) return;
+  if (await postAction(`/api/opportunities/${id}/target-marketplace`, '目标站点已更新', {target_marketplace:target})) setTimeout(()=>location.reload(),500);
+}
+async function saveOutcome(id, horizon) {
+  const result = prompt(`${horizon} 天结果：unknown / positive / negative / mixed / abandoned`, 'unknown');
+  if (result === null) return;
+  const note = prompt('结果说明与关键指标', '') ?? '';
+  if (await postAction(`/api/opportunities/${id}/outcomes/${horizon}`, `${horizon} 天结果已保存`, {result,metrics:{},note})) setTimeout(()=>location.reload(),500);
+}
 async function pushFeishu(id) {
   const result = await postAction(`/api/opportunities/${id}/push`, null);
   if (!result) return;

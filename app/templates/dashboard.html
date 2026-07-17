@@ -12,6 +12,29 @@
   </button>
 </section>
 
+<section id="run-progress" class="panel run-progress" {% if not pipeline_running %}hidden{% endif %} aria-live="polite" data-running="{{ 'true' if pipeline_running else 'false' }}">
+  <div class="run-progress-head">
+    <div>
+      <p class="eyebrow">本次采集进度</p>
+      <h2 id="run-stage">正在准备数据源</h2>
+      <p id="run-detail" class="muted">系统会持续更新，你可以离开这个页面，采集仍会在后台继续。</p>
+    </div>
+    <div class="run-time"><strong id="run-eta">正在估算</strong><span>预计剩余</span></div>
+  </div>
+  <div class="progress-track" role="progressbar" aria-label="采集完成度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+    <i id="run-progress-bar" style="width:0%"></i>
+  </div>
+  <div class="run-progress-meta">
+    <span id="run-percent">0%</span>
+    <span id="run-elapsed">已用时 0 秒</span>
+    <span id="run-output">等待首个数据源返回</span>
+  </div>
+  <details id="run-source-details">
+    <summary>查看各数据源状态</summary>
+    <div id="run-source-list" class="run-source-list"></div>
+  </details>
+</section>
+
 <section class="metric-grid">
   <article class="metric"><span>事件</span><strong>{{ events|length }}</strong></article>
   <article class="metric"><span>最近运行</span><strong>{{ runs[0].status if runs else '尚未运行' }}</strong></article>
@@ -22,6 +45,27 @@
 {% if not settings.openai_api_key %}
 <div class="notice"><strong>当前未配置模型 Key。</strong> 热点和网页证据均为真实数据；产品方向由可审计的 local-rules-v1 生成，并在详情中标为“待验证推断”。</div>
 {% endif %}
+
+<section class="panel digest-panel">
+  <div class="panel-head">
+    <div><h2>今日候选摘要</h2><span>{{ digest.date }} · 事件与产品方向去重 · 允许为空</span></div>
+    <button id="digest-button" class="primary" {% if not settings.feishu_webhook_url %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送双榜到飞书</button>
+  </div>
+  <div class="top-grid">
+    {% for title, items in [('中国信号 Top 3', digest.cn_top3), ('海外信号 Top 3', digest.overseas_top3)] %}
+    <div class="top-list">
+      <h3>{{ title }}</h3>
+      {% for item in items %}
+      <a href="/events/{{ item.event_id }}" class="top-item">
+        <strong>{{ loop.index }}. {{ item.name }}</strong>
+        <span>信号 {{ item.market }} → {{ item.marketplace }} ({{ item.target_marketplace }}) · {{ item.opportunity_score }} 分</span>
+        <small>{{ item.validation_status }} · 风险 {{ item.risk_level }} · {{ item.event_title }}</small>
+      </a>
+      {% else %}<p class="muted">当前没有达到候选条件的机会。</p>{% endfor %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
 
 <div class="layout">
   <section class="panel grow">
@@ -77,11 +121,86 @@
 {% block scripts %}
 <script>
   const runButton = document.getElementById('run-button');
+  const runPanel = document.getElementById('run-progress');
+  let runPoller = null;
+
+  function formatDuration(seconds) {
+    if (seconds === null || seconds === undefined) return '正在估算';
+    if (seconds < 60) return `${Math.max(1, seconds)} 秒`;
+    return `约 ${Math.ceil(seconds / 60)} 分钟`;
+  }
+
+  function renderRunStatus(status) {
+    if (!status || status.status === 'idle') return;
+    runPanel.hidden = false;
+    const progress = Math.max(0, Math.min(100, status.progress_percent || 0));
+    document.getElementById('run-stage').textContent = status.stage_label || '处理中';
+    document.getElementById('run-percent').textContent = `${progress}%`;
+    document.getElementById('run-elapsed').textContent = `已用时 ${formatDuration(status.elapsed_seconds || 0)}`;
+    document.getElementById('run-eta').textContent = status.status === 'running' ? formatDuration(status.estimated_remaining_seconds) : status.status === 'completed' ? '已完成' : '已停止';
+    const bar = document.getElementById('run-progress-bar');
+    bar.style.width = `${progress}%`;
+    bar.closest('[role="progressbar"]').setAttribute('aria-valuenow', progress);
+
+    let detail = '';
+    if (status.stage === 'ingest') detail = `已完成 ${status.sources_completed || 0}/${status.sources_total || 0} 个数据源，成功 ${status.sources_succeeded || 0} 个。外部源响应慢时预计时间会动态调整。`;
+    if (status.stage === 'cluster') detail = `已拿到 ${status.items_count || 0} 条原始记录，正在去重并合并成趋势事件。`;
+    if (status.stage === 'analyze') detail = `已形成 ${status.events_count || 0} 个趋势事件，正在分析第 ${status.analyzed_count || 0}/${status.selected_count || 0} 个重点事件。`;
+    if (status.stage === 'completed') detail = `本次采集完成：${status.items_count || 0} 条原始记录、${status.events_count || 0} 个趋势事件、${status.selected_count || 0} 个重点分析。`;
+    if (status.stage === 'failed') detail = status.error_summary || '本次采集未完成，请查看数据源状态后重试。';
+    document.getElementById('run-detail').textContent = detail;
+    document.getElementById('run-output').textContent = `${status.items_count || 0} 条记录 · ${status.events_count || 0} 个事件`;
+
+    const sourceList = document.getElementById('run-source-list');
+    sourceList.replaceChildren();
+    (status.source_results || []).forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'run-source-row';
+      const name = document.createElement('strong');
+      name.textContent = item.source;
+      const meta = document.createElement('span');
+      meta.textContent = `${item.market} · ${item.items_count || 0} 条 · ${item.latency_ms || 0} ms`;
+      const state = document.createElement('span');
+      state.className = `source-state ${item.success ? 'ok' : 'bad'}`;
+      state.textContent = item.success ? '已完成' : '失败';
+      row.append(name, meta, state);
+      sourceList.append(row);
+    });
+
+    if (status.status !== 'running') {
+      clearInterval(runPoller);
+      runPoller = null;
+      runButton.disabled = false;
+      runButton.textContent = '再次运行采集';
+      if (status.status === 'completed') setTimeout(() => location.reload(), 1800);
+    }
+  }
+
+  async function fetchRunStatus() {
+    try {
+      const response = await fetch('/api/run/status', {cache: 'no-store'});
+      if (response.ok) renderRunStatus(await response.json());
+    } catch (_) {}
+  }
+
+  function startRunPolling() {
+    fetchRunStatus();
+    if (!runPoller) runPoller = setInterval(fetchRunStatus, 1500);
+  }
+
   runButton?.addEventListener('click', async () => {
     runButton.disabled = true; runButton.textContent = '采集中…';
-    const ok = await postAction('/api/run', '真实采集已启动，稍后自动刷新');
+    runPanel.hidden = false;
+    const ok = await postAction('/api/run', '真实采集已启动，进度会持续更新');
     if (!ok) { runButton.disabled = false; runButton.textContent = '立即运行真实采集'; return; }
-    setTimeout(() => location.reload(), 6000);
+    startRunPolling();
+  });
+  if (runPanel?.dataset.running === 'true') startRunPolling();
+  document.getElementById('digest-button')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true;
+    const result = await postAction('/api/digest/push', null);
+    if (!result) { event.currentTarget.disabled = false; return; }
+    toast(result.status === 'already_sent' ? '当前双榜此前已推送' : result.status === 'in_progress' ? '双榜正在推送' : '双榜已推送到飞书');
   });
 </script>
 {% endblock %}

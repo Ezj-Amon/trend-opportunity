@@ -120,22 +120,35 @@ CREATE TABLE IF NOT EXISTS product_opportunities (
   analysis_id INTEGER NOT NULL REFERENCES analyses(id),
   event_id INTEGER NOT NULL REFERENCES trend_events(id),
   name TEXT NOT NULL,
+  product_keywords_json TEXT NOT NULL DEFAULT '[]',
+  category TEXT NOT NULL DEFAULT '',
   target_segment TEXT NOT NULL,
   scenario TEXT NOT NULL,
   jtbd TEXT NOT NULL,
+  purchase_motivation TEXT NOT NULL DEFAULT '',
   pain_points_json TEXT NOT NULL,
   solution TEXT NOT NULL,
   mvp TEXT NOT NULL,
   price_band TEXT NOT NULL,
   marketplace TEXT NOT NULL DEFAULT '',
+  target_marketplace TEXT NOT NULL DEFAULT '',
+  amazon_search_term TEXT NOT NULL DEFAULT '',
   channels_json TEXT NOT NULL,
   risks_json TEXT NOT NULL,
+  next_action TEXT NOT NULL DEFAULT '',
+  risk_level TEXT NOT NULL DEFAULT 'unassessed',
+  risk_flags_json TEXT NOT NULL DEFAULT '[]',
   pain_score INTEGER NOT NULL,
   intent_score INTEGER NOT NULL,
   segment_score INTEGER NOT NULL,
   timing_score INTEGER NOT NULL,
   feasibility_score INTEGER NOT NULL,
   differentiation_score INTEGER NOT NULL,
+  hypothesis_score REAL NOT NULL DEFAULT 0,
+  market_score REAL,
+  final_score REAL NOT NULL DEFAULT 0,
+  validation_status TEXT NOT NULL DEFAULT 'unavailable',
+  uncertainty_penalty REAL NOT NULL DEFAULT 30,
   opportunity_score REAL NOT NULL,
   evidence_confidence REAL NOT NULL,
   review_status TEXT NOT NULL DEFAULT 'pending',
@@ -146,12 +159,51 @@ CREATE TABLE IF NOT EXISTS product_opportunities (
 );
 CREATE INDEX IF NOT EXISTS idx_opportunities_score
   ON product_opportunities(opportunity_score DESC);
+CREATE TABLE IF NOT EXISTS market_validations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_id INTEGER NOT NULL REFERENCES product_opportunities(id),
+  provider TEXT NOT NULL,
+  provider_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  query_json TEXT NOT NULL,
+  scores_json TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  sources_json TEXT NOT NULL,
+  missing_fields_json TEXT NOT NULL,
+  market_score REAL,
+  raw_response_hash TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_validations_opportunity
+  ON market_validations(opportunity_id, id DESC);
+CREATE TABLE IF NOT EXISTS opportunity_outcomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_id INTEGER NOT NULL REFERENCES product_opportunities(id),
+  horizon_days INTEGER NOT NULL CHECK(horizon_days IN (7, 30)),
+  result TEXT NOT NULL,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  note TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  UNIQUE(opportunity_id, horizon_days)
+);
 CREATE TABLE IF NOT EXISTS notification_deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   opportunity_id INTEGER NOT NULL REFERENCES product_opportunities(id),
   channel TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL,
+  attempted_at TEXT NOT NULL,
+  http_status INTEGER,
+  response_excerpt TEXT,
+  error TEXT
+);
+CREATE TABLE IF NOT EXISTS digest_deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  digest_key TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
   attempted_at TEXT NOT NULL,
   http_status INTEGER,
   response_excerpt TEXT,
@@ -190,6 +242,58 @@ class Database:
                 "marketplace",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            opportunity_columns = {
+                "product_keywords_json": "TEXT NOT NULL DEFAULT '[]'",
+                "category": "TEXT NOT NULL DEFAULT ''",
+                "purchase_motivation": "TEXT NOT NULL DEFAULT ''",
+                "next_action": "TEXT NOT NULL DEFAULT ''",
+                "risk_level": "TEXT NOT NULL DEFAULT 'unassessed'",
+                "risk_flags_json": "TEXT NOT NULL DEFAULT '[]'",
+                "hypothesis_score": "REAL NOT NULL DEFAULT 0",
+                "market_score": "REAL",
+                "final_score": "REAL NOT NULL DEFAULT 0",
+                "validation_status": "TEXT NOT NULL DEFAULT 'unavailable'",
+                "uncertainty_penalty": "REAL NOT NULL DEFAULT 30",
+                "target_marketplace": "TEXT NOT NULL DEFAULT ''",
+                "amazon_search_term": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in opportunity_columns.items():
+                self._ensure_column(conn, "product_opportunities", column, definition)
+            conn.execute(
+                """UPDATE product_opportunities
+                SET hypothesis_score=opportunity_score,
+                    final_score=opportunity_score,
+                    risk_level='unassessed',
+                    validation_status='unavailable'
+                WHERE score_formula_version='opportunity-v1'"""
+            )
+            conn.execute(
+                """UPDATE product_opportunities SET target_marketplace=CASE
+                    WHEN marketplace='Amazon.com' THEN 'US'
+                    WHEN marketplace='Amazon.co.uk' THEN 'GB'
+                    WHEN marketplace='Amazon.de' THEN 'DE'
+                    WHEN marketplace='Amazon.co.jp' THEN 'JP'
+                    WHEN marketplace='Amazon.ca' THEN 'CA'
+                    WHEN marketplace='Amazon.fr' THEN 'FR'
+                    WHEN marketplace='Amazon.it' THEN 'IT'
+                    WHEN marketplace='Amazon.es' THEN 'ES'
+                    ELSE 'US' END
+                WHERE target_marketplace=''"""
+            )
+            conn.execute(
+                """UPDATE product_opportunities SET marketplace=CASE target_marketplace
+                    WHEN 'US' THEN 'Amazon.com'
+                    WHEN 'GB' THEN 'Amazon.co.uk'
+                    WHEN 'DE' THEN 'Amazon.de'
+                    WHEN 'JP' THEN 'Amazon.co.jp'
+                    WHEN 'CA' THEN 'Amazon.ca'
+                    WHEN 'FR' THEN 'Amazon.fr'
+                    WHEN 'IT' THEN 'Amazon.it'
+                    WHEN 'ES' THEN 'Amazon.es'
+                    ELSE marketplace END
+                WHERE target_marketplace!=''"""
+            )
+            self._ensure_column(conn, "market_validations", "note", "TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
     def _ensure_column(
@@ -267,7 +371,10 @@ class Database:
         with self._write_lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             for table in (
+                "digest_deliveries",
                 "notification_deliveries",
+                "opportunity_outcomes",
+                "market_validations",
                 "product_opportunities",
                 "analyses",
                 "evidence",
@@ -316,6 +423,49 @@ class Database:
                 )
                 claimed = conn.execute(
                     "SELECT * FROM notification_deliveries WHERE id=?", (cursor.lastrowid,)
+                ).fetchone()
+            return True, dict(claimed)
+
+    def claim_digest(self, digest_key: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._write_lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM digest_deliveries WHERE digest_key=?", (digest_key,)
+            ).fetchone()
+            if row and row["status"] == "sent":
+                return False, dict(row)
+            if row and row["status"] == "sending":
+                attempted = datetime.fromisoformat(row["attempted_at"])
+                if attempted > datetime.now(timezone.utc) - timedelta(minutes=10):
+                    return False, dict(row)
+                conn.execute(
+                    "UPDATE digest_deliveries SET status='unknown', error=? WHERE id=?",
+                    ("摘要发送进程中断，结果未知；请在飞书确认后再处理", row["id"]),
+                )
+                unknown = conn.execute(
+                    "SELECT * FROM digest_deliveries WHERE id=?", (row["id"],)
+                ).fetchone()
+                return False, dict(unknown)
+            if row:
+                conn.execute(
+                    """UPDATE digest_deliveries SET status='sending', payload_json=?,
+                    attempted_at=?, http_status=NULL, response_excerpt=NULL, error=NULL
+                    WHERE id=?""",
+                    (self.json(payload), now, row["id"]),
+                )
+                claimed = conn.execute(
+                    "SELECT * FROM digest_deliveries WHERE id=?", (row["id"],)
+                ).fetchone()
+            else:
+                cursor = conn.execute(
+                    """INSERT INTO digest_deliveries
+                    (digest_key,status,payload_json,attempted_at)
+                    VALUES (?,'sending',?,?)""",
+                    (digest_key, self.json(payload), now),
+                )
+                claimed = conn.execute(
+                    "SELECT * FROM digest_deliveries WHERE id=?", (cursor.lastrowid,)
                 ).fetchone()
             return True, dict(claimed)
 

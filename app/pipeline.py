@@ -8,12 +8,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .analysis import Analyzer
+from .amazon import marketplace_code, marketplace_name, pick_search_term
 from .clustering import normalize_title, should_merge
 from .config import Settings
 from .db import Database
+from .deduplication import collapse_unworked_duplicate_opportunities
 from .evidence import fetch_evidence
+from .market_validation import UnavailableMarketValidator
+from .risk import assess_product_risk
 from .scoring import (
     calculate_evidence_confidence,
+    calculate_final_score,
     calculate_opportunity_score,
     calculate_trend_scores,
 )
@@ -25,7 +30,7 @@ from .sources import (
 )
 
 
-ANALYSIS_PROMPT_VERSION = "opportunity-prompt-v6-overseas"
+ANALYSIS_PROMPT_VERSION = "opportunity-prompt-v7-market-validation"
 
 
 def utc_now() -> str:
@@ -49,11 +54,24 @@ class Pipeline:
             else None
         )
         self.analyzer = Analyzer(settings)
+        self.market_validator = UnavailableMarketValidator()
         self._lock = asyncio.Lock()
+        self._progress: dict[str, Any] | None = None
 
     @property
     def is_running(self) -> bool:
         return self._lock.locked()
+
+    @property
+    def progress(self) -> dict[str, Any] | None:
+        """Return a copy of the current/latest run progress for the UI."""
+        return dict(self._progress) if self._progress else None
+
+    def _set_progress(self, **updates: Any) -> None:
+        if self._progress is None:
+            self._progress = {}
+        self._progress.update(updates)
+        self._progress["updated_at"] = utc_now()
 
     @property
     def analysis_version(self) -> str:
@@ -119,6 +137,28 @@ class Pipeline:
                 ),
             ),
         )
+        source_total = (
+            len(self.settings.source_ids)
+            + len(self.settings.google_trends_geos)
+            + int(self.reddit_source is not None)
+        )
+        self._progress = {
+            "run_id": run_id,
+            "status": "running",
+            "stage": "ingest",
+            "progress_percent": 5,
+            "started_at": utc_now(),
+            "updated_at": utc_now(),
+            "sources_total": source_total,
+            "sources_completed": 0,
+            "sources_succeeded": 0,
+            "sources_failed": 0,
+            "items_count": 0,
+            "events_count": 0,
+            "selected_count": 0,
+            "analyzed_count": 0,
+            "source_results": [],
+        }
         try:
             fetches = [
                 self.source.fetch(source_id) for source_id in self.settings.source_ids
@@ -129,23 +169,60 @@ class Pipeline:
             )
             if self.reddit_source:
                 fetches.append(self.reddit_source.fetch())
-            results = await asyncio.gather(*fetches)
+            results: list[SourceResult] = []
+            item_ids: list[int] = []
+            for completed, future in enumerate(asyncio.as_completed(fetches), 1):
+                result = await future
+                results.append(result)
+                item_ids.extend(self._persist_source_results(run_id, [result]))
+                source_results = [
+                    *self._progress.get("source_results", []),
+                    {
+                        "source": result.source,
+                        "market": result.market,
+                        "success": result.success,
+                        "items_count": len(result.items),
+                        "latency_ms": result.latency_ms,
+                        "error": result.error,
+                    },
+                ]
+                succeeded = sum(1 for item in results if item.success)
+                self._set_progress(
+                    sources_completed=completed,
+                    sources_succeeded=succeeded,
+                    sources_failed=completed - succeeded,
+                    items_count=len(item_ids),
+                    source_results=source_results,
+                    progress_percent=5 + round(35 * completed / max(source_total, 1)),
+                )
+                self._update_run(run_id, items_count=len(item_ids))
             self._ensure_lease(lease_lost)
-            item_ids = self._persist_source_results(run_id, results)
             if not item_ids:
                 errors = "; ".join(
                     f"{result.source}: {result.error}" for result in results if result.error
                 )
                 raise RuntimeError(f"all real data sources failed: {errors[:800]}")
+            self._set_progress(stage="cluster", progress_percent=45)
             self._update_run(run_id, stage="cluster", items_count=len(item_ids))
             event_ids = self._cluster_items(item_ids)
             event_ids = self._consolidate_unanalyzed_events(event_ids)
             self._score_events(event_ids)
+            self._set_progress(
+                stage="analyze",
+                progress_percent=55,
+                events_count=len(event_ids),
+            )
             self._update_run(run_id, stage="analyze", events_count=len(event_ids))
             selected_ids = self._select_events(event_ids)
-            for event_id in selected_ids:
+            self._set_progress(selected_count=len(selected_ids))
+            for analyzed_count, event_id in enumerate(selected_ids, 1):
                 await self._research_and_analyze(run_id, event_id)
                 self._ensure_lease(lease_lost)
+                self._set_progress(
+                    analyzed_count=analyzed_count,
+                    progress_percent=55
+                    + round(40 * analyzed_count / max(len(selected_ids), 1)),
+                )
             self._update_run(
                 run_id,
                 status="completed",
@@ -153,11 +230,24 @@ class Pipeline:
                 selected_count=len(selected_ids),
                 finished_at=utc_now(),
             )
+            self._set_progress(
+                status="completed",
+                stage="completed",
+                progress_percent=100,
+                finished_at=utc_now(),
+            )
         except Exception as exc:
             self._update_run(
                 run_id,
                 status="failed",
                 stage="failed",
+                error_summary=f"{type(exc).__name__}: {str(exc)[:1000]}",
+                finished_at=utc_now(),
+            )
+            self._set_progress(
+                status="failed",
+                stage="failed",
+                progress_percent=100,
                 error_summary=f"{type(exc).__name__}: {str(exc)[:1000]}",
                 finished_at=utc_now(),
             )
@@ -606,7 +696,7 @@ class Pipeline:
                     "differentiation_score",
                 )
             }
-            opportunity_score = calculate_opportunity_score(score_fields)
+            hypothesis_score = calculate_opportunity_score(score_fields)
             evidence_quality = (article_count + hotlist_count * 0.5) / max(len(evidence), 1)
             cited_ratio = min(
                 len(set(draft.evidence_ids)) / max(len(evidence), 1), 1
@@ -617,38 +707,114 @@ class Pipeline:
                 consumer_voice_count=sum(int(item["is_consumer_voice"]) for item in evidence),
                 cited_claim_ratio=cited_ratio,
             )
-            self.db.execute(
+            risk_level, risk_flags = assess_product_risk(event, draft)
+            signal_market = str(event.get("market") or "").upper()
+            target_marketplace = marketplace_code(
+                draft.target_marketplace or draft.marketplace,
+                default=(
+                    signal_market
+                    if signal_market in {"US", "GB", "DE", "JP", "CA", "FR", "IT", "ES"}
+                    else self.settings.amazon_default_marketplace
+                ),
+            )
+            marketplace = marketplace_name(target_marketplace)
+            amazon_search_term = pick_search_term(
+                "", draft.product_keywords, target_marketplace
+            )
+            validation = await self.market_validator.validate(
+                {
+                    "name": draft.name,
+                    "marketplace": marketplace,
+                    "target_marketplace": target_marketplace,
+                    "product_keywords": draft.product_keywords,
+                },
+                event,
+            )
+            final_score, uncertainty_penalty = calculate_final_score(
+                trend_score=float(event["trend_score"]),
+                hypothesis_score=hypothesis_score,
+                market_score=validation.score,
+                validation_status=validation.status,
+                risk_level=risk_level,
+            )
+            opportunity_id = self.db.execute(
                 """INSERT INTO product_opportunities
-                (analysis_id, event_id, name, target_segment, scenario, jtbd,
-                 pain_points_json, solution, mvp, price_band, marketplace,
-                 channels_json, risks_json,
+                (analysis_id, event_id, name, product_keywords_json, category,
+                 target_segment, scenario, jtbd, purchase_motivation,
+                 pain_points_json, solution, mvp, price_band, marketplace, target_marketplace,
+                 amazon_search_term,
+                 channels_json, risks_json, next_action, risk_level, risk_flags_json,
                  pain_score, intent_score, segment_score, timing_score, feasibility_score,
-                 differentiation_score, opportunity_score, evidence_confidence,
-                 created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 differentiation_score, hypothesis_score, market_score, final_score,
+                 validation_status, uncertainty_penalty, opportunity_score,
+                 evidence_confidence, score_formula_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     analysis_id,
                     event_id,
                     draft.name,
+                    self.db.json(draft.product_keywords),
+                    draft.category,
                     draft.target_segment,
                     draft.scenario,
                     draft.jtbd,
+                    draft.purchase_motivation,
                     self.db.json(draft.pain_points),
                     draft.solution,
                     draft.mvp,
                     draft.price_band,
-                    draft.marketplace,
+                    marketplace,
+                    target_marketplace,
+                    amazon_search_term,
                     self.db.json(draft.channels),
                     self.db.json(draft.risks),
+                    draft.next_action,
+                    risk_level,
+                    self.db.json(risk_flags),
                     draft.pain_score,
                     draft.intent_score,
                     draft.segment_score,
                     draft.timing_score,
                     draft.feasibility_score,
                     draft.differentiation_score,
-                    opportunity_score,
+                    hypothesis_score,
+                    validation.score,
+                    final_score,
+                    validation.status,
+                    uncertainty_penalty,
+                    final_score,
                     confidence,
+                    "opportunity-v2",
                     created_at,
                     created_at,
                 ),
             )
+            self.db.execute(
+                """INSERT INTO market_validations
+                (opportunity_id,provider,provider_version,status,query_json,
+                 scores_json,metrics_json,sources_json,missing_fields_json,
+                 market_score,raw_response_hash,note,error,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    opportunity_id,
+                    validation.provider,
+                    validation.provider_version,
+                    validation.status,
+                    self.db.json(validation.query),
+                    self.db.json(validation.scores),
+                    self.db.json(validation.metrics),
+                    self.db.json(validation.sources),
+                    self.db.json(validation.missing_fields),
+                    validation.score,
+                    validation.raw_response_hash,
+                    validation.note,
+                    validation.error,
+                    created_at,
+                ),
+            )
+        collapse_unworked_duplicate_opportunities(self.db)

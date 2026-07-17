@@ -11,6 +11,7 @@
   <header class="topbar">
     <a class="brand" href="/">Trend Opportunity Lab</a>
     <span class="tag">真实数据 · 证据优先</span>
+    <nav class="topnav"><a href="/">趋势面板</a><a href="/validation">市场验证</a></nav>
   </header>
   <main class="container">{% block content %}{% endblock %}</main>
   <div id="toast" class="toast" hidden></div>
@@ -21,10 +22,14 @@
       node.className = error ? 'toast error' : 'toast';
       setTimeout(() => node.hidden = true, 4000);
     }
-    async function postAction(url, successMessage) {
+    async function postAction(url, successMessage, data=null) {
       const token = localStorage.getItem('trendAdminToken');
       const headers = token ? {'X-Admin-Token': token} : {};
-      const response = await fetch(url, {method: 'POST', headers});
+      if (data !== null) headers['Content-Type'] = 'application/json';
+      const response = await fetch(url, {
+        method: 'POST', headers,
+        body: data === null ? undefined : JSON.stringify(data)
+      });
       let body = {}; try { body = await response.json(); } catch (_) {}
       if (!response.ok) { toast(body.detail || '操作失败', true); return null; }
       if (successMessage) toast(successMessage);

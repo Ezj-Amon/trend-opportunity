@@ -33,6 +33,7 @@ class Settings:
     feishu_secret: str | None
     public_base_url: str
     admin_token: str | None
+    amazon_default_marketplace: str = "US"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,4 +85,7 @@ class Settings:
                 "/"
             ),
             admin_token=os.getenv("ADMIN_TOKEN") or None,
+            amazon_default_marketplace=os.getenv(
+                "AMAZON_DEFAULT_MARKETPLACE", "US"
+            ).strip().upper(),
         )

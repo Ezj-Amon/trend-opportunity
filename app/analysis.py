@@ -8,21 +8,27 @@ from typing import Any
 from openai import AsyncOpenAI, OpenAIError
 from pydantic import BaseModel, Field, ValidationError
 
+from .amazon import AMAZON_MARKETPLACES, marketplace_name
 from .config import Settings
 
 
 class OpportunityDraft(BaseModel):
     name: str
+    product_keywords: list[str] = Field(min_length=1, max_length=8)
+    category: str
     target_segment: str
     scenario: str
     jtbd: str
+    purchase_motivation: str
     pain_points: list[str] = Field(min_length=1, max_length=5)
     solution: str
     mvp: str
     price_band: str
     marketplace: str
+    target_marketplace: str = ""
     channels: list[str] = Field(min_length=1, max_length=5)
     risks: list[str] = Field(min_length=1, max_length=5)
+    next_action: str
     pain_score: int = Field(ge=1, le=5)
     intent_score: int = Field(ge=1, le=5)
     segment_score: int = Field(ge=1, le=5)
@@ -198,20 +204,6 @@ PUBLIC_INTEREST_WORDS = {
     "严打", "谣言被拘", "警方通报", "公安通报", "刑事拘留", "立案调查",
 }
 
-MARKETPLACES = {
-    "US": "Amazon.com",
-    "GB": "Amazon.co.uk",
-    "DE": "Amazon.de",
-    "JP": "Amazon.co.jp",
-    "CA": "Amazon.ca",
-    "FR": "Amazon.fr",
-    "IT": "Amazon.it",
-    "ES": "Amazon.es",
-    "CN": "中国电商平台",
-    "GLOBAL": "Amazon.com / 目标站点",
-}
-
-
 def _contains_keyword(corpus: str, keyword: str) -> bool:
     folded = corpus.casefold()
     needle = keyword.casefold()
@@ -312,7 +304,8 @@ class Analyzer:
 只能引用给出的 evidence id。生成 0 到 3 个适合个人验证的产品机会。涉及死亡、犯罪或受害者的敏感事件时返回空 opportunities，不将悲剧商业化。
 评分每项为 1-5：痛点强度、购买意图、人群清晰度、时机、可行性、差异化。
 事件：{event['canonical_title']}，趋势分 {event['trend_score']}，市场 {event.get('market', 'CN')}，信号类型 {event.get('signal_type', 'news')}。
-产品方向应说明适用的 Amazon marketplace；搜索或社媒热度不能直接当作 Amazon 销量证据。
+产品方向应说明适用的 Amazon marketplace，并在 target_marketplace 填写 US/GB/DE/JP 等站点代码；事件市场只是信号来源，不能当作目标销售站点。搜索或社媒热度不能直接当作 Amazon 销量证据。
+每个机会必须给出产品关键词、可能类目、购买动机和一条可以当天执行的市场验证动作；不得编造搜索量、价格、利润或竞品数据。
 证据：{json.dumps(evidence_payload, ensure_ascii=False)}
 只返回符合以下 JSON Schema 的 JSON：
 {json.dumps(AnalysisOutput.model_json_schema(), ensure_ascii=False)}
@@ -377,24 +370,34 @@ class Analyzer:
         evidence_ids = [int(item["id"]) for item in evidence]
         opportunities = []
         market = str(event.get("market") or "CN").upper()
-        marketplace = MARKETPLACES.get(market, f"Amazon {market}")
+        target_marketplace = (
+            market if market in AMAZON_MARKETPLACES else self.settings.amazon_default_marketplace
+        )
+        marketplace = marketplace_name(target_marketplace)
         for index, (name, mvp, price) in enumerate(category["products"][:2]):
             overseas_price = "$19–49" if index == 0 else "$9–29 / 次或月"
+            keywords = sorted(matched_keywords, key=lambda value: (len(value), value))[:5]
+            if name not in keywords:
+                keywords.append(name)
             opportunities.append(
                 OpportunityDraft(
                     name=name,
+                    product_keywords=keywords[:8],
+                    category=category["scenario"],
                     target_segment=category["segment"],
                     scenario=category["scenario"],
                     jtbd=f"当“{event['canonical_title']}”相关场景出现时，更快完成准备或决策",
+                    purchase_motivation=category["pain"],
                     pain_points=[category["pain"]],
                     solution=f"围绕当前事件提供低成本、可快速验证的{name}",
                     mvp=mvp,
-                    price_band=price if market == "CN" else overseas_price,
+                    price_band=overseas_price,
                     marketplace=marketplace,
+                    target_marketplace=target_marketplace,
                     channels=(
                         [marketplace, "TikTok / Instagram 内容", "Reddit 垂直社区"]
                         if market != "CN"
-                        else ["内容平台", "私域/社群", "电商平台"]
+                        else [marketplace, "中国内容平台", "私域/社群"]
                     ),
                     risks=[
                         "热点关注度不等于真实购买需求",
@@ -402,6 +405,9 @@ class Analyzer:
                         "需要人工确认事件与产品场景是否存在自然联系",
                         f"需在 {marketplace} 复核关键词、竞品数量、价格带和评论痛点",
                     ],
+                    next_action=(
+                        f"用关键词“{keywords[0]}”在 {marketplace} 验证搜索需求、竞争、价格带和评论痛点"
+                    ),
                     pain_score=pain_score,
                     intent_score=intent_score,
                     segment_score=segment_score,
