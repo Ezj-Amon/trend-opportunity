@@ -1,9 +1,9 @@
 # EvidenceBundle 与 Research Agent 可执行实施计划
 
-> 实现状态（2026-07-17）：阶段 0–7 的核心对象、表、接口和安全边界已实现，但并非全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 时 Pipeline 无法创建 ResearchCandidate，因而不满足“各阶段可在 Embedding 关闭下运行”的原则；真实数据库的证据 Bundle 也尚无 `ready_for_assessment`。本文继续作为设计与验收契约，真实验证结果与后续入口以 `HANDOFF.md` 为准。
+> 实现状态（2026-07-18）：阶段 0–7 的核心对象、表、接口和安全边界已实现，但并非全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Pipeline 已能为安全且至少 `partial` 的 Bundle 创建无类目 ResearchCandidate；纯标题 `insufficient` Bundle 仍显式弃权。真实数据库尚无 `ready_for_assessment` Bundle，也尚未完成真实人工 Run 到 Signal 的验收。本文继续作为设计与验收契约，真实验证结果与后续入口以 `HANDOFF.md` 为准。
 
-状态：待实施
-日期：2026-07-17
+状态：核心实施完成，运行验收进行中
+日期：2026-07-18
 依赖架构：`docs/research-agent-architecture.md`
 目标：把当前“标题证据 + 原始语义指标”升级为“可审计证据包 + 待研究候选 + 可选 Agent 研究 + 结构化机会评估”。
 
@@ -382,8 +382,9 @@ def candidate_from_event(
 
 规则：
 
-- EvidenceBundle 不足时允许创建 ResearchCandidate。
-- ResearchCandidate 只能包含类目联想和研究问题。
+- 有 `ready` 语义特征时，EvidenceBundle 不足仍允许创建 ResearchCandidate。
+- 无可用语义特征时，至少 `partial` 的安全 Bundle 可创建无类目 Candidate；纯标题 `insufficient` Bundle 弃权。
+- ResearchCandidate 只能包含可为空的类目联想、研究问题和缺失证据。
 - 不生成商品名、Amazon 查询词、目标售价或需求结论。
 - 安全门命中的悲剧、犯罪和高风险事件默认不创建商业研究候选；可保留事实跟踪状态。
 
@@ -438,7 +439,7 @@ class OpportunityAssessmentProvider(Protocol):
 ```text
 EVIDENCE_BUNDLE_VERSION=evidence-bundle-v1
 EVIDENCE_READY_SCORE=1.8
-RESEARCH_CANDIDATE_VERSION=research-candidate-v1
+RESEARCH_CANDIDATE_VERSION=research-candidate-v2
 RESEARCH_MAX_SEARCH_QUERIES=8
 RESEARCH_MAX_FETCH_PAGES=15
 RESEARCH_MAX_BROWSER_PAGES=3

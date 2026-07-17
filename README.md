@@ -27,7 +27,7 @@
 - Skill 固化研究步骤与证据标准，Agent 负责编排工具，大模型只对已有证据做带引用的综合。
 - Embedding 继续用于检索、跨语言匹配、重复候选和类目联想，不承担最终机会判断。
 
-该研究链的核心程序结构和阶段 0–7 接口已实现：包含不可变 `EvidenceBundle`、`ResearchCandidate`、可恢复 `ResearchRun`、受控研究工具、人工/规则/可选云端 `OpportunityAssessment`、引用校验和人工审核。当前仍有一项验收偏差：默认 `ENABLE_EMBEDDINGS=false` 时语义特征不是 `ready`，Pipeline 不会自动创建 ResearchCandidate，因此默认配置下的无模型人工闭环尚未真正贯通。MCP 与浏览器登录态不是核心依赖，默认不启用；系统不会自动创建 OpportunitySignal。详细决策见 [研究架构](docs/research-agent-architecture.md)，表结构、接口与验收标准见 [实施计划](docs/research-agent-implementation-plan.md)，当前状态见 [HANDOFF](HANDOFF.md)。
+该研究链的核心程序结构和阶段 0–7 接口已实现：包含不可变 `EvidenceBundle`、`ResearchCandidate`、可恢复 `ResearchRun`、受控研究工具、人工/规则/可选云端 `OpportunityAssessment`、引用校验和人工审核。默认 `ENABLE_EMBEDDINGS=false` 时，Pipeline 会为至少达到 `partial` 的安全 Bundle 创建无类目待研究 Candidate；纯标题 `insufficient` Bundle 仍显式弃权，Candidate 不生成商品名、查询词或需求结论。MCP 与浏览器登录态不是核心依赖，默认不启用；系统不会自动创建 OpportunitySignal。详细决策见 [研究架构](docs/research-agent-architecture.md)，表结构、接口与验收标准见 [实施计划](docs/research-agent-implementation-plan.md)，当前状态见 [HANDOFF](HANDOFF.md)。
 
 ## 当前能力
 

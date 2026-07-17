@@ -52,7 +52,7 @@
 <section class="panel research-candidate-detail">
   <div class="panel-head"><h2>待研究方向</h2><span>{{ research_candidate.status }} · 优先级 {{ research_candidate.priority }}</span></div>
   <p>{{ research_candidate.candidate_reason }}</p>
-  <div class="chips">{% for item in research_candidate.category_candidates %}<span>{{ item.category }} {{ '%.4f'|format(item.similarity) }}</span>{% endfor %}</div>
+  {% if research_candidate.category_candidates %}<div class="chips">{% for item in research_candidate.category_candidates %}<span>{{ item.category }} {{ '%.4f'|format(item.similarity) }}</span>{% endfor %}</div>{% else %}<p class="muted">尚无可靠类目联想；该候选只用于补证，不代表商品方向或需求结论。</p>{% endif %}
   <h4>研究问题</h4><ul>{% for question in research_candidate.research_questions %}<li>{{ question }}</li>{% endfor %}</ul>
   {% if research_candidate.status in ['pending','evidence_ready','insufficient_evidence','failed'] %}<button class="compact primary" onclick="startResearchRun({{ research_candidate.id }})">启动人工 ResearchRun</button>{% endif %}
 </section>

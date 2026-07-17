@@ -1,10 +1,10 @@
 # 项目交接：全球趋势驱动新品机会系统
 
-更新时间：2026-07-17
+更新时间：2026-07-18
 工作目录：`D:\code\xpzs`
-当前分支：`main`
-当前 HEAD：`b41111a Document current architecture, evidence gaps, and implementation roadmap`
-Git 状态：`main` 与 `origin/main` 同步；本轮 README、HANDOFF 和两份研究文档更新尚未提交。不要擅自提交、重置或推送。
+当前分支：`agent/research-architecture`
+当前 HEAD：`bcf8c57 Implement evidence-backed research architecture`
+Git 状态：当前分支已推送到 `origin/agent/research-architecture`，但尚未合并到 `main`，也未创建 PR；本轮 Candidate 入口修复、测试和文档修改尚未提交。不要擅自提交、重置或推送。
 
 ## 1. 产品目标与边界
 
@@ -129,11 +129,13 @@ EvidenceBundle
 - 事件页现在显示结论、停止原因、下一步、Candidate、Run 预算/工具审计、Assessment 和人工审核；研究工具补证据后会把当前 Candidate 前移到新的不可变 Bundle 快照。
 - MCP 和浏览器登录态仍不是核心依赖，浏览器证据默认关闭。系统不会自动创建 OpportunitySignal、商品假设或推荐。
 
-已知未完成验收：
+本轮 Candidate 入口修复与剩余验收：
 
-- `candidate_from_event()` 要求语义特征状态为 `ready` 且存在类目联想；默认 `ENABLE_EMBEDDINGS=false` 时只会保存 `disabled` 特征，因此 Pipeline 不创建 ResearchCandidate。
-- 真实库当前有 42 个 EvidenceBundle、7 个 ready 语义特征和 7 个 disabled 语义特征，但 ResearchCandidate、ResearchRun、OpportunityAssessment 均为 0。
-- 这意味着表、API 和测试夹具中的人工研究闭环已经存在，但默认真实运行链还没有从 Bundle 自动进入 Candidate，不应宣称无模型闭环已完全贯通。
+- `research-candidate-v2` 已允许默认 `ENABLE_EMBEDDINGS=false` 时，为安全且至少 `partial` 的 Bundle 创建无类目 Candidate；`semantic_feature_id` 保持为空，避免以后启用模型、替换 disabled/unavailable 特征时触发外键冲突。
+- 纯标题 `insufficient` Bundle 在没有 ready 语义特征时仍显式弃权；Candidate 只保存研究问题和缺失证据，不生成商品名、查询词或需求结论。
+- 安全门补充山体垮塌、坍塌、泥石流和政治纪律处分等明确不适合商业研究的事件词，并有回归测试。
+- 使用真实数据库副本调用实际 Pipeline Candidate 阶段验证：事件 #677 在语义特征写为 `disabled` 后创建无类目 Candidate，OpportunitySignal 增量为 0，外键检查通过，真实库 SHA-256 未变化。
+- 真实库当前仍有 42 个 EvidenceBundle、7 个 ready 和 7 个 disabled 语义特征，ResearchCandidate、ResearchRun、OpportunityAssessment 仍为 0；原因是本轮没有回填或重跑真实库。`/research` 要出现队列仍需显式重跑 Pipeline 或安全回填。
 - 42 个真实 Bundle 中 27 个为 `insufficient`、15 个为 `partial`，没有 `ready_for_assessment`；正文证据覆盖仍是实际瓶颈。
 
 ## 3. 真实数据库状态
@@ -143,13 +145,33 @@ EvidenceBundle
 ```text
 trend_events                    1156
 evidence                          81
+evidence_bundles                  42
 opportunity_signals                0
 semantic_event_features           14
 semantic_evaluation_labels         7
 semantic_duplicate_candidates     11
+research_candidates                0
+research_runs                      0
+research_tool_calls                0
+opportunity_assessments            0
 product_hypotheses                 0
 market_evidence                    0
 validated_recommendations          0
+pipeline_runs                      15
+```
+
+当前证据质量分布：
+
+```text
+有效完整正文                        16
+仅标题且不可分析                    65
+content_too_short                  48
+robots_or_access_denied             5
+http_error                          4
+
+EvidenceBundle insufficient        27
+EvidenceBundle partial             15
+EvidenceBundle ready_for_assessment 0
 ```
 
 零 OpportunitySignal、零商品假设和零推荐目前是合法结果，不代表数据库或页面故障。主要原因是：
@@ -293,15 +315,17 @@ TrendEvent
 
 ## 6. 后续运营优先级
 
-研究架构的核心对象和接口已完成，但默认配置下的 Candidate 入口仍需补齐；在此之前不能只做样本运营并宣称程序主链已经完全验收。
+研究架构的核心对象和接口已完成，默认配置下的 Candidate 入口也已通过代码、回归测试和真实数据库副本验收；真实库尚未回填 Candidate，正文覆盖和真实人工研究样本仍需继续补齐。
 
-### P0：补齐默认 Candidate 入口（尚未实施）
+### P0：补齐默认 Candidate 入口（已实施）
 
-1. 设计 `ENABLE_EMBEDDINGS=false` 时的确定性类目/待研究候选策略，或允许无类目 Candidate 进入补证队列。
-2. 保持 Candidate 不生成商品名、查询词或需求结论。
-3. 用真实 Pipeline 验证 Bundle -> Candidate，而不是只依赖测试中的 ReadyModelExtractor。
+1. 默认无 embedding 时，安全且至少 `partial` 的 Bundle 进入无类目补证队列；纯标题 `insufficient` Bundle 弃权。
+2. Candidate 保持不生成商品名、查询词或需求结论。
+3. 默认 Pipeline 回归测试和真实数据库副本均已证明 Bundle -> Candidate 可达；后续 ready 特征会创建新快照并 supersede 无类目旧候选。
 
 ### P1：真实研究样本与人工评测
+
+前置条件：P0 已完成，但真实库尚未重跑或回填，当前 `/research` 队列仍为 0；先显式运行 Pipeline 或增加可审计安全回填，再开始样本运营。
 
 1. 在 `/research` 从高优先级 Candidate 启动人工 ResearchRun。
 2. 收集公开正文、独立来源和消费者声音，保留工具审计。
@@ -344,7 +368,7 @@ TrendEvent
 python -m compileall -q app
   -> passed
 
-python -m ruff check app tests
+ruff check app tests
   -> passed
 
 git diff --check
@@ -357,7 +381,7 @@ Skill quick_validate
   -> Skill is valid!
 ```
 
-真实 `data/trends.db` 未在本轮验证中改写，验证前后 SHA-256 一致。数据库副本执行初始化迁移后生成 42 个历史 EvidenceBundle，42 个已分析事件缺失 Bundle 数为 0；事件 #338 的 Bundle 为 `insufficient`、质量分 0.30、完整正文 0、标题证据 3、独立来源 2，页面结构化解释验证通过。
+真实 `data/trends.db` 未在本轮验证中改写，验证前后 SHA-256 一致。数据库副本执行初始化迁移后生成 42 个历史 EvidenceBundle，42 个已分析事件缺失 Bundle 数为 0；事件 #338 的 Bundle 为 `insufficient`、质量分 0.30、完整正文 0、标题证据 3、独立来源 2，页面结构化解释验证通过。本轮又在真实数据库副本上调用实际 Pipeline Candidate 阶段：事件 #677 在默认 embedding 关闭、语义状态为 `disabled` 时成功创建 `deterministic-research-rules` 无类目 Candidate，未创建 OpportunitySignal，外键检查通过；外网抓取在该验收中替换为确定性失败结果，避免把网络波动混入入口验证。
 
 全量测试包含真实外部来源。单次 NewsNow/Google Trends 失败应先单独复测，不要直接判定代码回归。
 
@@ -385,7 +409,76 @@ Skill quick_validate
 - 语义评测页：`app/templates/semantic_review.html`
 - 回归测试：`tests/test_core.py`
 
-## 10. 绝对约束
+## 10. 架构符合性与未解决问题
+
+### 10.1 总体结论
+
+静态结构基本符合 `docs/research-agent-architecture.md` 和 `docs/research-agent-implementation-plan.md`：EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、OpportunitySignal 已分层；Bundle 和 Assessment 使用快照；引用、风险门、人工审核、受控工具、租约与幂等均已落地；定时 Pipeline 不会自动创建 Signal、商品假设或推荐；MCP 和浏览器登录态没有成为核心依赖。
+
+默认 `ENABLE_EMBEDDINGS=false` 的 Bundle -> Candidate 已通过真实数据库副本验收，但当前仍不能判定“实施计划已完成”：真实库尚未产生 Candidate，也没有真实 Candidate -> Run -> Assessment -> Signal 人工样本。当前更准确的状态是：**默认 Candidate 入口已贯通，真实研究运营闭环仍未验收。**
+
+### 10.2 已解决：默认配置可以进入 ResearchCandidate
+
+实现：`candidate_from_event()` 在语义特征未启用或不可用时，允许安全且至少 `partial` 的 Bundle 形成无类目 Candidate；纯标题 `insufficient` Bundle 继续弃权。降级 Candidate 不引用可替换的 disabled/unavailable 特征行，后续 ready 特征会生成新版本 Candidate 并 supersede 旧候选。
+
+证据：默认 Pipeline 回归测试直接断言 `disabled` 特征仍创建无类目 Candidate、页面显示非结论提示、后续 ready 特征可安全替换并 supersede；真实数据库副本的实际 Pipeline Candidate 阶段也创建成功，未创建 Signal，外键检查通过。
+
+剩余事项：真实库未在本轮改写，所以 `/research` 仍为空；这是待重跑/回填状态，不再是代码入口不可达。
+
+### 10.3 P0：二级正文证据采集仍是主要瓶颈
+
+现状：主趋势源采集正常，但从热榜条目升级到可分析正文的成功率很低。81 条 Evidence 中 65 条是不可分析的 `title_only`，只有 16 条有效完整正文；42 个 Bundle 中 27 个 `insufficient`、15 个 `partial`，没有 `ready_for_assessment`。
+
+主要失败分布：头条短正文 14、百度短正文 13、微博短正文 11、抖音短正文 9、贴吧短正文 1；知乎 403/访问拒绝 4、Product Hunt 403/访问拒绝 1；Google Trends DE/GB/JP/US 关联页面各有 1 次 HTTP 429。
+
+影响：即使修复 Candidate 入口，当前真实 Bundle 仍不能批准 `worth_following` Assessment，也无法形成新研究主链的 Signal。标题存在性能够确认，但正文事实、独立来源和消费者声音经常不足。该问题已确认，按本轮要求只记录、不解决。
+
+### 10.4 P1：采集成功、证据质量和研究就绪状态没有统一监控
+
+现状：真实库 15 次 Pipeline Run 全部是 `completed/completed`；155 个主源快照均记录成功，最新各源也都有条目。然而同一批数据没有一个 `ready_for_assessment` Bundle，也没有 Candidate。Dashboard 的“来源健康”只看 `source_snapshots.success`，不能反映正文抓取、Bundle 准备度或研究链产出。
+
+性能风险：最新一轮多个主源延迟较高，例如百度约 24 秒、B 站 36 秒、酷安 39 秒、贴吧 43 秒、Google Trends DE/GB/US 约 47/55/59 秒、Hacker News 51 秒。当前没有按阶段区分的超时率或质量 SLO。
+
+历史状态混淆：`/healthz` 顶层已报告新 Pipeline 模式，但 `latest_run.config_json` 和 `legacy_latest_analysis` 仍会展示数据库中的历史 `local-rules` / `local-rules-v1`，容易被误解为旧规则仍在活跃运行。活跃代码已删除，问题在于监控语义和历史字段未隔离。
+
+### 10.5 P1：人工研究工作台只完成展示和启动，操作闭环仍依赖 API/Skill
+
+现状：`/research` 和事件页可以启动人工 ResearchRun、显示工具审计、展示并审核已有 Assessment；但页面没有执行受控工具、添加人工 Evidence、完成 Run、创建人工 Assessment 或触发云端 Assessment 的操作入口。
+
+影响：后端 API 和 Skill 具备这些能力，但普通用户仅靠页面无法完成实施计划所述的人工研究闭环。真实库中 0 Run、0 ToolCall、0 Assessment 也说明这条链尚未经过真实操作验收。
+
+### 10.6 P1：新研究状态机仍有兼容旁路
+
+Candidate 状态接口目前允许把非 `superseded` Candidate 直接更新为任一合法状态，没有校验允许的状态转换，也没有在写入 `evidence_ready`、`awaiting_review` 或 `completed` 时复核 Bundle 和 Assessment 条件。
+
+事件页和 `POST /api/events/{event_id}/opportunity-signals` 仍支持直接人工创建 Signal；它只要求证据 ID 属于事件，不要求有效正文、ready Bundle、Candidate 或批准的 OpportunityAssessment。这是 Phase 1 人工工作台的兼容路径，但意味着目标架构中“只有人工确认 `worth_following` Assessment 后才创建 Signal”尚不是唯一受控路径。
+
+需要后续明确：这些接口是受信任管理员的显式旁路，还是应收紧到新状态机；在决定前不能宣称所有新 Signal 都能回溯完整 Research 链。
+
+### 10.7 P2：Agent、搜索与浏览器配置尚未接入执行器
+
+当前受控工具只有 `get_context`、`fetch_public_page`、`collect_related_news` 和 `rebuild_evidence_bundle`。没有搜索 Provider、浏览器工具或独立 Research Agent worker；`ENABLE_RESEARCH_AGENT`、`ENABLE_BROWSER_EVIDENCE` 目前只影响页面文案，`RESEARCH_MAX_SEARCH_QUERIES` 和 `RESEARCH_MAX_BROWSER_PAGES` 没有对应可执行工具，`AbstainingRulesAssessmentProvider` 也没有接入 API 或 Pipeline。
+
+这些能力在实施计划中属于默认关闭或第二版可选项，不阻塞最小人工闭环，但配置项会让使用者误以为开启后已有实际执行能力。后续应实现、隐藏或明确标记为预留。
+
+### 10.8 P2：新主链仍受旧数据模型约束
+
+`opportunity_signals.analysis_id` 仍是非空外键。批准 OpportunityAssessment 或人工创建 Signal 时，代码会额外插入兼容用 `pipeline_runs` 和 `analyses` 记录，再创建 Signal。旧 `product_opportunities`、`market_validations`、旧页面/API 和 `/healthz` 的 legacy 字段也仍保留。
+
+这保证旧数据可用，但增加了双轨查询、清理顺序和状态解释成本。长期架构若要完全独立，需要迁移 `analysis_id` 约束并明确旧表/API 的退役条件；当前仅做到“新推荐不再由旧链生产”。
+
+### 10.9 P2：生产安全边界尚未完成
+
+写 API 当前使用浏览器 Origin 校验、本机限制或单一 `ADMIN_TOKEN`，README 已明确这是 Demo 级保护。没有正式用户身份、角色权限、审计主体和限流；适合本机或可信内网，不适合直接公网部署。浏览器登录态、Cookie 和验证码绕过仍按设计不实现。
+
+### 10.10 P2：验证、文档与发布状态仍有缺口
+
+- 58 个测试和外键检查均通过，真实数据库副本已验证默认 Bundle -> Candidate，但仍没有真实 Candidate -> Run -> Assessment -> Signal 端到端样本；云端 Provider 只通过 fake client 验证，没有真实模型灰度样本。
+- 测试仍有 1 个 Starlette `TestClient` 上游弃用警告，不影响当前结果，但应在依赖升级时处理。
+- `docs/research-agent-implementation-plan.md` 的实现说明和正文元数据已统一为“核心实施完成，运行验收进行中”。
+- 代码提交 `bcf8c57` 已推送到 `origin/agent/research-architecture`，尚未创建 PR，也未合并到 `main`；本轮 `HANDOFF.md` 问题盘点尚未提交。
+
+## 11. 绝对约束
 
 1. 不恢复新闻关键词到固定商品模板。
 2. 不把类目相似度或模型置信度称为需求概率。
@@ -400,7 +493,7 @@ Skill quick_validate
 11. 不擅自提交、重置、推送或清理工作区。
 12. Windows 环境不要使用 `rg`，使用 PowerShell 原生命令。
 
-## 11. 新会话建议先执行
+## 12. 新会话建议先执行
 
 ```powershell
 Set-Location -LiteralPath 'D:\code\xpzs'
@@ -413,4 +506,4 @@ python -m pytest -q tests\test_core.py
 
 最合理的续做入口是：
 
-> 启动本地应用，从 `/research` 选择真实 Candidate，按 Skill 流程完成人工补证据和 OpportunityAssessment，积累可审核样本；在样本质量足够前保持 `ENABLE_RESEARCH_AGENT=false`，不要自动生产 Signal。
+> 显式重跑 Pipeline 或实现可审计安全回填，使真实 `/research` 队列出现 Candidate；随后补齐人工研究工作台或严格按 Skill/API 完成一个真实 Run 与 OpportunityAssessment 样本。在证据质量和样本验收前保持 `ENABLE_RESEARCH_AGENT=false`，不要自动生产 Signal。

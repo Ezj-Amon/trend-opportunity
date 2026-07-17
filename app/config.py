@@ -44,7 +44,7 @@ class Settings:
     semantic_duplicate_window: int = 500
     evidence_bundle_version: str = "evidence-bundle-v1"
     evidence_ready_score: float = 1.8
-    research_candidate_version: str = "research-candidate-v1"
+    research_candidate_version: str = "research-candidate-v2"
     research_max_search_queries: int = 8
     research_max_fetch_pages: int = 15
     research_max_browser_pages: int = 3
@@ -156,7 +156,7 @@ class Settings:
                 0.0, float(os.getenv("EVIDENCE_READY_SCORE", "1.8"))
             ),
             research_candidate_version=os.getenv(
-                "RESEARCH_CANDIDATE_VERSION", "research-candidate-v1"
+                "RESEARCH_CANDIDATE_VERSION", "research-candidate-v2"
             ).strip(),
             research_max_search_queries=max(
                 0, int(os.getenv("RESEARCH_MAX_SEARCH_QUERIES", "8"))

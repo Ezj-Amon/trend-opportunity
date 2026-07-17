@@ -1,9 +1,9 @@
 # 趋势机会研究架构：核心程序、EvidenceBundle 与 Research Agent
 
-> 实现状态（2026-07-17）：核心程序、EvidenceBundle、ResearchCandidate、ResearchRun、受控工具、Skill 和可选大模型 OpportunityAssessment 的结构与接口已落地，但尚未全部通过运行验收。已知缺口是默认 `ENABLE_EMBEDDINGS=false` 时 Pipeline 不会创建 ResearchCandidate，导致默认配置下的无模型人工闭环不可达；正文证据覆盖也仍不足。MCP 与浏览器登录态保持可选且默认不启用；当前状态以 `HANDOFF.md` 为准。
+> 实现状态（2026-07-18）：核心程序、EvidenceBundle、ResearchCandidate、ResearchRun、受控工具、Skill 和可选大模型 OpportunityAssessment 的结构与接口已落地，但尚未全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Candidate 入口已打通：安全且至少 `partial` 的 Bundle 会创建无类目待研究 Candidate，纯标题 Bundle 继续弃权；正文证据覆盖和真实人工研究样本仍不足。MCP 与浏览器登录态保持可选且默认不启用；当前状态以 `HANDOFF.md` 为准。
 
-状态：核心主结构已实现，存在已知验收缺口
-日期：2026-07-17
+状态：核心主结构已实现，默认 Candidate 入口已验收，仍有后续运行缺口
+日期：2026-07-18
 适用范围：证据获取、待研究候选、机会评估、Skill/Agent 集成和事件详情解释
 
 ## 1. 架构决策
