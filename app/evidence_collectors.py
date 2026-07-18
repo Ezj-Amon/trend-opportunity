@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Protocol
 
+import httpx
+
 from .db import Database
 from .evidence import EvidenceResult, fetch_evidence
-from .evidence_bundle import EVIDENCE_QUALITY_VERSION, calculate_evidence_quality
+from .evidence_bundle import (
+    EVIDENCE_QUALITY_VERSION,
+    calculate_evidence_quality,
+    classify_evidence_strength,
+)
+from .evidence_quality import registrable_domain
 from .evidence_types import EvidenceType, FetchStatus, ManualEvidenceInput
+from .news_search import PublicNewsSearchProvider, build_fact_search_queries
 from .research import ResearchBudget
 
 
@@ -147,6 +156,103 @@ class RelatedNewsCollector:
         return collected
 
 
+class PublicNewsSearchCollector:
+    name = "public-news-search"
+
+    def __init__(
+        self,
+        provider: PublicNewsSearchProvider,
+        fetcher: EvidenceFetcher = fetch_evidence,
+        *,
+        max_results: int = 8,
+    ):
+        self.provider = provider
+        self.fetcher = fetcher
+        self.max_results = max_results
+
+    async def collect(
+        self,
+        event: dict,
+        current_evidence: list[dict],
+        budget: ResearchBudget,
+    ) -> list[CollectedEvidence]:
+        if budget.max_search_queries <= 0 or budget.max_fetch_pages <= 0:
+            return []
+        source_items = event.get("source_items") or []
+        queries = build_fact_search_queries(
+            event, source_items, budget.max_search_queries
+        )
+        existing_urls = {str(row.get("url") or "") for row in current_evidence}
+        existing_domains = {
+            registrable_domain(str(row.get("url") or ""))
+            for row in current_evidence
+            if bool(row.get("valid_for_analysis"))
+        }
+        existing_domains.discard("")
+        selected = []
+        selected_domains: set[str] = set()
+        for query in queries:
+            try:
+                hits = await self.provider.search(
+                    query,
+                    market=str(event.get("market") or "US"),
+                    language=str(event.get("language") or "all"),
+                    limit=max(self.max_results, budget.max_fetch_pages),
+                )
+            except (httpx.HTTPError, ValueError, OSError):
+                continue
+            for hit in hits:
+                domain = registrable_domain(hit.url)
+                if (
+                    not domain
+                    or hit.url in existing_urls
+                    or domain in existing_domains
+                    or domain in selected_domains
+                ):
+                    continue
+                selected.append((hit, query))
+                selected_domains.add(domain)
+                if len(selected) >= budget.max_fetch_pages:
+                    break
+            if len(selected) >= budget.max_fetch_pages:
+                break
+
+        results = await asyncio.gather(
+            *[self.fetcher(hit.url, hit.title) for hit, _query in selected]
+        )
+        collected: list[CollectedEvidence] = []
+        for result, (hit, _query) in zip(results, selected, strict=True):
+            metadata = {
+                **result.raw_metadata,
+                "search_provider": hit.provider,
+                "search_query_hash": hit.query_hash,
+                "search_rank": hit.rank,
+                "search_published_at": hit.published_at,
+                "search_provider_url": hit.provider_url,
+            }
+            collected.append(
+                CollectedEvidence(
+                    evidence_type=result.evidence_type,
+                    source_name=(
+                        registrable_domain(result.url)
+                        or hit.source_name
+                        or hit.provider
+                    ),
+                    url=result.url,
+                    title=result.title,
+                    excerpt=result.excerpt,
+                    fetch_method=self.name,
+                    fetch_status=result.fetch_status,
+                    fetched_at=result.fetched_at,
+                    http_status=result.http_status,
+                    content_hash=result.content_hash,
+                    error=result.error,
+                    raw_metadata=metadata,
+                )
+            )
+        return collected
+
+
 class ManualEvidenceCollector:
     name = "manual"
 
@@ -213,6 +319,15 @@ def persist_collected_evidence(
             fetch_status == FetchStatus.READY and evidence_type != EvidenceType.TITLE_ONLY
         ),
     }
+    classified_type = classify_evidence_strength(row_for_quality)
+    if classified_type != evidence_type:
+        item.raw_metadata = {
+            **item.raw_metadata,
+            "declared_evidence_type": evidence_type.value,
+            "classification_note": "content strength normalized during persistence",
+        }
+        evidence_type = classified_type
+        row_for_quality["evidence_type"] = evidence_type.value
     quality = calculate_evidence_quality(row_for_quality)
     valid_for_analysis = int(
         fetch_status == FetchStatus.READY

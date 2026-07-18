@@ -1,6 +1,6 @@
 # EvidenceBundle 与 Research Agent 可执行实施计划
 
-> 实现状态（2026-07-18）：阶段 0–7 的核心对象、表、接口和安全边界已实现，但并非全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Pipeline 已能为安全且至少 `partial` 的 Bundle 创建无类目 ResearchCandidate；纯标题 `insufficient` Bundle 仍显式弃权。真实数据库尚无 `ready_for_assessment` Bundle，也尚未完成真实人工 Run 到 Signal 的验收。本文继续作为设计与验收契约，真实验证结果与后续入口以 `HANDOFF.md` 为准。
+> 实现状态（2026-07-18）：阶段 0–7 的核心对象、表、接口和安全边界已实现，但并非全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Pipeline 已能为安全且至少 `partial` 的 Bundle 创建无类目 ResearchCandidate；纯标题 `insufficient` Bundle 仍显式弃权。二级正文已接入 Trafilatura 真实性校验和主动公共新闻搜索，真实数据库尚无 `ready_for_assessment` Bundle，也尚未完成真实人工 Run 到 Signal 的验收。本文继续作为设计与验收契约，真实验证结果与后续入口以 `HANDOFF.md` 为准。
 
 状态：核心实施完成，运行验收进行中
 日期：2026-07-18
@@ -79,7 +79,7 @@ source_name TEXT NOT NULL DEFAULT ''
 fetch_method TEXT NOT NULL DEFAULT 'unknown'
 fetch_status TEXT NOT NULL DEFAULT 'unknown'
 quality_score REAL NOT NULL DEFAULT 0
-quality_version TEXT NOT NULL DEFAULT 'evidence-quality-v1'
+quality_version TEXT NOT NULL DEFAULT 'evidence-quality-v2'
 raw_metadata_json TEXT NOT NULL DEFAULT '{}'
 ```
 
@@ -329,7 +329,7 @@ class EvidenceCollector(Protocol):
 - `RelatedNewsCollector`，先只消费 SourceItem 原始 JSON 中已有的关联 URL。
 - `ManualEvidenceCollector`。
 
-第二版再实现搜索 Provider 和浏览器 Provider。
+第二版已实现 `PublicNewsSearchCollector`：默认 Google News RSS + 原站链接解码，可选自建 SearXNG；浏览器 Provider 仍保持预留和默认关闭。
 
 ### 5.3 `app/evidence_bundle.py`
 
@@ -343,7 +343,7 @@ def calculate_evidence_quality(row: dict) -> float: ...
 def build_evidence_bundle(
     event: dict,
     evidence: list[dict],
-    version: str = "evidence-bundle-v1",
+    version: str = "evidence-bundle-v2",
 ) -> EvidenceBundleResult: ...
 ```
 
@@ -437,13 +437,16 @@ class OpportunityAssessmentProvider(Protocol):
 新增到 `Settings` 和 `.env.example`：
 
 ```text
-EVIDENCE_BUNDLE_VERSION=evidence-bundle-v1
+EVIDENCE_BUNDLE_VERSION=evidence-bundle-v2
 EVIDENCE_READY_SCORE=1.8
 RESEARCH_CANDIDATE_VERSION=research-candidate-v2
 RESEARCH_MAX_SEARCH_QUERIES=8
 RESEARCH_MAX_FETCH_PAGES=15
 RESEARCH_MAX_BROWSER_PAGES=3
 RESEARCH_TIMEOUT_SECONDS=300
+ENABLE_PUBLIC_NEWS_SEARCH=true
+PUBLIC_NEWS_MAX_RESULTS=8
+SEARXNG_BASE_URL=
 ENABLE_RESEARCH_AGENT=false
 ENABLE_BROWSER_EVIDENCE=false
 ```
@@ -611,7 +614,7 @@ Agent 由以下方式触发：
 - Evidence 类型迁移。
 - Bundle 输入哈希和幂等。
 - 标题、正文、官方来源和消费者声音计数。
-- 独立域名计数。
+- Public Suffix List 注册域名计数与跨域近重复正文去重。
 - 准备度阈值。
 - `clear_derived_data` 外键顺序。
 
@@ -639,9 +642,11 @@ Agent 由以下方式触发：
 改动：
 
 - 安全重定向，每次跳转重新验证公网目标。
-- meta、JSON-LD 和正文抽取。
+- Trafilatura 正文抽取，meta、JSON-LD 和普通段落回退。
+- 搜索/热榜页、短内容、模板污染和事件相关性校验。
 - 标准化失败原因。
 - Google Trends 关联新闻 URL Collector。
+- 默认 Google News RSS 主动新闻搜索、原站直链解码和可选 SearXNG Provider。
 - 人工证据 API。
 
 暂不实现：

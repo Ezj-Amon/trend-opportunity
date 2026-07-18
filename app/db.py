@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   fetch_method TEXT NOT NULL DEFAULT 'unknown',
   fetch_status TEXT NOT NULL DEFAULT 'unknown',
   quality_score REAL NOT NULL DEFAULT 0,
-  quality_version TEXT NOT NULL DEFAULT 'evidence-quality-v1',
+  quality_version TEXT NOT NULL DEFAULT 'evidence-quality-v2',
   raw_metadata_json TEXT NOT NULL DEFAULT '{}',
   UNIQUE(event_id, url)
 );
@@ -606,12 +606,11 @@ class Database:
     @staticmethod
     def _migrate_evidence_metadata(conn: sqlite3.Connection) -> None:
         from .evidence_bundle import EVIDENCE_QUALITY_VERSION, calculate_evidence_quality
-        from .evidence_types import normalize_fetch_status
+        from .evidence_quality import is_signal_page_url, validate_extracted_content
+        from .evidence_types import EvidenceType, FetchStatus, normalize_fetch_status
 
         conn.execute(
             """UPDATE evidence SET evidence_type=CASE
-                WHEN kind='article' AND valid_for_analysis=1
-                     AND LENGTH(TRIM(excerpt))>=20 AND error IS NULL THEN 'full_article'
                 WHEN kind IN ('official','official_notice') THEN 'official_notice'
                 WHEN kind IN ('manual','manual_evidence') THEN 'manual_evidence'
                 ELSE evidence_type END"""
@@ -641,18 +640,61 @@ class Database:
                     urlparse(str(row.get("url") or "")).hostname or "unknown"
                 ).casefold()
             fetch_status = normalize_fetch_status(row).value
-            migrated = {**row, "fetch_status": fetch_status}
+            evidence_type = str(row.get("evidence_type") or "title_only")
+            valid_for_analysis = bool(row.get("valid_for_analysis"))
+            error = row.get("error")
+            if str(row.get("kind") or "").casefold() == "hotlist" or is_signal_page_url(
+                str(row.get("url") or "")
+            ):
+                evidence_type = EvidenceType.TITLE_ONLY.value
+                valid_for_analysis = False
+                if fetch_status == FetchStatus.READY.value:
+                    fetch_status = FetchStatus.CONTENT_TOO_SHORT.value
+                error = error or "source URL is a search, hot-list, or trend landing page"
+            elif (
+                str(row.get("kind") or "").casefold() == "article"
+                and fetch_status == FetchStatus.READY.value
+            ):
+                validation = validate_extracted_content(
+                    url=str(row.get("url") or ""),
+                    expected_title=str(row.get("title") or ""),
+                    extracted_title=str(row.get("title") or ""),
+                    text=str(row.get("excerpt") or ""),
+                )
+                if validation.accepted:
+                    evidence_type = validation.content_level
+                    valid_for_analysis = True
+                else:
+                    evidence_type = EvidenceType.TITLE_ONLY.value
+                    valid_for_analysis = False
+                    fetch_status = (
+                        FetchStatus.CONTENT_IRRELEVANT.value
+                        if any(
+                            "not relevant" in reason for reason in validation.reasons
+                        )
+                        else FetchStatus.CONTENT_TOO_SHORT.value
+                    )
+                    error = error or "; ".join(validation.reasons)
+            migrated = {
+                **row,
+                "evidence_type": evidence_type,
+                "fetch_status": fetch_status,
+                "valid_for_analysis": int(valid_for_analysis),
+                "error": error,
+            }
             quality_score = calculate_evidence_quality(migrated)
             conn.execute(
-                """UPDATE evidence SET source_name=?,fetch_status=?,quality_score=?,
-                   quality_version=?,valid_for_analysis=CASE
-                     WHEN evidence_type='title_only' THEN 0 ELSE valid_for_analysis END
+                """UPDATE evidence SET source_name=?,evidence_type=?,fetch_status=?,
+                   quality_score=?,quality_version=?,valid_for_analysis=?,error=?
                 WHERE id=?""",
                 (
                     source_name,
+                    evidence_type,
                     fetch_status,
                     quality_score,
                     EVIDENCE_QUALITY_VERSION,
+                    int(valid_for_analysis),
+                    error,
                     row["id"],
                 ),
             )

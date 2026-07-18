@@ -37,7 +37,8 @@
 - Amazon 验证能力：已将 Seller Central CSV 解析封装为 `MarketplaceDataProvider`，证据写入独立 `market_evidence`，不再依赖旧机会表。
 - 可追溯：保存每次请求的状态、延迟、原始响应哈希、热榜排名和事件聚类关系。
 - 可解释：趋势分由代码计算并显示所有分项；模型判断分、市场分和已验证推荐分分别保存。
-- 证据优先：尝试读取热榜链接正文；失败时保留真实热榜标题、URL 和 HTTP 状态，不伪造正文。
+- 证据优先：热榜/搜索落地页只作为信号，不再伪装成正文；正文使用 Trafilatura 抽取并经过长度、模板污染和事件相关性校验。
+- 独立来源补证：默认通过无需密钥的 Google News RSS 主动查找原站报道并解码直链；可选接入自建 SearXNG。独立来源按注册域名计数，转载近重复内容不重复计数。
 - 研究分层：定时 Pipeline 只构建 EvidenceBundle 和 ResearchCandidate；可选云端模型只能生成带引用的 OpportunityAssessment，不能直接生成 Signal 或商品假设。
 - 安全门：死亡、犯罪和受害者相关敏感事件不生成商业化建议。
 - 主动弃权：证据不足、敏感事件或模型失败会形成显式弃权状态，不使用商品模板或本地规则伪装分析结果。
@@ -56,24 +57,39 @@
 
 ## 快速启动
 
-当前环境已有依赖时：
+先同步项目虚拟环境（不会安装到系统 Python）：
 
 ```powershell
-python -m app.cli run
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv sync --extra dev
+uv run python -m app.cli run
+# 或直接启动 Web 服务：
+uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 然后访问 <http://127.0.0.1:8000>。
 
 聚类规则升级或本地派生数据需要重建时，可执行 `python -m app.cli rebuild`。该命令保留原始来源快照与条目，清空事件、证据、分析、机会和推送记录，再进行一次新的真实采集；运行前应先备份需要保留的审核结果。
 
-从全新 Python 3.12 环境安装：
+如果不使用 uv，必须先激活自己的虚拟环境，再安装项目；直接使用系统 `python` 而未安装依赖会出现 `ModuleNotFoundError`：
 
 ```powershell
-python -m pip install -e .
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
 ```
 
 所有配置均为环境变量，示例见 `.env.example`。应用不会自动读取 `.env`，避免无意加载密钥；PowerShell 中可用 `$env:变量名='值'` 设置。
+
+默认会为研究候选主动搜索公开新闻，无需 API Key：
+
+```powershell
+$env:ENABLE_PUBLIC_NEWS_SEARCH='true'
+$env:PUBLIC_NEWS_MAX_RESULTS='8'
+# 可选：只填写自己控制或信任的 SearXNG 实例
+$env:SEARXNG_BASE_URL='https://search.example.com'
+```
+
+搜索只提供候选 URL；原站页面仍必须通过公网地址、正文真实性和相关性校验。系统不会绕过登录、验证码或付费墙。
 
 ## 海外源与 Reddit
 
@@ -82,7 +98,7 @@ python -m pip install -e .
 ```powershell
 $env:GOOGLE_TRENDS_GEOS='US,GB,DE,JP'
 $env:OVERSEAS_RESEARCH_CANDIDATE_TOP_N='5'
-python -m app.cli run
+uv run python -m app.cli run
 ```
 
 需要加入 Reddit 消费讨论时，请创建 Reddit API 应用并配置 OAuth 凭证：
@@ -92,7 +108,7 @@ $env:REDDIT_CLIENT_ID='...'
 $env:REDDIT_CLIENT_SECRET='...'
 $env:REDDIT_USER_AGENT='TrendOpportunityLab/0.2 by your-reddit-name'
 $env:REDDIT_SUBREDDITS='BuyItForLife,gadgets,HomeImprovement,shutupandtakemymoney'
-python -m app.cli run
+uv run python -m app.cli run
 ```
 
 未配置凭证时不会请求 Reddit，也不会把 Reddit 标成失败源。完整的成熟项目、核心代码、许可证、Issue 和实测比较见 [海外数据源调研](docs/overseas-source-research.md)。
@@ -106,7 +122,7 @@ $env:OPENAI_API_KEY='你的密钥'
 $env:OPENAI_MODEL='gpt-4.1-mini'
 # 使用兼容服务时再设置：
 $env:OPENAI_BASE_URL='https://example.com/v1'
-python -m app.cli run
+uv run python -m app.cli run
 ```
 
 模型输出必须通过 Pydantic Schema，并且只能引用数据库中存在且属于当前 Bundle 的证据 ID。如果模型失败，OpportunityAssessment 会明确记录 `abstained` 和失败原因，不会回退到本地商品规则。
@@ -151,8 +167,8 @@ GET  /api/validated-recommendations
 ## 测试
 
 ```powershell
-python -m pytest -q
-python -m pytest -q -m live
+uv run pytest -q
+uv run pytest -q -m live
 ```
 
 `live` 测试会真实访问 NewsNow 和 Google Trends RSS，不使用 Mock。由于它依赖外部服务，网络或上游故障会真实导致测试失败。Reddit 需要个人 OAuth 凭证，因此不放入无凭证 CI 测试。
@@ -162,7 +178,7 @@ python -m pytest -q -m live
 默认安装不包含 PyTorch 或 `sentence-transformers`，默认测试不会下载模型。需要启用时先显式安装并准备本地缓存：
 
 ```powershell
-pip install -e ".[ml]"
+uv sync --extra dev --extra ml
 $env:ENABLE_EMBEDDINGS='true'
 $env:EMBEDDING_MODEL_ID='intfloat/multilingual-e5-small'
 $env:EMBEDDING_MODEL_REVISION='614241f622f53c4eeff9890bdc4f31cfecc418b3'
