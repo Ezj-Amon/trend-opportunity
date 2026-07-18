@@ -13,11 +13,18 @@ from .evidence import fetch_evidence
 from .evidence_bundle import build_evidence_bundle, persist_evidence_bundle
 from .evidence_collectors import (
     CollectedEvidence,
+    PublicNewsSearchCollector,
     RelatedNewsCollector,
     persist_collected_evidence,
 )
+from .evidence_quality import is_signal_page_url
+from .news_search import build_public_news_search_provider
 from .research import ResearchBudget
-from .research_candidates import candidate_from_event, persist_research_candidate
+from .research_candidates import (
+    candidate_from_event,
+    is_commercial_research_blocked,
+    persist_research_candidate,
+)
 from .semantic import (
     EmbeddingUnavailable,
     SemanticFeatureExtractor,
@@ -57,6 +64,7 @@ class Pipeline:
             if settings.reddit_client_id and settings.reddit_client_secret
             else None
         )
+        self.news_search_provider = build_public_news_search_provider(settings)
         self.semantic_extractor = (
             SemanticFeatureExtractor(
                 SentenceTransformerEmbedder(
@@ -139,6 +147,12 @@ class Pipeline:
                             self.settings.overseas_research_candidate_top_n
                         ),
                         "pipeline_mode": "evidence-bundle-research-candidate",
+                        "public_news_search_enabled": bool(
+                            self.news_search_provider
+                        ),
+                        "searxng_configured": bool(
+                            self.settings.searxng_base_url
+                        ),
                     }
                 ),
             ),
@@ -600,10 +614,15 @@ class Pipeline:
                         member["raw_json"],
                     ),
                 )
+        direct_targets = [
+            item for item in unique_urls if not is_signal_page_url(item[0])
+        ][:3]
         fetched = await asyncio.gather(
-            *[fetch_evidence(url, title) for url, title, _source in unique_urls[:3]]
+            *[fetch_evidence(url, title) for url, title, _source in direct_targets]
         )
-        for result, (_url, _title, source_name) in zip(fetched, unique_urls[:3], strict=True):
+        for result, (_url, _title, source_name) in zip(
+            fetched, direct_targets, strict=True
+        ):
             persist_collected_evidence(
                 self.db,
                 event_id,
@@ -641,6 +660,35 @@ class Pipeline:
                 ),
             )
             for item in related:
+                persist_collected_evidence(
+                    self.db, event_id, item, allow_upgrade=True
+                )
+            remaining_fetches = max(0, remaining_fetches - len(related))
+        current_evidence = self.db.all(
+            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+        )
+        if (
+            remaining_fetches
+            and self.news_search_provider is not None
+            and not is_commercial_research_blocked(event)
+        ):
+            searched = await PublicNewsSearchCollector(
+                self.news_search_provider,
+                fetcher=fetch_evidence,
+                max_results=self.settings.public_news_max_results,
+            ).collect(
+                {**event, "source_items": members},
+                current_evidence,
+                ResearchBudget(
+                    max_search_queries=self.settings.research_max_search_queries,
+                    max_fetch_pages=remaining_fetches,
+                    max_browser_pages=0,
+                    timeout_seconds=self.settings.research_timeout_seconds,
+                    markets=[str(event.get("market") or "")],
+                    languages=[str(event.get("language") or "")],
+                ),
+            )
+            for item in searched:
                 persist_collected_evidence(
                     self.db, event_id, item, allow_upgrade=True
                 )

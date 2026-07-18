@@ -36,7 +36,12 @@ from app.evidence_bundle import (
     persist_evidence_bundle,
 )
 from app.evidence_types import EvidenceType, FetchStatus, normalize_fetch_status
-from app.evidence_collectors import RelatedNewsCollector, related_news_targets
+from app.evidence_collectors import (
+    PublicNewsSearchCollector,
+    RelatedNewsCollector,
+    related_news_targets,
+)
+from app.evidence_quality import canonicalize_public_url, registrable_domain
 from app.event_research import build_event_research_view
 from app.market_validation import MarketScores
 from app.opportunity_assessment import (
@@ -61,6 +66,7 @@ from app.research_candidates import (
     persist_research_candidate,
 )
 from app.research_tools import ResearchToolExecutor
+from app.news_search import GoogleNewsRssSearchProvider, NewsSearchHit
 from app.risk import assess_product_risk
 from app.scoring import calculate_evidence_confidence, calculate_opportunity_score
 from app.scoring import calculate_final_score, calculate_market_score
@@ -74,6 +80,20 @@ from app.semantic import (
     opportunity_precision_at_k,
 )
 from app.semantic_duplicates import create_duplicate_candidates
+
+
+FULL_ARTICLE_ONE = (
+    "Residents described how changing storage constraints disrupted routines across several seasons. "
+    "The report compared interviews from multiple neighborhoods and documented repeated purchases, "
+    "failed workarounds, and measurable changes in available living space. Researchers also checked "
+    "the timeline against public records and explained which observations were independently verified."
+)
+FULL_ARTICLE_TWO = (
+    "A separate newsroom reviewed household diaries, retailer records, and follow-up interviews. "
+    "Its investigation found that buyers repeatedly replaced rigid organizers when rooms changed use, "
+    "creating avoidable expense and waste. The journalists described the sampling method, publication "
+    "dates, contrary examples, and the limits of drawing a broader conclusion from the collected accounts."
+)
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -97,6 +117,7 @@ def make_settings(tmp_path: Path) -> Settings:
         feishu_secret=None,
         public_base_url="http://127.0.0.1:8000",
         admin_token=None,
+        enable_public_news_search=False,
     )
 
 
@@ -903,7 +924,7 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
     )
 
     async def fake_fetch(url: str, title: str) -> EvidenceResult:
-        return EvidenceResult(url, title, "Shoppers compare durable storage products for small homes.", now, 200, "hash")
+        return EvidenceResult(url, title, FULL_ARTICLE_ONE, now, 200, "hash")
 
     monkeypatch.setattr(pipeline_module, "fetch_evidence", fake_fetch)
     pipeline = Pipeline(db, make_settings(tmp_path))
@@ -1333,7 +1354,14 @@ def test_event_page_explains_ready_evidence_without_semantic_feature(
         VALUES('持续居住空间变化','持续居住空间变化',?,?,?,?)""",
         (now, now, now, now),
     )
-    for index, host in enumerate(("official.example", "news.example"), 1):
+    for index, (host, excerpt) in enumerate(
+        zip(
+            ("official.example", "news.example"),
+            (FULL_ARTICLE_ONE, FULL_ARTICLE_TWO),
+            strict=True,
+        ),
+        1,
+    ):
         db.execute(
             """INSERT INTO evidence
             (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash,
@@ -1343,7 +1371,7 @@ def test_event_page_explains_ready_evidence_without_semantic_feature(
                 event_id,
                 f"https://{host}/story",
                 f"Complete report {index}",
-                "A complete independent report documents a recurring consumer constraint.",
+                excerpt,
                 now,
                 f"hash-{index}",
                 host,
@@ -1375,8 +1403,8 @@ def test_evidence_metadata_migration_classifies_legacy_rows(tmp_path: Path) -> N
         """INSERT INTO evidence
         (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash)
         VALUES(?,'article','https://news.example/story','Story',
-        'A complete article excerpt long enough for analysis.',?,200,'article-hash')""",
-        (event_id, now),
+        ?,?,200,'article-hash')""",
+        (event_id, FULL_ARTICLE_ONE, now),
     )
     title_id = db.execute(
         """INSERT INTO evidence
@@ -1435,7 +1463,7 @@ def test_evidence_bundle_counts_sources_threshold_and_input_hash() -> None:
     assert insufficient.readiness_status == "insufficient"
     assert insufficient.full_text_count == 0
     assert insufficient.title_only_count == 3
-    assert insufficient.independent_source_count == 2
+    assert insufficient.independent_source_count == 0
     assert insufficient.readiness_score == 0.3
 
     ready_evidence = [
@@ -1457,7 +1485,7 @@ def test_evidence_bundle_counts_sources_threshold_and_input_hash() -> None:
             "fetch_status": "ready",
             "url": "https://news.example/report",
             "title": "Independent report",
-            "excerpt": "Independent reporting with enough detail about recurring conditions.",
+            "excerpt": FULL_ARTICLE_TWO,
             "valid_for_analysis": 1,
             "is_consumer_voice": 0,
         },
@@ -1562,10 +1590,7 @@ def test_event_research_view_handles_semantic_states_and_missing_data(
 
 @pytest.mark.asyncio
 async def test_public_page_fetcher_extracts_json_ld_and_follows_safe_redirects() -> None:
-    article_body = (
-        "Residents describe a recurring change in storage constraints and explain "
-        "how the same problem affects daily routines across multiple seasons."
-    )
+    article_body = FULL_ARTICLE_ONE
 
     def handler(request):
         if request.url.path == "/start":
@@ -1649,7 +1674,7 @@ async def test_related_news_collector_consumes_source_item_raw_urls() -> None:
         return EvidenceResult(
             url,
             title,
-            "A complete related report with recurring consumer behavior details.",
+            FULL_ARTICLE_ONE,
             "2026-07-17T00:00:00+00:00",
             200,
             hashlib.sha256(url.encode()).hexdigest(),
@@ -1664,6 +1689,179 @@ async def test_related_news_collector_consumes_source_item_raw_urls() -> None:
     assert len(items) == 1
     assert items[0].fetch_method == "related-news"
     assert items[0].evidence_type == "full_article"
+
+
+@pytest.mark.asyncio
+async def test_google_news_rss_search_decodes_and_audits_direct_urls() -> None:
+    requested = []
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss><channel>
+      <item><title>沈阳暴雨造成多处积水 - 新华社</title>
+        <link>https://news.google.com/rss/articles/one</link>
+        <description>沈阳暴雨造成多处积水，相关部门发布处置进展。</description>
+        <pubDate>Fri, 17 Jul 2026 10:00:00 GMT</pubDate><source>新华社</source></item>
+      <item><title>完全无关的体育消息 - 体育报</title>
+        <link>https://news.google.com/rss/articles/two</link>
+        <description>球队公布新赛季名单。</description><source>体育报</source></item>
+    </channel></rss>"""
+
+    def handler(request):
+        requested.append(request)
+        return httpx.Response(200, content=xml.encode("utf-8"))
+
+    async def decode(url: str) -> str | None:
+        assert url.endswith("/one")
+        return "https://local.news.example.cn/story?utm_source=google&ref=rss"
+
+    provider = GoogleNewsRssSearchProvider(
+        decoder=decode,
+        transport=httpx.MockTransport(handler),
+    )
+    hits = await provider.search("沈阳暴雨", market="CN", language="zh", limit=3)
+
+    assert len(hits) == 1
+    assert hits[0].url == "https://local.news.example.cn/story"
+    assert hits[0].source_name == "新华社"
+    assert hits[0].provider_url.endswith("/one")
+    assert len(hits[0].query_hash) == 64
+    assert dict(requested[0].url.params)["gl"] == "CN"
+    assert "when:7d" in dict(requested[0].url.params)["q"]
+
+
+@pytest.mark.asyncio
+async def test_public_news_collector_uses_one_result_per_registrable_domain() -> None:
+    class FakeProvider:
+        name = "fake-search"
+
+        async def search(self, query: str, **_kwargs) -> list[NewsSearchHit]:
+            return [
+                NewsSearchHit(
+                    url="https://a.example.co.uk/one",
+                    title=query,
+                    snippet="first",
+                    source_name="A",
+                    published_at=None,
+                    provider=self.name,
+                    rank=1,
+                    query_hash="a" * 64,
+                ),
+                NewsSearchHit(
+                    url="https://b.example.co.uk/two",
+                    title=query,
+                    snippet="same publisher domain",
+                    source_name="B",
+                    published_at=None,
+                    provider=self.name,
+                    rank=2,
+                    query_hash="a" * 64,
+                ),
+                NewsSearchHit(
+                    url="https://independent.example.org/three",
+                    title=query,
+                    snippet="second domain",
+                    source_name="C",
+                    published_at=None,
+                    provider=self.name,
+                    rank=3,
+                    query_hash="a" * 64,
+                ),
+            ]
+
+    async def fake_fetch(url: str, title: str) -> EvidenceResult:
+        excerpt = FULL_ARTICLE_ONE if "co.uk" in url else FULL_ARTICLE_TWO
+        return EvidenceResult(url, title, excerpt, "2026-07-17", 200, url)
+
+    items = await PublicNewsSearchCollector(
+        FakeProvider(), fetcher=fake_fetch, max_results=5
+    ).collect(
+        {"id": 1, "canonical_title": "storage constraints", "market": "GB"},
+        [],
+        ResearchBudget(max_search_queries=1, max_fetch_pages=3),
+    )
+
+    assert [registrable_domain(item.url) for item in items] == [
+        "example.co.uk",
+        "example.org",
+    ]
+    assert all(item.fetch_method == "public-news-search" for item in items)
+    assert all(item.raw_metadata["search_query_hash"] == "a" * 64 for item in items)
+
+
+@pytest.mark.asyncio
+async def test_fetcher_rejects_signal_pages_and_unrelated_article_content() -> None:
+    signal = await fetch_evidence(
+        "https://search.bilibili.com/all?keyword=storage",
+        "storage constraints",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=f"<html><title>Search</title><article>{FULL_ARTICLE_ONE}</article></html>",
+            )
+        ),
+        host_validator=lambda _host: True,
+    )
+    unrelated = await fetch_evidence(
+        "https://news.example/unrelated",
+        "沈阳暴雨",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text=f"<html><title>Storage research</title><article>{FULL_ARTICLE_ONE}</article></html>",
+            )
+        ),
+        host_validator=lambda _host: True,
+    )
+
+    assert signal.fetch_status == "content_too_short"
+    assert signal.evidence_type == "title_only"
+    assert "search, hot-list" in signal.error
+    assert unrelated.fetch_status == "content_irrelevant"
+    assert unrelated.evidence_type == "title_only"
+    assert "not relevant" in unrelated.error
+
+
+def test_independent_sources_collapse_subdomains_and_syndicated_copies() -> None:
+    rows = [
+        {
+            "id": 1,
+            "kind": "article",
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "url": "https://news.bbc.co.uk/one",
+            "excerpt": FULL_ARTICLE_ONE,
+            "valid_for_analysis": 1,
+        },
+        {
+            "id": 2,
+            "kind": "article",
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "url": "https://local.bbc.co.uk/two",
+            "excerpt": FULL_ARTICLE_TWO,
+            "valid_for_analysis": 1,
+        },
+        {
+            "id": 3,
+            "kind": "article",
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "url": "https://copied.example.net/three",
+            "excerpt": FULL_ARTICLE_ONE,
+            "valid_for_analysis": 1,
+        },
+    ]
+
+    bundle = build_evidence_bundle({"id": 1}, rows)
+    assert registrable_domain(rows[0]["url"]) == "bbc.co.uk"
+    assert registrable_domain(rows[1]["url"]) == "bbc.co.uk"
+    assert bundle.full_text_count == 3
+    assert bundle.independent_source_count == 1
+    assert bundle.readiness_status == "partial"
+    assert canonicalize_public_url("ftp://example.com/file") == ""
+    assert canonicalize_public_url("https://user:secret@example.com/file") == ""
+    assert canonicalize_public_url("https://example.com:bad/file") == ""
 
 
 def test_manual_evidence_api_is_idempotent_rebuilds_bundle_and_blocks_private_url(
@@ -1684,7 +1882,7 @@ def test_manual_evidence_api_is_idempotent_rebuilds_bundle_and_blocks_private_ur
         "source_name": "manual interview notes",
         "url": "",
         "title": "Recurring storage constraints",
-        "excerpt": "Multiple residents describe the same recurring storage constraint across seasons.",
+        "excerpt": FULL_ARTICLE_ONE,
         "is_consumer_voice": True,
         "note": "User supplied text",
     }
@@ -1926,7 +2124,7 @@ def make_research_chain(db: Database, *, ready: bool = True) -> tuple[int, list[
             values = (
                 "article",
                 "full_article",
-                "A complete independent report documents recurring consumer constraints over time.",
+                (FULL_ARTICLE_ONE, FULL_ARTICLE_TWO)[index - 1],
                 0.9,
                 1,
             )
@@ -2303,6 +2501,83 @@ async def test_controlled_research_tools_resume_enforce_budget_and_deduplicate_e
             "fetch_public_page",
             {"url": "https://third.example/report", "title": "Third"},
         )
+
+
+@pytest.mark.asyncio
+async def test_collect_related_news_falls_back_to_active_public_search(
+    tmp_path: Path,
+) -> None:
+    class FakeProvider:
+        name = "fake-search"
+
+        async def search(self, query: str, **_kwargs) -> list[NewsSearchHit]:
+            return [
+                NewsSearchHit(
+                    url="https://first-news.example/report",
+                    title=f"{query} first report",
+                    snippet="",
+                    source_name="first-news",
+                    published_at=None,
+                    provider=self.name,
+                    rank=1,
+                    query_hash="1" * 64,
+                ),
+                NewsSearchHit(
+                    url="https://second-press.example/report",
+                    title=f"{query} second report",
+                    snippet="",
+                    source_name="second-press",
+                    published_at=None,
+                    provider=self.name,
+                    rank=2,
+                    query_hash="1" * 64,
+                ),
+            ]
+
+    db = Database(tmp_path / "active-news-search.db")
+    db.initialize()
+    event_id, _evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    candidate = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    run = start_research_run(
+        db,
+        candidate,
+        ResearchRunInput(
+            executor_type="agent",
+            executor_name="search-agent",
+            budget=ResearchBudget(
+                max_search_queries=1,
+                max_fetch_pages=2,
+                timeout_seconds=30,
+            ),
+        ),
+    )
+
+    async def fake_fetch(url: str, title: str) -> EvidenceResult:
+        excerpt = FULL_ARTICLE_ONE if "first-news" in url else FULL_ARTICLE_TWO
+        return EvidenceResult(
+            url,
+            title,
+            excerpt,
+            "2026-07-17T00:00:00+00:00",
+            200,
+            hashlib.sha256(url.encode()).hexdigest(),
+        )
+
+    result = await ResearchToolExecutor(
+        db,
+        fetcher=fake_fetch,
+        news_search_provider=FakeProvider(),
+    ).execute(run, "collect_related_news", {})
+
+    saved = db.all(
+        "SELECT * FROM evidence WHERE event_id=? AND fetch_method='public-news-search' ORDER BY id",
+        (event_id,),
+    )
+    assert result["replayed"] is False
+    assert len(saved) == 2
+    assert all(json.loads(row["raw_metadata_json"])["search_query_hash"] for row in saved)
+    assert result["result"]["evidence_bundle"]["independent_source_count"] == 2
+    assert result["result"]["evidence_bundle"]["readiness_status"] == "ready_for_assessment"
 
 
 @pytest.mark.asyncio

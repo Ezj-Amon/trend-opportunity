@@ -17,10 +17,12 @@ from .evidence_bundle import (
 )
 from .evidence_collectors import (
     CollectedEvidence,
+    PublicNewsSearchCollector,
     RelatedNewsCollector,
     decode_evidence,
     persist_collected_evidence,
 )
+from .news_search import PublicNewsSearchProvider
 from .research import (
     ResearchBudget,
     ResearchToolResultInput,
@@ -49,14 +51,18 @@ class ResearchToolExecutor:
         self,
         db: Database,
         *,
-        evidence_bundle_version: str = "evidence-bundle-v1",
+        evidence_bundle_version: str = "evidence-bundle-v2",
         evidence_ready_score: float = 1.8,
         fetcher: EvidenceFetcher = fetch_evidence,
+        news_search_provider: PublicNewsSearchProvider | None = None,
+        public_news_max_results: int = 8,
     ):
         self.db = db
         self.evidence_bundle_version = evidence_bundle_version
         self.evidence_ready_score = evidence_ready_score
         self.fetcher = fetcher
+        self.news_search_provider = news_search_provider
+        self.public_news_max_results = public_news_max_results
 
     async def execute(self, run: dict, tool_name: str, request: dict) -> dict:
         if run["status"] != "running":
@@ -249,6 +255,32 @@ class ResearchToolExecutor:
             )
             for item in items
         ]
+        remaining = max(0, budget.max_fetch_pages - used - len(items))
+        if remaining and self.news_search_provider is not None:
+            current_evidence = self.db.all(
+                "SELECT * FROM evidence WHERE event_id=? ORDER BY id",
+                (event["id"],),
+            )
+            searched = await PublicNewsSearchCollector(
+                self.news_search_provider,
+                fetcher=self.fetcher,
+                max_results=self.public_news_max_results,
+            ).collect(
+                {**event, "source_items": source_items},
+                current_evidence,
+                ResearchBudget(
+                    **{
+                        **budget.model_dump(),
+                        "max_fetch_pages": remaining,
+                    }
+                ),
+            )
+            saved_items.extend(
+                persist_collected_evidence(
+                    self.db, int(event["id"]), item, allow_upgrade=True
+                )
+                for item in searched
+            )
         rebuilt = self._rebuild(event, int(candidate["id"]))
         return {
             "evidence": saved_items,

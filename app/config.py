@@ -42,13 +42,16 @@ class Settings:
     semantic_feature_version: str = "semantic-v1"
     semantic_duplicate_threshold: float = 0.90
     semantic_duplicate_window: int = 500
-    evidence_bundle_version: str = "evidence-bundle-v1"
+    evidence_bundle_version: str = "evidence-bundle-v2"
     evidence_ready_score: float = 1.8
     research_candidate_version: str = "research-candidate-v2"
     research_max_search_queries: int = 8
     research_max_fetch_pages: int = 15
     research_max_browser_pages: int = 3
     research_timeout_seconds: int = 300
+    enable_public_news_search: bool = True
+    public_news_max_results: int = 8
+    searxng_base_url: str | None = None
     enable_research_agent: bool = False
     enable_browser_evidence: bool = False
 
@@ -150,7 +153,7 @@ class Settings:
                 10, min(int(os.getenv("SEMANTIC_DUPLICATE_WINDOW", "500")), 5000)
             ),
             evidence_bundle_version=os.getenv(
-                "EVIDENCE_BUNDLE_VERSION", "evidence-bundle-v1"
+                "EVIDENCE_BUNDLE_VERSION", "evidence-bundle-v2"
             ).strip(),
             evidence_ready_score=max(
                 0.0, float(os.getenv("EVIDENCE_READY_SCORE", "1.8"))
@@ -169,6 +172,13 @@ class Settings:
             ),
             research_timeout_seconds=max(
                 1, int(os.getenv("RESEARCH_TIMEOUT_SECONDS", "300"))
+            ),
+            enable_public_news_search=_bool_env("ENABLE_PUBLIC_NEWS_SEARCH", True),
+            public_news_max_results=max(
+                1, min(int(os.getenv("PUBLIC_NEWS_MAX_RESULTS", "8")), 30)
+            ),
+            searxng_base_url=(
+                os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/") or None
             ),
             enable_research_agent=_bool_env("ENABLE_RESEARCH_AGENT"),
             enable_browser_evidence=_bool_env("ENABLE_BROWSER_EVIDENCE"),

@@ -5,16 +5,21 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
-
+from .evidence_quality import (
+    MIN_FULL_ARTICLE_CHARACTERS,
+    MIN_SUMMARY_CHARACTERS,
+    content_near_duplicate,
+    is_signal_page_url,
+    registrable_domain,
+)
 from .evidence_types import EvidenceType, FetchStatus, normalize_fetch_status
 
 if TYPE_CHECKING:
     from .db import Database
 
 
-EVIDENCE_QUALITY_VERSION = "evidence-quality-v1"
-DEFAULT_BUNDLE_VERSION = "evidence-bundle-v1"
+EVIDENCE_QUALITY_VERSION = "evidence-quality-v2"
+DEFAULT_BUNDLE_VERSION = "evidence-bundle-v2"
 DEFAULT_READY_SCORE = 1.8
 
 EVIDENCE_WEIGHTS = {
@@ -53,16 +58,34 @@ def classify_evidence_strength(row: dict) -> EvidenceType:
     excerpt = str(row.get("excerpt") or "").strip()
     valid = bool(row.get("valid_for_analysis", 1))
 
-    if kind == "hotlist":
+    if kind == "hotlist" or is_signal_page_url(str(row.get("url") or "")):
         return EvidenceType.TITLE_ONLY
-    if kind == "article" and valid and status == FetchStatus.READY and len(excerpt) >= 20:
-        return EvidenceType.FULL_ARTICLE
+    if status != FetchStatus.READY:
+        return EvidenceType.TITLE_ONLY
     if kind in {"official", "official_notice"} and valid:
         return EvidenceType.OFFICIAL_NOTICE
     if kind in {"manual", "manual_evidence"}:
         return EvidenceType.MANUAL_EVIDENCE
     if explicit in EvidenceType._value2member_map_:
-        return EvidenceType(explicit)
+        evidence_type = EvidenceType(explicit)
+        if evidence_type == EvidenceType.FULL_ARTICLE:
+            if valid and len(excerpt) >= MIN_FULL_ARTICLE_CHARACTERS:
+                return EvidenceType.FULL_ARTICLE
+            if valid and len(excerpt) >= MIN_SUMMARY_CHARACTERS:
+                return EvidenceType.ARTICLE_SUMMARY
+            return EvidenceType.TITLE_ONLY
+        if evidence_type == EvidenceType.ARTICLE_SUMMARY:
+            return (
+                EvidenceType.ARTICLE_SUMMARY
+                if valid and len(excerpt) >= MIN_SUMMARY_CHARACTERS
+                else EvidenceType.TITLE_ONLY
+            )
+        return evidence_type
+    if kind == "article" and valid:
+        if len(excerpt) >= MIN_FULL_ARTICLE_CHARACTERS:
+            return EvidenceType.FULL_ARTICLE
+        if len(excerpt) >= MIN_SUMMARY_CHARACTERS:
+            return EvidenceType.ARTICLE_SUMMARY
     return EvidenceType.TITLE_ONLY
 
 
@@ -71,15 +94,48 @@ def calculate_evidence_quality(row: dict) -> float:
     status = normalize_fetch_status(row)
     if status != FetchStatus.READY and evidence_type != EvidenceType.TITLE_ONLY:
         return 0.0
+    if evidence_type != EvidenceType.TITLE_ONLY and not bool(
+        row.get("valid_for_analysis", 1)
+    ):
+        return 0.0
     return EVIDENCE_WEIGHTS[evidence_type]
 
 
 def _source_identity(row: dict) -> str:
     url = str(row.get("url") or "").strip()
-    hostname = (urlparse(url).hostname or "").casefold().removeprefix("www.")
-    if hostname:
-        return hostname
+    domain = registrable_domain(url)
+    if domain:
+        return domain
     return str(row.get("source_name") or "unknown").strip().casefold() or "unknown"
+
+
+def _independent_source_rows(typed: list[tuple[dict, EvidenceType]]) -> list[dict]:
+    candidates = [
+        row
+        for row, evidence_type in typed
+        if bool(row.get("valid_for_analysis"))
+        and normalize_fetch_status(row) == FetchStatus.READY
+        and evidence_type not in {EvidenceType.TITLE_ONLY, EvidenceType.SEARCH_SNIPPET}
+    ]
+    representatives: list[dict] = []
+    used_domains: set[str] = set()
+    for row in sorted(
+        candidates,
+        key=lambda item: calculate_evidence_quality(item),
+        reverse=True,
+    ):
+        domain = _source_identity(row)
+        if domain in used_domains:
+            continue
+        excerpt = str(row.get("excerpt") or "")
+        if any(
+            content_near_duplicate(excerpt, str(existing.get("excerpt") or ""))
+            for existing in representatives
+        ):
+            continue
+        representatives.append(row)
+        used_domains.add(domain)
+    return representatives
 
 
 def _bundle_input_hash(evidence: list[dict]) -> str:
@@ -113,7 +169,12 @@ def build_evidence_bundle(
     typed = [(row, classify_evidence_strength(row)) for row in usable]
     readiness_score = round(sum(calculate_evidence_quality(row) for row in usable), 4)
     full_types = {EvidenceType.FULL_ARTICLE, EvidenceType.OFFICIAL_NOTICE}
-    full_text_count = sum(evidence_type in full_types for _, evidence_type in typed)
+    full_text_count = sum(
+        evidence_type in full_types
+        and bool(row.get("valid_for_analysis"))
+        and normalize_fetch_status(row) == FetchStatus.READY
+        for row, evidence_type in typed
+    )
     title_only_count = sum(
         evidence_type == EvidenceType.TITLE_ONLY for _, evidence_type in typed
     )
@@ -126,12 +187,7 @@ def build_evidence_bundle(
         in {EvidenceType.CONSUMER_DISCUSSION, EvidenceType.CONSUMER_COMMENT}
         for row, evidence_type in typed
     )
-    independent_sources = {
-        _source_identity(row)
-        for row in usable
-        if calculate_evidence_quality(row) > 0
-    }
-    independent_source_count = len(independent_sources)
+    independent_source_count = len(_independent_source_rows(typed))
 
     ready = (
         independent_source_count >= 2

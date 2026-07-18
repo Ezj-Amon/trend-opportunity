@@ -13,8 +13,15 @@ from typing import Awaitable, Callable
 from urllib.parse import parse_qsl, urljoin, urlparse
 
 import httpx
+import trafilatura
 from bs4 import BeautifulSoup
 
+from .evidence_quality import (
+    MIN_FULL_ARTICLE_CHARACTERS,
+    MIN_SUMMARY_CHARACTERS,
+    content_fingerprint,
+    validate_extracted_content,
+)
 from .evidence_types import EvidenceType, FetchStatus, normalize_fetch_status
 
 
@@ -41,12 +48,15 @@ class EvidenceResult:
                 {"error": self.error, "http_status": self.http_status}
             ).value
         if not self.evidence_type:
-            self.evidence_type = (
-                EvidenceType.FULL_ARTICLE.value
-                if self.fetch_status == FetchStatus.READY.value
-                and len(self.excerpt.strip()) >= 20
-                else EvidenceType.TITLE_ONLY.value
-            )
+            length = len(self.excerpt.strip())
+            if self.fetch_status != FetchStatus.READY.value:
+                self.evidence_type = EvidenceType.TITLE_ONLY.value
+            elif length >= MIN_FULL_ARTICLE_CHARACTERS:
+                self.evidence_type = EvidenceType.FULL_ARTICLE.value
+            elif length >= MIN_SUMMARY_CHARACTERS:
+                self.evidence_type = EvidenceType.ARTICLE_SUMMARY.value
+            else:
+                self.evidence_type = EvidenceType.TITLE_ONLY.value
 
 
 def _host_is_public(hostname: str) -> bool:
@@ -121,7 +131,9 @@ def _json_ld_text(soup: BeautifulSoup) -> list[str]:
     return values
 
 
-def _extract_html(raw: bytes, fallback_title: str) -> tuple[str, str, str]:
+def _extract_html(
+    raw: bytes, fallback_title: str, url: str
+) -> tuple[str, str, str, dict]:
     soup = BeautifulSoup(raw, "html.parser")
     title = fallback_title
     if soup.title and soup.title.string:
@@ -139,6 +151,37 @@ def _extract_html(raw: bytes, fallback_title: str) -> tuple[str, str, str]:
                 descriptions.append(value)
 
     json_ld_values = _json_ld_text(soup)
+    trafilatura_text = ""
+    trafilatura_metadata: dict[str, str] = {}
+    try:
+        document = trafilatura.bare_extraction(
+            raw,
+            url=url,
+            favor_recall=True,
+            include_comments=False,
+            include_tables=False,
+        )
+        if document is not None:
+            extracted = (
+                document.as_dict()
+                if hasattr(document, "as_dict")
+                else dict(document)
+                if isinstance(document, dict)
+                else {}
+            )
+            trafilatura_text = re.sub(
+                r"\s+", " ", str(extracted.get("text") or "")
+            ).strip()
+            extracted_title = str(extracted.get("title") or "").strip()
+            if extracted_title:
+                title = extracted_title
+            trafilatura_metadata = {
+                key: str(extracted[key])[:1000]
+                for key in ("author", "date", "sitename", "hostname")
+                if extracted.get(key)
+            }
+    except (TypeError, ValueError, AttributeError):
+        trafilatura_text = ""
     for element in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
         element.decompose()
     container = soup.find("article") or soup.find("main") or soup
@@ -148,7 +191,11 @@ def _extract_html(raw: bytes, fallback_title: str) -> tuple[str, str, str]:
     ]
     paragraphs = [value for value in paragraphs if len(value) >= 30]
 
-    body_values = [*json_ld_values, *paragraphs]
+    body_values = (
+        [trafilatura_text]
+        if trafilatura_text
+        else [*json_ld_values, *paragraphs]
+    )
     evidence_type = (
         EvidenceType.FULL_ARTICLE.value
         if body_values and len(" ".join(body_values)) >= 120
@@ -163,7 +210,10 @@ def _extract_html(raw: bytes, fallback_title: str) -> tuple[str, str, str]:
             unique.append(value)
             seen.add(value)
     excerpt = re.sub(r"\s+", " ", " ".join(unique)).strip()[:4000]
-    return title[:300], excerpt, evidence_type
+    return title[:300], excerpt, evidence_type, {
+        "extractor": "trafilatura-2" if trafilatura_text else "html-fallback-v2",
+        **trafilatura_metadata,
+    }
 
 
 def _looks_like_login_wall(title: str, raw_text: str) -> bool:
@@ -317,7 +367,9 @@ async def fetch_evidence(
 
         raw = response.content[:1_000_000]
         raw_text = response.text
-        title, excerpt, evidence_type = _extract_html(raw, fallback_title)
+        title, excerpt, evidence_type, extraction_metadata = _extract_html(
+            raw, fallback_title, current_url
+        )
         if _looks_like_login_wall(title, raw_text):
             return _failure(
                 current_url,
@@ -338,7 +390,24 @@ async def fetch_evidence(
                 response.status_code,
                 {"redirect_chain": redirect_chain},
             )
-        if not excerpt or evidence_type == EvidenceType.TITLE_ONLY.value:
+        validation = validate_extracted_content(
+            url=current_url,
+            expected_title=fallback_title,
+            extracted_title=title,
+            text=excerpt,
+        )
+        metadata = {
+            "redirect_chain": redirect_chain,
+            "raw_content_hash": hashlib.sha256(raw).hexdigest(),
+            "extraction": extraction_metadata,
+            "content_validation": {
+                "accepted": validation.accepted,
+                "content_level": validation.content_level,
+                "relevance_score": validation.relevance_score,
+                "reasons": list(validation.reasons),
+            },
+        }
+        if not excerpt or validation.content_level == EvidenceType.TITLE_ONLY.value:
             return _failure(
                 current_url,
                 title,
@@ -346,18 +415,34 @@ async def fetch_evidence(
                 FetchStatus.CONTENT_TOO_SHORT,
                 "content too short",
                 response.status_code,
-                {"redirect_chain": redirect_chain},
+                metadata,
             )
+        if not validation.accepted:
+            status = (
+                FetchStatus.CONTENT_IRRELEVANT
+                if any("not relevant" in reason for reason in validation.reasons)
+                else FetchStatus.CONTENT_TOO_SHORT
+            )
+            return _failure(
+                current_url,
+                title,
+                fetched_at,
+                status,
+                "; ".join(validation.reasons),
+                response.status_code,
+                metadata,
+            )
+        evidence_type = validation.content_level
         return EvidenceResult(
             url=current_url,
             title=title,
             excerpt=excerpt,
             fetched_at=fetched_at,
             http_status=response.status_code,
-            content_hash=hashlib.sha256(raw).hexdigest(),
+            content_hash=content_fingerprint(excerpt),
             evidence_type=evidence_type,
             fetch_status=FetchStatus.READY.value,
-            raw_metadata={"redirect_chain": redirect_chain},
+            raw_metadata=metadata,
         )
     except httpx.TimeoutException as exc:
         return _failure(

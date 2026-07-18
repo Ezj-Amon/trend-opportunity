@@ -1227,6 +1227,8 @@ async def execute_research_tool(
         db,
         evidence_bundle_version=settings.evidence_bundle_version,
         evidence_ready_score=settings.evidence_ready_score,
+        news_search_provider=pipeline.news_search_provider,
+        public_news_max_results=settings.public_news_max_results,
     )
     try:
         return await executor.execute(run, tool_name, value.request)

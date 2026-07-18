@@ -19,6 +19,7 @@ class EvidenceType(StrEnum):
 class FetchStatus(StrEnum):
     READY = "ready"
     CONTENT_TOO_SHORT = "content_too_short"
+    CONTENT_IRRELEVANT = "content_irrelevant"
     LOGIN_REQUIRED = "login_required"
     REDIRECT_BLOCKED = "redirect_blocked"
     JAVASCRIPT_REQUIRED = "javascript_required"
@@ -49,6 +50,8 @@ def normalize_fetch_status(row: dict) -> FetchStatus:
     if error:
         if "content too short" in error or "too short" in error or "正文过短" in error:
             return FetchStatus.CONTENT_TOO_SHORT
+        if "not relevant" in error or "content irrelevant" in error or "正文不相关" in error:
+            return FetchStatus.CONTENT_IRRELEVANT
         if any(value in error for value in ("login", "sign in", "登录")):
             return FetchStatus.LOGIN_REQUIRED
         if "redirect" in error or "重定向" in error:
