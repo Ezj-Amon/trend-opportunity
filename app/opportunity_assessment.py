@@ -124,39 +124,6 @@ class HumanAssessmentProvider:
         )
 
 
-class AbstainingRulesAssessmentProvider:
-    name = "abstaining-rules"
-
-    def __init__(self, version: str = "abstaining-rules-v1"):
-        self.version = version
-
-    async def assess(
-        self,
-        event: dict,
-        bundle: dict,
-        candidate: dict,
-        evidence: list[dict],
-    ) -> OpportunityAssessmentResult:
-        del event, candidate, evidence
-        insufficient = bundle["readiness_status"] != "ready_for_assessment"
-        draft = OpportunityAssessmentDraft(
-            assessment_status=("insufficient_evidence" if insufficient else "abstained"),
-            evidence_ids=list(bundle.get("evidence_ids") or []),
-            missing_evidence=list(bundle.get("missing_evidence") or []),
-            abstention_reason=(
-                "EvidenceBundle 未达到机会判断门槛。"
-                if insufficient
-                else "规则 Provider 不执行开放式消费变化判断，主动弃权。"
-            ),
-        )
-        return OpportunityAssessmentResult(
-            draft=draft,
-            engine=self.name,
-            model="",
-            version=self.version,
-        )
-
-
 class CloudOpportunityAssessmentProvider:
     name = "cloud-opportunity-assessment"
 

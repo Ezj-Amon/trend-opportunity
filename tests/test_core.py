@@ -42,7 +42,7 @@ from app.evidence_collectors import (
     related_news_targets,
 )
 from app.evidence_quality import canonicalize_public_url, registrable_domain
-from app.event_research import build_event_research_view
+from app.event_research import build_event_research_view, select_key_evidence
 from app.market_validation import MarketScores
 from app.opportunity_assessment import (
     CloudOpportunityAssessmentProvider,
@@ -64,6 +64,11 @@ from app.research_candidates import (
     candidate_from_event,
     is_commercial_research_blocked,
     persist_research_candidate,
+)
+from app.research_screening import (
+    persist_research_screening,
+    rescreen_pending_research_candidates,
+    screen_research_event,
 )
 from app.research_tools import ResearchToolExecutor
 from app.news_search import GoogleNewsRssSearchProvider, NewsSearchHit
@@ -844,7 +849,7 @@ def test_pending_queue_csv_import_and_target_marketplace_change(
         assert raw_import.json()["source_rows_scanned"]["商机探测器"] == 1
         page = client.get("/validation?marketplace=US")
         assert page.status_code == 200
-        assert "当前没有可进入市场验证的商品假设" in page.text
+        assert "当前没有可进入市场验证的商品方向" in page.text
         template = client.get("/api/market-validations/template.csv?marketplace=US")
         assert template.status_code == 200
         assert "backpack" not in template.text
@@ -962,8 +967,14 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
         event_page = client.get(f"/events/{event_id}")
     assert research_page.status_code == 200
     assert event_page.status_code == 200
-    assert "尚无可靠类目联想" in research_page.text
-    assert "尚无可靠类目联想" in event_page.text
+    assert "打开机会判断" in research_page.text
+    assert "已有部分证据" in research_page.text
+    assert "ResearchCandidate" not in research_page.text
+    assert "完成机会判断" in event_page.text
+    assert event_page.text.index("当前结论") < event_page.text.index("已采用的关键证据")
+    assert event_page.text.index("已采用的关键证据") < event_page.text.index("完成机会判断")
+    assert "系统与审计详情" in event_page.text
+    assert "人工创建一条可审计的机会线索" not in event_page.text
 
     class MissingModelExtractor:
         def extract(self, _text):
@@ -1000,6 +1011,174 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
         "SELECT status FROM research_candidates WHERE id=?", (fallback_candidate_id,)
     )["status"] == "superseded"
     assert db.all("SELECT * FROM opportunity_signals WHERE event_id=?", (event_id,)) == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_prefilter_rejects_event_before_page_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "prefilter-reject.db")
+    db.initialize()
+    now = "2026-07-22T00:00:00+00:00"
+    db.execute(
+        "INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,config_json) "
+        "VALUES('r','test','running','research',?,'{}')",
+        (now,),
+    )
+    snapshot_id = db.execute(
+        """INSERT INTO source_snapshots
+        (run_id,source,market,language,signal_type,fetched_at,success,latency_ms)
+        VALUES('r','news','CN','zh','news',?,1,10)""",
+        (now,),
+    )
+    item_id = db.execute(
+        """INSERT INTO source_items
+        (snapshot_id,source,market,language,signal_type,external_id,title,
+         normalized_title,url,rank,item_count,fetched_at,raw_json)
+        VALUES(?,'news','CN','zh','news','1',?,?,'https://sports.example/final',1,1,?,'{}')""",
+        (snapshot_id, "世界杯决赛赛果公布", "世界杯决赛赛果公布", now),
+    )
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "世界杯决赛赛果公布",
+            "世界杯决赛赛果公布",
+            "CN",
+            "zh",
+            "news",
+            99,
+            now,
+            now,
+            now,
+            now,
+        ),
+    )
+    db.execute(
+        "INSERT INTO event_members(event_id,source_item_id,match_method,match_score) "
+        "VALUES(?,?,'new',1)",
+        (event_id, item_id),
+    )
+    fetched_urls: list[str] = []
+
+    async def fail_if_fetched(url: str, _title: str) -> EvidenceResult:
+        fetched_urls.append(url)
+        raise AssertionError("rejected event must not fetch a public page")
+
+    monkeypatch.setattr(pipeline_module, "fetch_evidence", fail_if_fetched)
+    await Pipeline(db, make_settings(tmp_path))._build_research_candidate(event_id)
+
+    screening = db.one(
+        "SELECT * FROM research_screenings WHERE event_id=?", (event_id,)
+    )
+    assert screening is not None
+    assert screening["decision"] == "rejected"
+    assert "sports_or_match" in json.loads(screening["reason_codes_json"])
+    assert fetched_urls == []
+    assert db.all("SELECT * FROM evidence_collection_runs WHERE event_id=?", (event_id,)) == []
+    assert db.all("SELECT * FROM research_candidates WHERE event_id=?", (event_id,)) == []
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        override = client.post(
+            f"/api/research-screenings/{screening['id']}/review",
+            json={"decision": "collect_limited_evidence"},
+        )
+    assert override.status_code == 409
+    assert db.all("SELECT * FROM research_screening_reviews") == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stops_fetching_immediately_after_minimum_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "early-stop.db")
+    db.initialize()
+    now = "2026-07-22T00:00:00+00:00"
+    db.execute(
+        "INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,config_json) "
+        "VALUES('r','test','running','research',?,'{}')",
+        (now,),
+    )
+    snapshot_id = db.execute(
+        """INSERT INTO source_snapshots
+        (run_id,source,market,language,signal_type,fetched_at,success,latency_ms)
+        VALUES('r','news','US','en','news',?,1,10)""",
+        (now,),
+    )
+    direct_url = "https://first.example.com/story"
+    second_url = "https://second.example.org/story"
+    unused_url = "https://unused.example.net/story"
+    raw = json.dumps(
+        {
+            "news_urls": [second_url, unused_url],
+            "news_titles": ["Independent report", "Should not be fetched"],
+        }
+    )
+    item_id = db.execute(
+        """INSERT INTO source_items
+        (snapshot_id,source,market,language,signal_type,external_id,title,
+         normalized_title,url,rank,item_count,fetched_at,raw_json)
+        VALUES(?,'news','US','en','news','1',?,?,?,1,1,?,?)""",
+        (
+            snapshot_id,
+            "Long-term household storage constraints",
+            "longtermhouseholdstorageconstraints",
+            direct_url,
+            now,
+            raw,
+        ),
+    )
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "Long-term household storage constraints",
+            "longtermhouseholdstorageconstraints",
+            "US",
+            "en",
+            "news",
+            80,
+            now,
+            now,
+            now,
+            now,
+        ),
+    )
+    db.execute(
+        "INSERT INTO event_members(event_id,source_item_id,match_method,match_score) "
+        "VALUES(?,?,'new',1)",
+        (event_id, item_id),
+    )
+    fetched_urls: list[str] = []
+
+    async def fake_fetch(url: str, title: str) -> EvidenceResult:
+        fetched_urls.append(url)
+        excerpt = FULL_ARTICLE_ONE if url == direct_url else FULL_ARTICLE_TWO
+        return EvidenceResult(url, title, excerpt, now, 200, url)
+
+    monkeypatch.setattr(pipeline_module, "fetch_evidence", fake_fetch)
+    await Pipeline(db, make_settings(tmp_path))._build_research_candidate(event_id)
+
+    assert fetched_urls == [direct_url, second_url]
+    bundle = db.one(
+        "SELECT * FROM evidence_bundles WHERE event_id=? ORDER BY id DESC LIMIT 1",
+        (event_id,),
+    )
+    assert bundle["readiness_status"] == "ready_for_assessment"
+    assert bundle["independent_source_count"] == 2
+    collection = db.one(
+        "SELECT * FROM evidence_collection_runs WHERE event_id=?", (event_id,)
+    )
+    assert collection["fetch_attempt_count"] == 2
+    assert collection["stop_reason"] == "minimum_evidence_reached"
+    assert db.one(
+        "SELECT * FROM research_candidates WHERE event_id=? AND status='pending'",
+        (event_id,),
+    ) is not None
 
 
 def test_semantic_duplicate_candidates_require_review_and_never_auto_merge(
@@ -1067,53 +1246,43 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
 ) -> None:
     db = Database(tmp_path / "evidence-chain.db")
     db.initialize()
-    now = "2026-07-17T00:00:00+00:00"
-    db.execute(
-        """INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,config_json)
-        VALUES('run','test','completed','completed',?,'{}')""",
-        (now,),
-    )
-    event_id = db.execute(
-        """INSERT INTO trend_events
-        (canonical_title,normalized_title,market,language,signal_type,trend_score,
-         first_seen_at,last_seen_at,created_at,updated_at)
-        VALUES('Small homes need flexible pantry storage','smallhomes','US','en','search',80,?,?,?,?)""",
-        (now, now, now, now),
-    )
-    db.execute(
-        """INSERT INTO analyses
-        (event_id,run_id,engine,model,prompt_version,output_json,status,created_at)
-        VALUES(?,'run','rules','rules','v1','{}','succeeded',?)""",
-        (event_id, now),
-    )
-    evidence_id = db.execute(
-        """INSERT INTO evidence
-        (event_id,kind,url,title,excerpt,fetched_at,http_status,content_hash)
-        VALUES(?,'article','https://example.com/storage','Storage survey',
-        'Residents describe a recurring need for flexible pantry storage.',?,200,'hash')""",
-        (event_id, now),
-    )
+    event_id, evidence_ids, candidate_id = make_research_chain(db)
+    evidence_id = evidence_ids[0]
     monkeypatch.setattr(main_app, "db", db)
     with TestClient(main_app.app) as client:
-        created_signal = client.post(
+        disabled_direct_signal = client.post(
             f"/api/events/{event_id}/opportunity-signals",
+            json={"legacy": True},
+        )
+        assert disabled_direct_signal.status_code == 410
+        judgment = client.post(
+            f"/api/research-candidates/{candidate_id}/opportunity-judgment",
             json={
-                "change_type": "居住空间约束",
-                "consumer_relevance_score": 82,
-                "product_opportunity_score": 76,
-                "target_users": ["小户型住户"],
-                "new_scenarios": ["灵活调整食品储物空间"],
-                "unmet_needs": ["不用时可折叠且承重明确"],
-                "related_product_categories": ["家居收纳"],
-                "durability": "结构性",
-                "lead_time_fit": "适合常规打样周期",
-                "evidence_ids": [evidence_id],
-                "confidence": 70,
-                "missing_evidence": ["平台搜索证据"],
+                "assessment": {
+                    "assessment_status": "worth_following",
+                    "change_type": "居住空间约束持续变化",
+                    "consumer_relevance": "多来源显示小空间住户反复调整收纳方式。",
+                    "durability": "变化跨季节存在，并非一次性热点。",
+                    "lead_time_fit": "持续时间覆盖常规实体商品开发和运输周期。",
+                    "target_users": ["小空间住户"],
+                    "new_scenarios": ["灵活调整食品储物空间"],
+                    "unmet_needs": ["固定结构无法随空间调整"],
+                    "related_product_categories": ["家居收纳"],
+                    "fact_claims": [
+                        {"claim": "两个独立来源记录了重复约束。", "evidence_ids": evidence_ids}
+                    ],
+                    "inferences": [
+                        {"claim": "值得进入商品方向验证。", "evidence_ids": evidence_ids}
+                    ],
+                    "evidence_ids": evidence_ids,
+                    "missing_evidence": ["平台需求和竞争数据"],
+                },
+                "note": "完整主链测试",
             },
         )
-        assert created_signal.status_code == 200
-        signal_id = created_signal.json()["signal_id"]
+        assert judgment.status_code == 200
+        assert judgment.json()["opportunity_signal"]["review_status"] == "follow_up"
+        signal_id = judgment.json()["opportunity_signal"]["id"]
         hypothesis_payload = {
             "name": "Foldable pantry shelf insert",
             "physical_form": "可折叠钢架与可替换防滑脚垫组成的实体收纳架",
@@ -1126,16 +1295,6 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
             "target_marketplace": "US",
             "evidence_ids": [evidence_id],
         }
-        blocked_by_signal = client.post(
-            f"/api/opportunity-signals/{signal_id}/product-hypotheses",
-            json=hypothesis_payload,
-        )
-        assert blocked_by_signal.status_code == 409
-        assert client.post(
-            f"/api/opportunity-signals/{signal_id}/feedback",
-            json={"feedback_type": "follow_up", "note": "场景和需求证据明确"},
-        ).status_code == 200
-
         non_physical = dict(hypothesis_payload)
         non_physical["name"] = "Pantry planning software"
         non_physical["physical_form"] = "软件订阅服务"
@@ -1157,11 +1316,20 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
         )
         assert created.status_code == 200
         hypothesis_id = created.json()["hypothesis_id"]
+        feedback_after_downstream = client.post(
+            f"/api/opportunity-signals/{signal_id}/feedback",
+            json={"feedback_type": "wrong_category", "note": "尝试改写上游"},
+        )
+        assert feedback_after_downstream.status_code == 409
         assert client.post(
             f"/api/product-hypotheses/{hypothesis_id}/review",
             json={"status": "ready_for_validation", "note": "实体结构和查询词已确认"},
         ).status_code == 200
-        assert client.get("/validation").status_code == 200
+        validation_page = client.get("/validation")
+        assert validation_page.status_code == 200
+        assert "Foldable pantry shelf insert" in validation_page.text
+        assert "系统选出的产品机会" not in validation_page.text
+        assert "/api/opportunities/" not in validation_page.text
 
         partial_scores = {
             "search_demand_score": 4, "purchase_intent_score": 4,
@@ -1180,6 +1348,10 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
         assert partial.status_code == 200
         assert partial.json()["recommendation"] is None
         assert db.one("SELECT COUNT(*) n FROM validated_recommendations")["n"] == 0
+        assert client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/review",
+            json={"status": "draft", "note": "已有证据后尝试退回"},
+        ).status_code == 409
 
         completed_scores = {key: None for key in partial_scores}
         completed_scores["unit_economics_score"] = 4
@@ -1199,6 +1371,22 @@ def test_new_evidence_chain_only_recommends_after_all_gates(
         assert completed.json()["market_evidence"]["provider"] == "evidence-composite"
         assert client.get("/recommendations").status_code == 200
         assert "Foldable pantry shelf insert" in client.get("/recommendations").text
+        assert client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/review",
+            json={"status": "rejected", "note": "尝试改写已验证方向"},
+        ).status_code == 409
+        assert client.post(
+            f"/api/product-hypotheses/{hypothesis_id}/market-evidence",
+            json={
+                "provider": "manual",
+                "provider_version": "manual-v1",
+                "marketplace": "US",
+                "query": {},
+                "scores": partial_scores,
+                "metrics": {},
+                "sources": ["late evidence"],
+            },
+        ).status_code == 409
 
     recommendation = db.one("SELECT * FROM validated_recommendations")
     snapshot = json.loads(recommendation["snapshot_json"])
@@ -1237,12 +1425,22 @@ def test_dashboard_and_health_report_candidate_pipeline_not_local_rules(
         dashboard = client.get("/")
         health = client.get("/healthz")
     assert dashboard.status_code == 200
-    assert "Evidence → Candidate" in dashboard.text
+    assert "趋势发现" in dashboard.text
+    assert "机会判断" in dashboard.text
+    assert "商品方向" in dashboard.text
+    assert "已验证选品" in dashboard.text
+    assert 'class="system-menu"' in dashboard.text
+    assert "Evidence → Candidate" not in dashboard.text
     assert "local-rules-v2" not in dashboard.text
     assert health.status_code == 200
     assert health.json()["pipeline_mode"] == "evidence-bundle-research-candidate"
     assert health.json()["assessment_mode"] == "human-only"
     assert "analysis_engine" not in health.json()
+    assert "legacy_latest_analysis" not in health.json()
+    assert health.json()["legacy_audit"]["active_pipeline"] is False
+    assert health.json()["latest_pipeline_observation"]["selected_count"] == 0
+    assert health.json()["journey_metrics"]["pending_screening_reviews"] == 0
+    assert health.json()["journey_metrics"]["active_candidates"] == 0
 
 
 def test_overseas_analysis_quota_is_not_crowded_out(tmp_path: Path) -> None:
@@ -1386,7 +1584,8 @@ def test_event_page_explains_ready_evidence_without_semantic_feature(
     assert "证据已准备，等待机会判断" in page.text
     assert "完整正文 2" in page.text
     assert "独立来源 2" in page.text
-    assert "语义特征：</b>尚未运行" in page.text
+    assert "语义状态：尚未运行" in page.text
+    assert page.text.index("当前结论") < page.text.index("已采用的关键证据")
 
 
 def test_evidence_metadata_migration_classifies_legacy_rows(tmp_path: Path) -> None:
@@ -1515,6 +1714,92 @@ def test_evidence_bundle_counts_sources_threshold_and_input_hash() -> None:
     assert ready.readiness_score == 2.75
     assert ready.input_hash == reordered.input_hash
     assert ready.input_hash != changed.input_hash
+
+
+def test_evidence_bundle_accepts_reliable_summary_as_second_source() -> None:
+    evidence = [
+        {
+            "id": 1,
+            "kind": "article",
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "url": "https://first.example.com/report",
+            "title": "Full report",
+            "excerpt": FULL_ARTICLE_ONE,
+            "valid_for_analysis": 1,
+        },
+        {
+            "id": 2,
+            "kind": "article",
+            "evidence_type": "article_summary",
+            "fetch_status": "ready",
+            "url": "https://second.example.org/summary",
+            "title": "Independent summary",
+            "excerpt": (
+                "An independent newsroom confirmed the recurring household constraint "
+                "and described the affected users, timing, and source records."
+            ),
+            "valid_for_analysis": 1,
+        },
+    ]
+
+    bundle = build_evidence_bundle({"id": 1}, evidence)
+
+    assert bundle.readiness_score < 1.8
+    assert bundle.full_text_count == 1
+    assert bundle.independent_source_count == 2
+    assert bundle.readiness_status == "ready_for_assessment"
+    assert all("质量分" not in item for item in bundle.missing_evidence)
+
+
+def test_product_view_selects_only_two_strong_independent_key_evidence() -> None:
+    rows = [
+        {
+            "id": 1,
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "valid_for_analysis": 1,
+            "quality_score": 0.9,
+            "url": "https://news.example.com/one",
+            "source_name": "news-a",
+            "excerpt": FULL_ARTICLE_ONE,
+        },
+        {
+            "id": 2,
+            "evidence_type": "full_article",
+            "fetch_status": "ready",
+            "valid_for_analysis": 1,
+            "quality_score": 0.9,
+            "url": "https://local.example.com/two",
+            "source_name": "news-a-local",
+            "excerpt": FULL_ARTICLE_TWO,
+        },
+        {
+            "id": 3,
+            "evidence_type": "article_summary",
+            "fetch_status": "ready",
+            "valid_for_analysis": 1,
+            "quality_score": 0.55,
+            "url": "https://independent.example.org/three",
+            "source_name": "news-b",
+            "excerpt": "Independent reporting confirms the recurring consumer constraint.",
+        },
+        {
+            "id": 4,
+            "evidence_type": "title_only",
+            "fetch_status": "http_error",
+            "valid_for_analysis": 0,
+            "quality_score": 0,
+            "url": "https://failed.example.net/four",
+            "source_name": "failed",
+            "excerpt": "",
+        },
+    ]
+
+    selected = select_key_evidence(rows)
+
+    assert [row["id"] for row in selected] == [2, 3]
+    assert all(row["valid_for_analysis"] for row in selected)
 
 
 def test_evidence_bundle_persistence_is_idempotent_and_clear_is_fk_safe(
@@ -1911,6 +2196,225 @@ def test_manual_evidence_api_is_idempotent_rebuilds_bundle_and_blocks_private_ur
     assert credential_url.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("title", "expected", "reason"),
+    [
+        ("重庆山体崩塌已搜救出8名被困者", "rejected", "disaster_or_casualty"),
+        ("世界杯决赛赛果公布", "rejected", "sports_or_match"),
+        ("GitHub Copilot developer SDK released", "rejected", "software_or_digital"),
+        (
+            "Long-term household storage constraints in small apartments",
+            "eligible",
+            "physical_consumption_link_found",
+        ),
+        ("A viral topic with no described user or physical scenario", "needs_review", "physical_consumption_link_unclear"),
+    ],
+)
+def test_research_screening_is_explainable_before_fetch(
+    title: str, expected: str, reason: str
+) -> None:
+    decision = screen_research_event(
+        {"id": 1, "canonical_title": title, "market": "GLOBAL"}
+    )
+    assert decision.decision == expected
+    assert reason in decision.reason_codes
+    assert decision.explanation
+    assert len(decision.input_hash) == 64
+
+
+def test_screening_review_reject_is_visible_audited_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "screening-reject.db")
+    db.initialize()
+    now = "2026-07-22T00:00:00+00:00"
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "A viral topic with no described user or physical scenario",
+            "a viral topic with no described user or physical scenario",
+            "US",
+            "en",
+            "news",
+            70,
+            now,
+            now,
+            now,
+            now,
+        ),
+    )
+    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
+    screening = persist_research_screening(db, screen_research_event(event))
+
+    class NoCollectionPipeline:
+        async def collect_reviewed_screening(self, _screening_id: int):
+            raise AssertionError("reject must not start evidence collection")
+
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "settings", make_settings(tmp_path))
+    monkeypatch.setattr(main_app, "pipeline", NoCollectionPipeline())
+    with TestClient(main_app.app) as client:
+        page = client.get("/research")
+        rejected = client.post(
+            f"/api/research-screenings/{screening['id']}/review",
+            json={"decision": "reject", "note": "No stable physical scenario."},
+        )
+        repeated = client.post(
+            f"/api/research-screenings/{screening['id']}/review",
+            json={"decision": "reject", "note": "A different retry note is ignored."},
+        )
+        conflict = client.post(
+            f"/api/research-screenings/{screening['id']}/review",
+            json={"decision": "collect_limited_evidence"},
+        )
+        cleared_page = client.get("/research")
+        event_page = client.get(f"/events/{event_id}")
+
+    assert page.status_code == 200
+    assert "初筛待复核" in page.text
+    assert "允许有限补证" in page.text
+    assert rejected.status_code == repeated.status_code == 200
+    assert rejected.json()["collection"] is None
+    assert conflict.status_code == 409
+    reviews = db.all("SELECT * FROM research_screening_reviews")
+    assert len(reviews) == 1
+    assert reviews[0]["decision"] == "reject"
+    assert reviews[0]["note"] == "No stable physical scenario."
+    assert db.all("SELECT * FROM evidence_collection_runs") == []
+    assert db.all("SELECT * FROM research_candidates") == []
+    assert db.all("SELECT * FROM opportunity_signals") == []
+    assert "初筛待复核" not in cleared_page.text
+    assert "已人工排除" in event_page.text
+    assert "No stable physical scenario." in event_page.text
+
+
+@pytest.mark.asyncio
+async def test_screening_review_approval_runs_one_limited_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "screening-approve.db")
+    db.initialize()
+    now = "2026-07-22T00:00:00+00:00"
+    db.execute(
+        "INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,config_json) "
+        "VALUES('r','test','running','research',?,'{}')",
+        (now,),
+    )
+    snapshot_id = db.execute(
+        """INSERT INTO source_snapshots
+        (run_id,source,market,language,signal_type,fetched_at,success,latency_ms)
+        VALUES('r','news','US','en','news',?,1,10)""",
+        (now,),
+    )
+    direct_url = "https://first.example.com/ambiguous-story"
+    second_url = "https://second.example.org/independent-story"
+    raw = json.dumps(
+        {"news_urls": [second_url], "news_titles": ["Independent report"]}
+    )
+    title = "A viral topic with no described user or physical scenario"
+    item_id = db.execute(
+        """INSERT INTO source_items
+        (snapshot_id,source,market,language,signal_type,external_id,title,
+         normalized_title,url,rank,item_count,fetched_at,raw_json)
+        VALUES(?,'news','US','en','news','1',?,?,?,1,1,?,?)""",
+        (snapshot_id, title, title.casefold(), direct_url, now, raw),
+    )
+    event_id = db.execute(
+        """INSERT INTO trend_events
+        (canonical_title,normalized_title,market,language,signal_type,trend_score,
+         first_seen_at,last_seen_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (title, title.casefold(), "US", "en", "news", 80, now, now, now, now),
+    )
+    db.execute(
+        "INSERT INTO event_members(event_id,source_item_id,match_method,match_score) "
+        "VALUES(?,?,'new',1)",
+        (event_id, item_id),
+    )
+    fetched_urls: list[str] = []
+
+    async def fake_fetch(url: str, item_title: str) -> EvidenceResult:
+        fetched_urls.append(url)
+        excerpt = FULL_ARTICLE_ONE if url == direct_url else FULL_ARTICLE_TWO
+        return EvidenceResult(url, item_title, excerpt, now, 200, url)
+
+    monkeypatch.setattr(pipeline_module, "fetch_evidence", fake_fetch)
+    worker = Pipeline(db, make_settings(tmp_path))
+    initial = await worker._build_research_candidate(event_id)
+    assert initial["status"] == "screened_out"
+    screening_id = int(initial["screening_id"])
+    assert fetched_urls == []
+
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "settings", make_settings(tmp_path))
+    monkeypatch.setattr(main_app, "pipeline", worker)
+    with TestClient(main_app.app) as client:
+        approved = client.post(
+            f"/api/research-screenings/{screening_id}/review",
+            json={
+                "decision": "collect_limited_evidence",
+                "note": "Verify whether the article reveals a durable physical scenario.",
+            },
+        )
+        repeated = client.post(
+            f"/api/research-screenings/{screening_id}/review",
+            json={"decision": "collect_limited_evidence"},
+        )
+        conflict = client.post(
+            f"/api/research-screenings/{screening_id}/review",
+            json={"decision": "reject"},
+        )
+
+    assert approved.status_code == repeated.status_code == 200
+    assert approved.json()["collection"]["stop_reason"] == "minimum_evidence_reached"
+    assert approved.json()["candidate"] is not None
+    assert conflict.status_code == 409
+    assert fetched_urls == [direct_url, second_url]
+    assert db.one("SELECT COUNT(*) n FROM research_screening_reviews")["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM evidence_collection_runs")["n"] == 1
+    assert db.one(
+        "SELECT COUNT(*) n FROM research_candidates WHERE event_id=? AND status='pending'",
+        (event_id,),
+    )["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+
+
+def test_pending_candidate_rescreen_removes_legacy_out_of_scope_queue_items(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "candidate-rescreen.db")
+    db.initialize()
+    eligible_event, _eligible_evidence, eligible_candidate = make_research_chain(db)
+    blocked_event, _blocked_evidence, blocked_candidate = make_research_chain(db)
+    db.execute(
+        "UPDATE trend_events SET canonical_title=? WHERE id=?",
+        ("Long-term household storage constraints", eligible_event),
+    )
+    db.execute(
+        "UPDATE trend_events SET canonical_title=? WHERE id=?",
+        ("父亲在家长群公开夫妻矛盾被认定家暴", blocked_event),
+    )
+
+    result = rescreen_pending_research_candidates(db)
+
+    assert result == {"checked": 2, "superseded": 1}
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (eligible_candidate,)
+    )["status"] == "pending"
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (blocked_candidate,)
+    )["status"] == "superseded"
+    screening = db.one(
+        "SELECT * FROM research_screenings WHERE event_id=? ORDER BY id DESC LIMIT 1",
+        (blocked_event,),
+    )
+    assert "crime_or_harm" in json.loads(screening["reason_codes_json"])
+    assert eligible_event != blocked_event
+
+
 def test_research_candidate_keeps_research_scope_and_blocks_sensitive_events() -> None:
     bundle = {
         "id": 5,
@@ -1928,7 +2432,11 @@ def test_research_candidate_keeps_research_scope_and_blocks_sensitive_events() -
         "opportunity_similarity": -0.0316,
     }
     candidate = candidate_from_event(
-        {"id": 338, "canonical_title": "沈阳暴雨", "trend_score": 71.4},
+        {
+            "id": 338,
+            "canonical_title": "极端降雨频率持续上升影响户外通勤",
+            "trend_score": 71.4,
+        },
         bundle,
         semantic,
     )
@@ -1939,6 +2447,13 @@ def test_research_candidate_keeps_research_scope_and_blocks_sensitive_events() -
     dumped = candidate.model_dump_json()
     assert "Amazon" not in dumped and "售价" not in dumped and "商品名" not in dumped
     assert candidate.missing_evidence == bundle["missing_evidence"]
+
+    one_off_weather = candidate_from_event(
+        {"id": 342, "canonical_title": "沈阳暴雨", "trend_score": 92},
+        {**bundle, "readiness_status": "partial"},
+        semantic,
+    )
+    assert one_off_weather is None
 
     fallback_bundle = {**bundle, "readiness_status": "partial"}
     without_embedding = candidate_from_event(
@@ -2065,7 +2580,7 @@ def test_research_candidate_version_and_bundle_change_supersede_previous(
     ] == "superseded"
 
 
-def test_research_candidate_api_and_page_do_not_create_signal(
+def test_research_candidate_api_cannot_bypass_screening_and_collection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "candidate-api.db")
@@ -2102,11 +2617,36 @@ def test_research_candidate_api_and_page_do_not_create_signal(
         created = client.post(f"/api/events/{event_id}/research-candidates")
         listing = client.get("/api/research-candidates?status=pending")
         page = client.get("/research")
-    assert created.status_code == 200
-    assert created.json()["candidate"]["category_candidates"][0]["category"] == "出行户外"
-    assert len(listing.json()) == 1
-    assert page.status_code == 200 and "持续防雨场景" in page.text
+    assert created.status_code == 409
+    assert "必须先通过初筛" in created.json()["detail"]
+    assert listing.json() == []
+    assert page.status_code == 200
     assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+
+
+def test_research_candidate_status_api_rejects_unproven_transitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "candidate-transitions.db")
+    db.initialize()
+    _event_id, _evidence_ids, candidate_id = make_research_chain(db)
+    monkeypatch.setattr(main_app, "db", db)
+
+    with TestClient(main_app.app) as client:
+        completed = client.post(
+            f"/api/research-candidates/{candidate_id}/status",
+            json={"status": "completed"},
+        )
+        evidence_ready = client.post(
+            f"/api/research-candidates/{candidate_id}/status",
+            json={"status": "evidence_ready"},
+        )
+
+    assert completed.status_code == 409
+    assert evidence_ready.status_code == 409
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (candidate_id,)
+    )["status"] == "pending"
 
 
 def make_research_chain(db: Database, *, ready: bool = True) -> tuple[int, list[int], int]:
@@ -2178,6 +2718,70 @@ def make_research_chain(db: Database, *, ready: bool = True) -> tuple[int, list[
     return event_id, evidence_ids, candidate["id"]
 
 
+def test_legacy_signal_without_approved_assessment_cannot_create_product_direction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "legacy-signal-chain.db")
+    db.initialize()
+    event_id, evidence_ids, _candidate_id = make_research_chain(db)
+    now = "2026-07-17T00:00:00+00:00"
+    db.execute(
+        """INSERT INTO pipeline_runs(id,trigger,status,stage,started_at,finished_at,config_json)
+        VALUES('legacy-signal-run','test','completed','completed',?,?,'{}')""",
+        (now, now),
+    )
+    analysis_id = db.execute(
+        """INSERT INTO analyses
+        (event_id,run_id,engine,model,prompt_version,output_json,status,created_at)
+        VALUES(?,'legacy-signal-run','human','legacy','legacy','{}','succeeded',?)""",
+        (event_id, now),
+    )
+    signal_id = db.execute(
+        """INSERT INTO opportunity_signals
+        (event_id,analysis_id,change_type,consumer_relevance_score,
+         product_opportunity_score,target_users_json,new_scenarios_json,
+         unmet_needs_json,related_product_categories_json,durability,lead_time_fit,
+         evidence_ids_json,confidence,missing_evidence_json,review_status,
+         engine,model,version,created_at,updated_at)
+        VALUES (?,?,?,0,0,?,?,?,?,?,?,?,0,'[]','follow_up','human','legacy','legacy',?,?)""",
+        (
+            event_id,
+            analysis_id,
+            "legacy signal",
+            db.json(["small-space residents"]),
+            db.json(["flexible storage"]),
+            db.json(["fixed shelves"]),
+            db.json(["storage"]),
+            "recurring",
+            "fits delivery",
+            db.json(evidence_ids),
+            now,
+            now,
+        ),
+    )
+    monkeypatch.setattr(main_app, "db", db)
+
+    with TestClient(main_app.app) as client:
+        response = client.post(
+            f"/api/opportunity-signals/{signal_id}/product-hypotheses",
+            json={
+                "name": "Foldable shelf",
+                "physical_form": "foldable steel shelf",
+                "target_users": ["small-space residents"],
+                "scenarios": ["flexible storage"],
+                "problem": "fixed shelves waste space",
+                "expected_difference": "foldable adjustable structure",
+                "product_keywords": ["foldable shelf"],
+                "query_terms": ["foldable pantry shelf"],
+                "target_marketplace": "US",
+                "evidence_ids": evidence_ids,
+            },
+        )
+
+    assert response.status_code == 409
+    assert db.one("SELECT COUNT(*) n FROM product_hypotheses")["n"] == 0
+
+
 def test_research_run_is_idempotent_and_completes_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2209,6 +2813,12 @@ def test_research_run_is_idempotent_and_completes_candidate(
     assert db.one("SELECT status FROM research_candidates WHERE id=?", (candidate_id,))[
         "status"
     ] == "evidence_ready"
+
+
+def test_browser_research_budget_is_explicitly_unavailable() -> None:
+    assert ResearchBudget().max_browser_pages == 0
+    with pytest.raises(ValueError):
+        ResearchBudget(max_browser_pages=1)
 
 
 def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit(
@@ -2252,7 +2862,8 @@ def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit
     with TestClient(main_app.app) as client:
         audited_page = client.get(f"/events/{event_id}")
     assert "get_context" in audited_page.text
-    assert "工具调用审计（1）" in audited_page.text
+    assert "工具调用（1）" in audited_page.text
+    assert "系统与审计详情" in audited_page.text
     assert "公开页面 2" in audited_page.text
 
     failed_run = start_research_run(
@@ -2268,7 +2879,7 @@ def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit
     with TestClient(main_app.app) as client:
         page = client.get(f"/events/{event_id}")
     assert page.status_code == 200
-    assert "自动 Agent 未启用" in page.text
+    assert "自动执行器尚未接入" in page.text
     assert "failed-agent" in page.text
     assert "运行失败" in page.text
     assert "provider unavailable" in page.text
@@ -2333,6 +2944,14 @@ def test_human_assessment_requires_bundle_evidence_and_approved_review_creates_s
     db = Database(tmp_path / "assessment.db")
     db.initialize()
     event_id, evidence_ids, candidate_id = make_research_chain(db)
+    run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="human", executor_name="assessment-test"),
+    )
+    completed_run = complete_research_run(
+        db, run, ResearchRunCompleteInput(status="completed")
+    )
     other_event = db.execute(
         """INSERT INTO trend_events
         (canonical_title,normalized_title,first_seen_at,last_seen_at,created_at,updated_at)
@@ -2364,6 +2983,7 @@ def test_human_assessment_requires_bundle_evidence_and_approved_review_creates_s
         ],
         "evidence_ids": evidence_ids,
         "missing_evidence": ["平台需求数据"],
+        "research_run_id": completed_run["id"],
     }
     with TestClient(main_app.app) as client:
         invalid = client.post(
@@ -2388,12 +3008,18 @@ def test_human_assessment_requires_bundle_evidence_and_approved_review_creates_s
             f"/api/opportunity-assessments/{created.json()['id']}/review",
             json={"review_status": "approved", "note": "重复请求"},
         )
+        changed_review = client.post(
+            f"/api/opportunity-assessments/{created.json()['id']}/review",
+            json={"review_status": "rejected", "note": "尝试改写"},
+        )
     assert invalid.status_code == 400
     assert created.status_code == 200
     assert reviewed.status_code == 200
+    assert changed_review.status_code == 409
     signal = reviewed.json()["opportunity_signal"]
     assert signal["event_id"] == event_id
     assert signal["opportunity_assessment_id"] == created.json()["id"]
+    assert signal["review_status"] == "follow_up"
     assert signal["product_opportunity_score"] == 0
     assert reviewed_again.json()["opportunity_signal"]["id"] == signal["id"]
     assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 1
@@ -2409,12 +3035,115 @@ def test_human_assessment_requires_bundle_evidence_and_approved_review_creates_s
     assert {item["id"] for item in snapshot["evidence"]} >= set(evidence_ids)
 
 
+def test_event_workbench_completes_judgment_run_assessment_and_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "opportunity-judgment-workbench.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db)
+    monkeypatch.setattr(main_app, "db", db)
+    payload = {
+        "assessment": {
+            "assessment_status": "worth_following",
+            "change_type": "居住空间约束持续变化",
+            "consumer_relevance": "多来源显示小空间住户反复调整收纳方式。",
+            "durability": "变化跨季节存在，并非一次性热点。",
+            "lead_time_fit": "持续时间覆盖常规实体商品开发和运输周期。",
+            "target_users": ["小空间住户"],
+            "new_scenarios": ["房间用途频繁切换"],
+            "unmet_needs": ["固定结构无法随空间调整"],
+            "related_product_categories": ["家居收纳"],
+            "fact_claims": [
+                {
+                    "claim": "两个独立来源记录了重复出现的收纳约束。",
+                    "evidence_ids": evidence_ids,
+                }
+            ],
+            "inferences": [
+                {
+                    "claim": "该变化值得进入实体商品方向验证。",
+                    "evidence_ids": evidence_ids,
+                }
+            ],
+            "evidence_ids": evidence_ids,
+            "missing_evidence": ["平台需求和竞争数据"],
+        },
+        "note": "页面内人工确认",
+    }
+
+    with TestClient(main_app.app) as client:
+        before = client.get(f"/events/{event_id}")
+        result = client.post(
+            f"/api/research-candidates/{candidate_id}/opportunity-judgment",
+            json=payload,
+        )
+        after = client.get(f"/events/{event_id}")
+
+    assert before.status_code == 200
+    assert 'id="opportunity-judgment-form"' in before.text
+    assert 'name="judgment-evidence"' in before.text
+    assert "手填证据 ID" not in before.text
+    assert result.status_code == 200
+    body = result.json()
+    assert body["research_run"]["status"] == "completed"
+    assert body["assessment"]["review_status"] == "approved"
+    assert body["opportunity_signal"]["event_id"] == event_id
+    assert db.one("SELECT COUNT(*) n FROM research_runs")["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM opportunity_assessments")["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 1
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (candidate_id,)
+    )["status"] == "completed"
+    assert 'id="opportunity-judgment-form"' not in after.text
+    assert 'class="product-direction-form"' in after.text
+    assert "引用证据 ID" not in after.text
+
+
+def test_event_workbench_can_finish_with_more_evidence_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "opportunity-judgment-more-evidence.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    monkeypatch.setattr(main_app, "db", db)
+
+    with TestClient(main_app.app) as client:
+        result = client.post(
+            f"/api/research-candidates/{candidate_id}/opportunity-judgment",
+            json={
+                "assessment": {
+                    "assessment_status": "insufficient_evidence",
+                    "evidence_ids": evidence_ids,
+                    "missing_evidence": ["第二个独立来源"],
+                    "abstention_reason": "当前只有一个可分析来源，无法判断持续性。",
+                },
+                "note": "先补证据",
+            },
+        )
+
+    assert result.status_code == 200
+    assert result.json()["assessment"]["review_status"] == "needs_more_evidence"
+    assert result.json()["opportunity_signal"] is None
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (candidate_id,)
+    )["status"] == "insufficient_evidence"
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+
+
 def test_insufficient_assessment_cannot_be_approved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = Database(tmp_path / "insufficient-assessment.db")
     db.initialize()
     _event_id, evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="human", executor_name="insufficient-test"),
+    )
+    completed_run = complete_research_run(
+        db, run, ResearchRunCompleteInput(status="completed")
+    )
     monkeypatch.setattr(main_app, "db", db)
     with TestClient(main_app.app) as client:
         created = client.post(
@@ -2422,9 +3151,10 @@ def test_insufficient_assessment_cannot_be_approved(
             json={
                 "assessment_status": "insufficient_evidence",
                 "evidence_ids": evidence_ids,
-                "missing_evidence": ["完整正文"],
-                "abstention_reason": "只有标题证据",
-            },
+                    "missing_evidence": ["完整正文"],
+                    "abstention_reason": "只有标题证据",
+                    "research_run_id": completed_run["id"],
+                },
         )
         reviewed = client.post(
             f"/api/opportunity-assessments/{created.json()['id']}/review",

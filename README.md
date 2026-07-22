@@ -6,6 +6,8 @@
 
 本项目的核心定位是：从全球新闻趋势中发现可能孕育新品的消费变化，并将其整理成可验证的新品机会线索。趋势事件、机会线索、具体商品假设、平台市场证据和已验证推荐必须分层处理；没有平台证据时不得把商品假设包装成最终选品推荐。
 
+Web 主导航按用户任务收敛为“趋势发现 → 机会判断 → 商品方向 → 市场验证 → 已验证选品”。语义评测、数据源状态和审计记录位于“系统”二级入口；事件页优先展示当前结论、1–2 条关键证据和唯一下一步，未采用来源及模型、运行、工具细节默认折叠。
+
 固定产品模板、假设分代理市场分和未验证产品榜单已经在 Phase 0 停用。后续设计与开发以 [产品边界与分层架构](docs/product-boundary-and-architecture.md) 为准。
 
 ## 目标研究架构
@@ -23,11 +25,11 @@
 ```
 
 - 核心程序继续负责数据库、状态机、审计、风险门和定时运行，是唯一事实来源。
-- Evidence 工具负责公开网页、来源适配、浏览器和人工证据接入；MCP 只是可选工具接口。
+- Evidence 工具负责公开网页、来源适配和人工证据接入；MCP 只是可选工具接口。浏览器证据和独立自动 Agent 尚未接入执行器，也没有可误启用的环境开关。
 - Skill 固化研究步骤与证据标准，Agent 负责编排工具，大模型只对已有证据做带引用的综合。
 - Embedding 继续用于检索、跨语言匹配、重复候选和类目联想，不承担最终机会判断。
 
-该研究链的核心程序结构和阶段 0–7 接口已实现：包含不可变 `EvidenceBundle`、`ResearchCandidate`、可恢复 `ResearchRun`、受控研究工具、人工/规则/可选云端 `OpportunityAssessment`、引用校验和人工审核。默认 `ENABLE_EMBEDDINGS=false` 时，Pipeline 会为至少达到 `partial` 的安全 Bundle 创建无类目待研究 Candidate；纯标题 `insufficient` Bundle 仍显式弃权，Candidate 不生成商品名、查询词或需求结论。MCP 与浏览器登录态不是核心依赖，默认不启用；系统不会自动创建 OpportunitySignal。详细决策见 [研究架构](docs/research-agent-architecture.md)，表结构、接口与验收标准见 [实施计划](docs/research-agent-implementation-plan.md)，当前状态见 [HANDOFF](HANDOFF.md)。
+该研究链的核心程序结构和阶段 0–7 接口已实现：包含不可变 `EvidenceBundle`、`ResearchCandidate`、可恢复 `ResearchRun`、受控研究工具、人工/可选云端 `OpportunityAssessment`、引用校验和人工审核。Pipeline 会先执行可审计的快速初筛，明显的灾难、赛事、人物、软件/代码和医疗功效主题在正文深抓前退出；仅凭标题无法确认实体消费关联的事件进入 `/research` 的“初筛待复核”，由用户一次性选择排除或允许一次有限补证。自动通过和人工允许的补证都只搜索 1 次、尝试最多 4 个公开页面，并在取得 2 个独立来源且至少 1 篇完整正文或官方公告后立即停止。默认 `ENABLE_EMBEDDINGS=false` 时，Pipeline 仍可为至少达到 `partial` 的安全 Bundle 创建无类目待判断趋势；纯标题 `insufficient` Bundle 继续弃权。MCP 与浏览器登录态不是核心依赖，浏览器证据和独立自动 Agent 尚未接入；系统不会自动创建 OpportunitySignal。详细决策见 [研究架构](docs/research-agent-architecture.md)，表结构、接口与验收标准见 [实施计划](docs/research-agent-implementation-plan.md)，当前状态见 [HANDOFF](HANDOFF.md)。
 
 ## 当前能力
 
@@ -39,7 +41,11 @@
 - 可解释：趋势分由代码计算并显示所有分项；模型判断分、市场分和已验证推荐分分别保存。
 - 证据优先：热榜/搜索落地页只作为信号，不再伪装成正文；正文使用 Trafilatura 抽取并经过长度、模板污染和事件相关性校验。
 - 独立来源补证：默认通过无需密钥的 Google News RSS 主动查找原站报道并解码直链；可选接入自建 SearXNG。独立来源按注册域名计数，转载近重复内容不重复计数。
+- 抓取前初筛：先检查实体消费关联、持续性、交付周期和阻断风险；初筛决定和原因会单独保存，未通过事件不消耗正文抓取预算。
+- 初筛人工复核：消费关联不明确的 `needs_review` 事件会进入机会判断页；复核决定不可改写，排除不抓取，允许补证只执行一个有预算且可提前停止的采集记录。
+- 证据够用即停：逐页保存并重算 EvidenceBundle；达到 2 个独立来源且至少 1 篇完整正文或官方公告后立即停止，第二来源允许是通过质量校验的可靠摘要。
 - 研究分层：定时 Pipeline 只构建 EvidenceBundle 和 ResearchCandidate；可选云端模型只能生成带引用的 OpportunityAssessment，不能直接生成 Signal 或商品假设。
+- 页面机会判断：事件页可直接选择“值得跟进 / 不适合选品 / 需要补证据”，勾选已采用证据并提交结构化判断；一次操作沿受控状态链完成 ResearchRun、OpportunityAssessment 和人工审核，只有“值得跟进”且证据就绪时才创建已确认机会。
 - 安全门：死亡、犯罪和受害者相关敏感事件不生成商业化建议。
 - 主动弃权：证据不足、敏感事件或模型失败会形成显式弃权状态，不使用商品模板或本地规则伪装分析结果。
 - 推送门槛：单条商品只有完成人工审核、市场验证和风险门后才能作为已验证推荐推送，重复推送具有幂等保护。
@@ -48,11 +54,11 @@
 - 产品风险门：合规、IP、物流、季节性、供应链和单位经济性风险结构化记录，阻断级机会不能进入榜单、通过审核或推送。
 - 反馈闭环：支持保存审核原因、7 天结果和 30 天结果，为后续复盘提供标签。
 - OpportunitySignal 主链路：趋势事件与商品假设之间已有独立机会线索表，保存变化类型、消费关联、目标用户、新场景、未满足需求、实体类目、耐久性、交付周期、证据引用、缺失证据以及引擎/模型/版本。
-- 线索反馈：`/signals` 展示新品机会线索，`/feedback` 提供“值得跟进、无实体商品机会、消费关联弱、过于短期、类目错误、证据不足”六类反馈；每次反馈保存当时的趋势、证据、线索文本和模型版本快照。
+- 线索反馈：兼容页 `/signals` 仍可查看新品机会线索，系统二级入口中的 `/feedback` 提供“值得跟进、无实体商品机会、消费关联弱、过于短期、类目错误、证据不足”六类反馈；每次反馈保存当时的趋势、证据、线索文本和模型版本快照。
 - 可选语义基线：以 `intfloat/multilingual-e5-small` 为默认模型，用事件标题和短证据摘要生成向量，保存模型 ID、revision、输入哈希和特征版本；正负机会原型相似度与实体类目候选只用于发现和排序，不显示为需求概率。
 - 语义去重闭环：`/semantic-review` 展示语义重复候选和真实事件评测样本；候选保存模型/特征版本、输入哈希、词面相似度、市场和语言，人工反馈保留完整快照，永不自动合并事件。
-- 人工线索入口：事件详情可人工创建引用本事件证据的 OpportunitySignal，仍需在反馈队列审核为“值得跟进”。
-- 独立商品假设：`/hypotheses` 展示 `product_hypotheses`；只有已审核线索能创建实体商品草稿，非实体类型、阻断风险、缺少证据或查询词时不能进入验证。
+- 主流程不再提供绕过机会判断的人工 Signal 创建按钮；直接创建 Signal 的兼容 API 固定返回 410，所有新机会都必须来自证据就绪且已批准的 OpportunityAssessment。
+- 独立商品方向：事件页提供结构化表单并自动继承已确认机会的证据，`/hypotheses` 负责审核；只有完整受控链上的实体方向才能进入验证，每个机会最多保留 3 个有效方向。
 - 独立推荐链：`/validation` 写入 MarketEvidence；只有证据完整、单位经济和证据评分至少为 3、风险为低或中时，才在 `/recommendations` 生成可回溯的 ValidatedRecommendation。
 
 ## 快速启动
@@ -84,7 +90,7 @@ python -m pip install -e ".[dev]"
 
 ```powershell
 $env:ENABLE_PUBLIC_NEWS_SEARCH='true'
-$env:PUBLIC_NEWS_MAX_RESULTS='8'
+$env:PUBLIC_NEWS_MAX_RESULTS='4'
 # 可选：只填写自己控制或信任的 SearXNG 实例
 $env:SEARXNG_BASE_URL='https://search.example.com'
 ```
@@ -143,7 +149,7 @@ $env:PUBLIC_BASE_URL='http://你的可访问地址:8000'
 
 ## 商品假设、市场验证与推荐
 
-先在线索页把 OpportunitySignal 审核为“值得跟进”，再从事件详情人工创建具体实体商品假设。商品假设通过结构、证据引用和风险检查，并经人工审核后进入 `/validation`。完整操作见 [Amazon 一方数据验证流程](docs/amazon-first-party-validation.md)。
+先在事件页完成机会判断；“值得跟进”且证据就绪时会直接形成已确认机会，无需再到隐藏反馈页二次批准。随后在同一事件页填写结构化实体商品方向，系统自动引用上游证据；商品方向通过结构和风险检查并经审核后进入 `/validation`。完整操作见 [Amazon 一方数据验证流程](docs/amazon-first-party-validation.md)。
 
 系统不再从新闻关键词或规则类目自动生成 Amazon 查询词。查询词必须来自具体商品形态、目标用户和使用场景，并通过人工确认；修正查询词后旧市场验证自动失效。
 
@@ -152,7 +158,8 @@ $env:PUBLIC_BASE_URL='http://你的可访问地址:8000'
 新主链路使用可插拔 `MarketplaceDataProvider` 契约和以下 API：
 
 ```text
-POST /api/events/{event_id}/opportunity-signals
+POST /api/research-screenings/{screening_id}/review
+POST /api/research-candidates/{candidate_id}/opportunity-judgment
 POST /api/opportunity-signals/{signal_id}/product-hypotheses
 POST /api/product-hypotheses/{hypothesis_id}/review
 POST /api/product-hypotheses/{hypothesis_id}/amazon-raw-import

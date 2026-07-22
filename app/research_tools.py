@@ -55,7 +55,7 @@ class ResearchToolExecutor:
         evidence_ready_score: float = 1.8,
         fetcher: EvidenceFetcher = fetch_evidence,
         news_search_provider: PublicNewsSearchProvider | None = None,
-        public_news_max_results: int = 8,
+        public_news_max_results: int = 4,
     ):
         self.db = db
         self.evidence_bundle_version = evidence_bundle_version
@@ -238,34 +238,47 @@ class ResearchToolExecutor:
             (event["id"],),
         )
         used = self._used_fetch_pages(run)
-        collector = RelatedNewsCollector(fetcher=self.fetcher)
-        items = await collector.collect(
-            {**event, "source_items": source_items},
-            evidence,
-            ResearchBudget(
-                **{
-                    **budget.model_dump(),
-                    "max_fetch_pages": budget.max_fetch_pages - used,
-                }
-            ),
+        remaining = max(0, budget.max_fetch_pages - used)
+        saved_items: list[dict] = []
+        rebuilt = self._rebuild(event, int(candidate["id"]))
+        stop_reason = (
+            "existing_evidence_ready"
+            if rebuilt["readiness_status"] == "ready_for_assessment"
+            else ""
         )
-        saved_items = [
-            persist_collected_evidence(
-                self.db, int(event["id"]), item, allow_upgrade=True
-            )
-            for item in items
-        ]
-        remaining = max(0, budget.max_fetch_pages - used - len(items))
-        if remaining and self.news_search_provider is not None:
+        collector = RelatedNewsCollector(fetcher=self.fetcher)
+        if remaining and not stop_reason:
+            async for item in collector.iter_collect(
+                {**event, "source_items": source_items},
+                evidence,
+                ResearchBudget(
+                    **{
+                        **budget.model_dump(),
+                        "max_fetch_pages": remaining,
+                    }
+                ),
+            ):
+                saved_items.append(
+                    persist_collected_evidence(
+                        self.db, int(event["id"]), item, allow_upgrade=True
+                    )
+                )
+                rebuilt = self._rebuild(event, int(candidate["id"]))
+                if rebuilt["readiness_status"] == "ready_for_assessment":
+                    stop_reason = "minimum_evidence_reached"
+                    break
+        remaining = max(0, budget.max_fetch_pages - used - len(saved_items))
+        if remaining and not stop_reason and self.news_search_provider is not None:
             current_evidence = self.db.all(
                 "SELECT * FROM evidence WHERE event_id=? ORDER BY id",
                 (event["id"],),
             )
-            searched = await PublicNewsSearchCollector(
+            collector = PublicNewsSearchCollector(
                 self.news_search_provider,
                 fetcher=self.fetcher,
                 max_results=self.public_news_max_results,
-            ).collect(
+            )
+            async for item in collector.iter_collect(
                 {**event, "source_items": source_items},
                 current_evidence,
                 ResearchBudget(
@@ -274,17 +287,26 @@ class ResearchToolExecutor:
                         "max_fetch_pages": remaining,
                     }
                 ),
-            )
-            saved_items.extend(
-                persist_collected_evidence(
-                    self.db, int(event["id"]), item, allow_upgrade=True
+            ):
+                saved_items.append(
+                    persist_collected_evidence(
+                        self.db, int(event["id"]), item, allow_upgrade=True
+                    )
                 )
-                for item in searched
+                rebuilt = self._rebuild(event, int(candidate["id"]))
+                if rebuilt["readiness_status"] == "ready_for_assessment":
+                    stop_reason = "minimum_evidence_reached"
+                    break
+        if not stop_reason:
+            stop_reason = (
+                "fetch_budget_exhausted"
+                if used + len(saved_items) >= budget.max_fetch_pages
+                else "public_sources_exhausted"
             )
-        rebuilt = self._rebuild(event, int(candidate["id"]))
         return {
             "evidence": saved_items,
             "evidence_bundle": rebuilt,
+            "stop_reason": stop_reason,
         }, [int(item["id"]) for item in saved_items]
 
     def _rebuild(self, event: dict, candidate_id: int) -> dict:

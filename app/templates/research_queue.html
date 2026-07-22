@@ -1,27 +1,70 @@
 {% extends "base.html" %}
-{% block title %}研究队列 · 选品助手{% endblock %}
+{% block title %}机会判断 · 选品助手{% endblock %}
 {% block content %}
-<section class="hero compact-hero"><div><p class="eyebrow">RESEARCH QUEUE</p><h1>待研究方向</h1><p class="muted">类目联想只是研究导航；ResearchCandidate 不能进入商品假设或推荐队列。</p></div><div class="hero-score"><strong>{{ candidate_count }}</strong><span>候选总数</span></div></section>
-{% set labels = {'pending':'待研究','researching':'研究中','insufficient_evidence':'证据不足','awaiting_review':'等待审核','evidence_ready':'证据已准备','completed':'已完成','failed':'失败'} %}
-{% for status in ['awaiting_review','researching','pending','insufficient_evidence','evidence_ready','failed','completed'] %}
+<section class="hero compact-hero"><div><p class="eyebrow">OPPORTUNITY JUDGMENT</p><h1>机会判断</h1><p class="muted">先决定模糊趋势是否值得花一次小额补证预算，再判断消费变化是否值得跟进。这里不生成商品名，也不把趋势热度当作需求。</p></div><div class="hero-score"><strong>{{ work_item_count }}</strong><span>队列记录</span></div></section>
+{% set labels = {'pending':'等待判断','researching':'判断中','insufficient_evidence':'需要补证据','awaiting_review':'等待确认','evidence_ready':'可以判断','completed':'已完成','failed':'需要重试'} %}
+{% set readiness_labels = {'insufficient':'证据不足','partial':'已有部分证据','ready_for_assessment':'证据够用，可以判断'} %}
+{% if screening_reviews %}
+<section class="panel research-group screening-review-group">
+  <div class="panel-head"><div><h2>初筛待复核</h2><p class="muted">系统看不出明确实体消费关系。每条只能选择一次：允许最多 1 次搜索、4 个页面的有限补证，或直接排除。</p></div><span>{{ screening_review_count }} 条</span></div>
+  <div class="research-candidate-list">
+  {% for item in screening_reviews %}
+    <article class="research-candidate screening-review" data-screening-id="{{ item.id }}">
+      <div><a href="/events/{{ item.event_id }}"><strong>{{ item.event_title }}</strong></a><small>{{ item.market }} · 待决定是否补证</small></div>
+      <p>{{ item.explanation }}</p>
+      <small>初筛依据：{{ item.reason_codes|join('；') }}</small>
+      <label class="screening-note"><span>复核备注（可选）</span><textarea rows="2" maxlength="2000" placeholder="例如：存在稳定使用场景，值得核实正文"></textarea></label>
+      <div class="screening-actions">
+        <button type="button" class="primary" data-decision="collect_limited_evidence">允许有限补证</button>
+        <button type="button" class="ghost" data-decision="reject">排除</button>
+        <small class="screening-progress" aria-live="polite"></small>
+      </div>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% if work_item_count == 0 %}
+<section class="panel"><div class="empty"><h2>当前没有待判断趋势</h2><p>快速初筛没有发现值得投入研究预算的实体消费变化。这是合法结果，无需填满队列。</p><a class="button-link" href="/">返回趋势发现</a></div></section>
+{% endif %}
+{% for status in ['awaiting_review','researching','pending','insufficient_evidence','evidence_ready','failed','completed'] if grouped_candidates[status] %}
 <section class="panel research-group">
   <div class="panel-head"><h2>{{ labels[status] }}</h2><span>{{ grouped_candidates[status]|length }} 条</span></div>
   <div class="research-candidate-list">
   {% for item in grouped_candidates[status] %}
     <article class="research-candidate">
-      <div><a href="/events/{{ item.event_id }}"><strong>#{{ item.id }} · {{ item.event_title }}</strong></a><small>{{ item.market }} · 趋势 {{ item.trend_score }} · 优先级 {{ item.priority }}</small></div>
+      <div><a href="/events/{{ item.event_id }}"><strong>{{ item.event_title }}</strong></a><small>{{ item.market }} · {{ labels[status] }}</small></div>
       <p>{{ item.candidate_reason }}</p>
-      {% if item.category_candidates %}<div class="chips">{% for category in item.category_candidates %}<span>{{ category.category }} {{ '%.4f'|format(category.similarity) }}</span>{% endfor %}</div>{% else %}<small>尚无可靠类目联想；仅进入补证队列，不代表商品方向或需求结论。</small>{% endif %}
-      <small>证据准备度 {{ item.readiness_status }} / {{ item.readiness_score }} · 缺失：{{ item.missing_evidence|join('；') if item.missing_evidence else '无' }}</small>
-      {% if item.latest_run %}<small>最近 Run：{{ item.latest_run.executor_type }} / {{ item.latest_run.executor_name }} · {{ item.latest_run.status }}</small>{% endif %}
-      {% if item.latest_assessment %}<small>最近 Assessment：{{ item.latest_assessment.assessment_status }} · 审核 {{ item.latest_assessment.review_status }}</small>{% endif %}
-      {% if item.status in ['pending','evidence_ready','insufficient_evidence','failed'] %}<div><button class="compact primary" onclick="startRun({{ item.id }})">启动人工研究</button></div>{% endif %}
+      <small>{{ readiness_labels.get(item.readiness_status, '证据状态未知') }}{% if item.missing_evidence %} · 还需要：{{ item.missing_evidence|join('；') }}{% endif %}</small>
+      <div><a class="button-link compact" href="/events/{{ item.event_id }}">打开机会判断</a></div>
     </article>
-  {% else %}<div class="empty">当前没有{{ labels[status] }}候选。</div>{% endfor %}
+  {% endfor %}
   </div>
 </section>
 {% endfor %}
 {% endblock %}
-{% block scripts %}<script>
-async function startRun(candidateId){if(await postAction(`/api/research-candidates/${candidateId}/runs`,'ResearchRun 已启动',{executor_type:'human',executor_name:'research-queue',budget:{}}))setTimeout(()=>location.reload(),300);}
-</script>{% endblock %}
+{% block scripts %}
+<script>
+document.querySelectorAll('.screening-review button[data-decision]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const card = button.closest('.screening-review');
+    const decision = button.dataset.decision;
+    const progress = card.querySelector('.screening-progress');
+    const buttons = card.querySelectorAll('button');
+    buttons.forEach((item) => item.disabled = true);
+    progress.textContent = decision === 'reject' ? '正在记录排除决定…' : '正在执行有限补证，证据够用会提前停止…';
+    const body = await postAction(
+      `/api/research-screenings/${card.dataset.screeningId}/review`,
+      decision === 'reject' ? '已排除该趋势' : '有限补证已完成',
+      {decision, note: card.querySelector('textarea').value}
+    );
+    if (body) {
+      window.location.reload();
+      return;
+    }
+    progress.textContent = '操作未完成，请查看提示后重试。';
+    buttons.forEach((item) => item.disabled = false);
+  });
+});
+</script>
+{% endblock %}

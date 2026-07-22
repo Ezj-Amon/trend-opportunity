@@ -50,7 +50,11 @@ from .evidence_collectors import (
     persist_collected_evidence,
 )
 from .evidence_types import ManualEvidenceInput
-from .event_research import EVIDENCE_TYPE_LABELS, build_event_research_view
+from .event_research import (
+    EVIDENCE_TYPE_LABELS,
+    build_event_research_view,
+    select_key_evidence,
+)
 from .feishu import delivery_timestamp, send_daily_digest, send_opportunity
 from .market_evidence import ManualMarketplaceDataProvider, SellerCentralCsvProvider
 from .market_validation import (
@@ -60,7 +64,6 @@ from .market_validation import (
     result_from_input,
 )
 from .opportunity_signals import (
-    OpportunitySignalInput,
     SIGNAL_FEEDBACK_TYPES,
     decode_signal,
 )
@@ -103,6 +106,12 @@ from .research_candidates import (
     candidate_from_event,
     decode_research_candidate,
     persist_research_candidate,
+    transition_research_candidate,
+)
+from .research_screening import (
+    decode_research_screening,
+    pending_screening_review_rows,
+    record_screening_review,
 )
 from .research_tools import ResearchToolExecutionInput, ResearchToolExecutor
 from .scoring import calculate_final_score, calculate_market_score
@@ -176,6 +185,11 @@ class HypothesisReviewInput(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class ScreeningReviewInput(BaseModel):
+    decision: str = Field(min_length=1, max_length=64)
+    note: str = Field(default="", max_length=2000)
+
+
 class ResearchCandidateStatusInput(BaseModel):
     status: str = Field(min_length=1, max_length=64)
 
@@ -186,7 +200,12 @@ class AssessmentReviewInput(BaseModel):
 
 
 class CloudAssessmentInput(BaseModel):
-    research_run_id: str | None = Field(default=None, max_length=100)
+    research_run_id: str = Field(min_length=1, max_length=100)
+
+
+class OpportunityJudgmentInput(BaseModel):
+    assessment: OpportunityAssessmentDraft
+    note: str = Field(default="", max_length=2000)
 
 
 def opportunity_signal_rows(review_status: str | None = None, limit: int = 200) -> list[dict]:
@@ -299,7 +318,7 @@ def validated_recommendation_rows(limit: int = 200) -> list[dict[str, Any]]:
 def persist_hypothesis_market_evidence(
     hypothesis: dict[str, Any], result: MarketValidationResult
 ) -> dict[str, Any]:
-    if hypothesis["status"] not in {"ready_for_validation", "validated"}:
+    if hypothesis["status"] != "ready_for_validation":
         raise HTTPException(409, "hypothesis is not ready for market validation")
     marketplace = str(result.query.get("marketplace") or hypothesis["target_marketplace"]).upper()
     if marketplace != str(hypothesis["target_marketplace"]).upper():
@@ -787,6 +806,22 @@ async def dashboard(request: Request, market: str = "ALL"):
         *sorted({"CN", "GLOBAL", *settings.google_trends_geos, *market_counts}),
     )
     runs = db.all("SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 10")
+    journey_counts = {
+        "research": int(
+            db.one(
+                "SELECT COUNT(*) count FROM research_candidates WHERE status!='superseded'"
+            )["count"]
+        ),
+        "signals": int(
+            db.one(
+                """SELECT COUNT(*) count FROM opportunity_signals
+                WHERE review_status NOT IN ('superseded','rejected')"""
+            )["count"]
+        ),
+        "recommendations": int(
+            db.one("SELECT COUNT(*) count FROM validated_recommendations")["count"]
+        ),
+    }
     source_health = db.all(
         """SELECT s.* FROM source_snapshots s
         JOIN (SELECT source, MAX(id) id FROM source_snapshots GROUP BY source) latest
@@ -811,6 +846,7 @@ async def dashboard(request: Request, market: str = "ALL"):
             "market_counts": market_counts,
             "market_options": market_options,
             "digest": digest,
+            "journey_counts": journey_counts,
         },
     )
 
@@ -912,6 +948,67 @@ async def event_detail(request: Request, event_id: int):
     human_label = db.one(
         "SELECT * FROM semantic_evaluation_labels WHERE event_id=?", (event_id,)
     )
+    screening_row = db.one(
+        """SELECT * FROM research_screenings
+        WHERE event_id=? ORDER BY id DESC LIMIT 1""",
+        (event_id,),
+    )
+    research_screening = (
+        decode_research_screening(screening_row) if screening_row else None
+    )
+    if research_screening:
+        research_screening["decision_label"] = {
+            "eligible": "通过初筛",
+            "needs_review": "暂缓，等待人工确认",
+            "rejected": "不进入选品研究",
+        }.get(research_screening["decision"], "尚未确定")
+        reason_labels = {
+            "human_high_risk": "人工已标记为高风险",
+            "disaster_or_casualty": "灾难、伤亡或救援事件",
+            "crime_or_harm": "案件或人身伤害事件",
+            "sports_or_match": "赛事或赛果热点",
+            "person_or_gossip": "人物或八卦热点",
+            "software_or_digital": "软件、服务或代码项目",
+            "medical_or_regulated": "医疗功效或受监管主题",
+            "political_personnel": "政治人事或选举事件",
+            "one_off_or_lead_time_mismatch": "持续时间不匹配商品交付周期",
+            "physical_consumption_link_unclear": "实体消费关联尚不明确",
+            "physical_consumption_link_found": "发现实体消费用户或场景",
+            "durability_signal_found": "发现持续性变化信号",
+            "durability_requires_evidence": "持续性需要正文核实",
+        }
+        research_screening["reason_labels"] = [
+            reason_labels.get(code, "其他初筛依据")
+            for code in research_screening["reason_codes"]
+        ]
+    screening_review = (
+        db.one(
+            """SELECT * FROM research_screening_reviews
+            WHERE screening_id=?""",
+            (research_screening["id"],),
+        )
+        if research_screening
+        else None
+    )
+    if screening_review:
+        screening_review["decision_label"] = {
+            "collect_limited_evidence": "已允许一次有限补证",
+            "reject": "已人工排除",
+        }.get(screening_review["decision"], "已完成复核")
+    collection_outcome = db.one(
+        """SELECT * FROM evidence_collection_runs
+        WHERE event_id=? ORDER BY started_at DESC LIMIT 1""",
+        (event_id,),
+    )
+    if collection_outcome:
+        collection_outcome["stop_label"] = {
+            "minimum_evidence_reached": "证据够用，已停止继续抓取",
+            "existing_evidence_ready": "已有证据够用，无需重复抓取",
+            "fetch_budget_exhausted": "已用完本话题抓取预算",
+            "public_sources_exhausted": "未找到更多可用公开来源",
+            "fetch_disabled": "公开页面抓取已关闭",
+            "collector_failed": "采集过程异常中止",
+        }.get(collection_outcome["stop_reason"], "采集已结束")
     current_bundle = build_evidence_bundle(
         event,
         evidence,
@@ -928,6 +1025,11 @@ async def event_detail(request: Request, event_id: int):
         research_candidate,
         assessment_rows[0] if assessment_rows else None,
     )
+    key_evidence = select_key_evidence(evidence)
+    key_evidence_ids = {int(item["id"]) for item in key_evidence}
+    unused_evidence = [
+        item for item in evidence if int(item["id"]) not in key_evidence_ids
+    ]
     return templates.TemplateResponse(
         request,
         "event.html",
@@ -935,6 +1037,8 @@ async def event_detail(request: Request, event_id: int):
             "event": event,
             "members": members,
             "evidence": evidence,
+            "key_evidence": key_evidence,
+            "unused_evidence": unused_evidence,
             "opportunities": opportunities,
             "signals": signals,
             "product_hypotheses": [
@@ -944,11 +1048,12 @@ async def event_detail(request: Request, event_id: int):
             ],
             "semantic_feature": semantic_feature,
             "research_view": research_view,
+            "research_screening": research_screening,
+            "screening_review": screening_review,
+            "collection_outcome": collection_outcome,
             "research_candidate": research_candidate,
             "research_run": research_run,
             "research_tool_calls": research_tool_calls,
-            "research_agent_enabled": settings.enable_research_agent,
-            "browser_evidence_enabled": settings.enable_browser_evidence,
             "opportunity_assessments": assessment_rows,
             "evidence_type_labels": EVIDENCE_TYPE_LABELS,
             "feishu_configured": bool(settings.feishu_webhook_url),
@@ -1081,6 +1186,7 @@ def research_candidate_rows(status: str | None = None, limit: int = 500) -> list
 @app.get("/research", response_class=HTMLResponse)
 async def research_queue_page(request: Request):
     candidates = research_candidate_rows()
+    screening_reviews = pending_screening_review_rows(db)
     grouped = {
         status: [item for item in candidates if item["status"] == status]
         for status in (
@@ -1096,8 +1202,52 @@ async def research_queue_page(request: Request):
     return templates.TemplateResponse(
         request,
         "research_queue.html",
-        {"grouped_candidates": grouped, "candidate_count": len(candidates)},
+        {
+            "grouped_candidates": grouped,
+            "candidate_count": len(candidates),
+            "screening_reviews": screening_reviews,
+            "screening_review_count": len(screening_reviews),
+            "work_item_count": len(candidates) + len(screening_reviews),
+        },
     )
+
+
+@app.post("/api/research-screenings/{screening_id}/review")
+async def review_research_screening(screening_id: int, value: ScreeningReviewInput):
+    try:
+        review, created = record_screening_review(
+            db, screening_id, value.decision, value.note
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if value.decision == "reject":
+        return {"review": review, "collection": None, "candidate": None}
+    if not created:
+        screening = db.one(
+            "SELECT event_id FROM research_screenings WHERE id=?", (screening_id,)
+        )
+        collection = db.one(
+            """SELECT * FROM evidence_collection_runs
+            WHERE screening_id=? ORDER BY started_at DESC LIMIT 1""",
+            (screening_id,),
+        )
+        candidate = db.one(
+            """SELECT * FROM research_candidates WHERE event_id=?
+            ORDER BY id DESC LIMIT 1""",
+            (screening["event_id"],),
+        )
+        return {"review": review, "collection": collection, "candidate": candidate}
+    try:
+        result = await pipeline.collect_reviewed_screening(screening_id)
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "review": review,
+        "collection": result.get("collection_run"),
+        "candidate": result.get("candidate"),
+    }
 
 
 @app.get("/api/research-candidates")
@@ -1120,6 +1270,29 @@ async def api_research_candidate(candidate_id: int):
 @app.post("/api/events/{event_id}/research-candidates")
 async def create_event_research_candidate(event_id: int):
     event = _event_or_404(event_id)
+    screening = db.one(
+        """SELECT * FROM research_screenings
+        WHERE event_id=? ORDER BY id DESC LIMIT 1""",
+        (event_id,),
+    )
+    if screening is None or screening["decision"] == "rejected":
+        raise HTTPException(409, "创建待判断趋势必须先通过初筛")
+    if screening["decision"] == "needs_review":
+        review = db.one(
+            """SELECT * FROM research_screening_reviews
+            WHERE screening_id=? AND decision='collect_limited_evidence'""",
+            (screening["id"],),
+        )
+        if review is None:
+            raise HTTPException(409, "创建待判断趋势必须先批准初筛补证")
+    collection = db.one(
+        """SELECT * FROM evidence_collection_runs
+        WHERE screening_id=? AND status='completed'
+        ORDER BY finished_at DESC LIMIT 1""",
+        (screening["id"],),
+    )
+    if collection is None:
+        raise HTTPException(409, "创建待判断趋势必须先完成合规证据采集")
     bundle = _rebuild_event_bundle(event)
     semantic_feature = db.one(
         """SELECT * FROM semantic_event_features
@@ -1146,18 +1319,12 @@ async def update_research_candidate_status(
 ):
     if value.status not in RESEARCH_CANDIDATE_STATUSES - {"superseded"}:
         raise HTTPException(400, "invalid research candidate status")
-    row = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
-    if not row:
-        raise HTTPException(404, "research candidate not found")
-    if row["status"] == "superseded":
-        raise HTTPException(409, "research candidate has been superseded")
-    db.execute(
-        "UPDATE research_candidates SET status=?,updated_at=? WHERE id=?",
-        (value.status, utc_now(), candidate_id),
-    )
-    return decode_research_candidate(
-        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
-    )
+    try:
+        return transition_research_candidate(db, candidate_id, value.status)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def _candidate_or_404(candidate_id: int) -> dict:
@@ -1172,6 +1339,19 @@ def _research_run_or_404(run_id: str) -> dict:
     if not row:
         raise HTTPException(404, "research run not found")
     return decode_research_run(row)
+
+
+def _completed_candidate_run_or_409(candidate: dict, run_id: str | None) -> dict:
+    if candidate["status"] not in {"evidence_ready", "insufficient_evidence"}:
+        raise HTTPException(409, "candidate research must finish before assessment")
+    if not run_id:
+        raise HTTPException(409, "a completed research run is required")
+    run = _research_run_or_404(run_id)
+    if int(run["candidate_id"]) != int(candidate["id"]):
+        raise HTTPException(400, "research run belongs to another candidate")
+    if run["status"] != "completed":
+        raise HTTPException(409, "research run must be completed before assessment")
+    return run
 
 
 @app.post("/api/research-candidates/{candidate_id}/runs")
@@ -1281,8 +1461,7 @@ async def create_opportunity_assessment(
     candidate_id: int, value: OpportunityAssessmentDraft
 ):
     candidate = _candidate_or_404(candidate_id)
-    if candidate["status"] == "superseded":
-        raise HTTPException(409, "research candidate has been superseded")
+    _completed_candidate_run_or_409(candidate, value.research_run_id)
     bundle_row = db.one(
         "SELECT * FROM evidence_bundles WHERE id=?", (candidate["evidence_bundle_id"],)
     )
@@ -1293,10 +1472,6 @@ async def create_opportunity_assessment(
     evidence = db.all(
         "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (candidate["event_id"],)
     )
-    if value.research_run_id:
-        run = _research_run_or_404(value.research_run_id)
-        if int(run["candidate_id"]) != candidate_id:
-            raise HTTPException(400, "research run belongs to another candidate")
     provider = HumanAssessmentProvider(value)
     try:
         result = await provider.assess(event, bundle, candidate, evidence)
@@ -1304,10 +1479,7 @@ async def create_opportunity_assessment(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     assessment = persist_opportunity_assessment(db, candidate, bundle, result)
-    db.execute(
-        "UPDATE research_candidates SET status='awaiting_review',updated_at=? WHERE id=?",
-        (utc_now(), candidate_id),
-    )
+    transition_research_candidate(db, candidate_id, "awaiting_review")
     return assessment
 
 
@@ -1318,8 +1490,7 @@ async def create_cloud_opportunity_assessment(
     if not settings.openai_api_key:
         raise HTTPException(409, "cloud opportunity assessment is not configured")
     candidate = _candidate_or_404(candidate_id)
-    if candidate["status"] == "superseded":
-        raise HTTPException(409, "research candidate has been superseded")
+    _completed_candidate_run_or_409(candidate, value.research_run_id)
     bundle = decode_evidence_bundle(
         db.one(
             "SELECT * FROM evidence_bundles WHERE id=?",
@@ -1330,10 +1501,6 @@ async def create_cloud_opportunity_assessment(
     evidence = db.all(
         "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
     )
-    if value.research_run_id:
-        run = _research_run_or_404(value.research_run_id)
-        if int(run["candidate_id"]) != candidate_id:
-            raise HTTPException(400, "research run belongs to another candidate")
     provider = CloudOpportunityAssessmentProvider(
         settings.openai_api_key,
         settings.openai_model,
@@ -1346,10 +1513,7 @@ async def create_cloud_opportunity_assessment(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     assessment = persist_opportunity_assessment(db, candidate, bundle, result)
-    db.execute(
-        "UPDATE research_candidates SET status='awaiting_review',updated_at=? WHERE id=?",
-        (utc_now(), candidate_id),
-    )
+    transition_research_candidate(db, candidate_id, "awaiting_review")
     return assessment
 
 
@@ -1421,7 +1585,7 @@ def _create_signal_from_assessment(
          new_scenarios_json,unmet_needs_json,related_product_categories_json,
          durability,lead_time_fit,evidence_ids_json,confidence,
          missing_evidence_json,review_status,engine,model,version,created_at,updated_at)
-        VALUES (?,?,?, ?,0,0,?,?,?,?,?,?,?,0,?,'pending',?,?,?,?,?)""",
+         VALUES (?,?,?, ?,0,0,?,?,?,?,?,?,?,0,?,'follow_up',?,?,?,?,?)""",
         (
             event["id"],
             analysis_id,
@@ -1475,7 +1639,20 @@ async def review_opportunity_assessment(
     assessment = decode_opportunity_assessment(row)
     if assessment["review_status"] == "superseded":
         raise HTTPException(409, "assessment has been superseded")
+    if assessment["review_status"] != "pending":
+        if assessment["review_status"] != value.review_status:
+            raise HTTPException(409, "completed assessment reviews are immutable")
+        signal = None
+        if assessment["review_status"] == "approved":
+            signal_row = db.one(
+                "SELECT * FROM opportunity_signals WHERE opportunity_assessment_id=?",
+                (assessment_id,),
+            )
+            signal = decode_signal(signal_row) if signal_row else None
+        return {"assessment": assessment, "opportunity_signal": signal}
     candidate = _candidate_or_404(int(assessment["candidate_id"]))
+    if candidate["status"] != "awaiting_review":
+        raise HTTPException(409, "candidate is not awaiting an assessment review")
     bundle = decode_evidence_bundle(
         db.one(
             "SELECT * FROM evidence_bundles WHERE id=?",
@@ -1498,9 +1675,6 @@ async def review_opportunity_assessment(
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        signal = _create_signal_from_assessment(
-            assessment, candidate, bundle, event, evidence, value.note.strip()
-        )
         candidate_status = "completed"
     elif value.review_status == "needs_more_evidence":
         candidate_status = "insufficient_evidence"
@@ -1511,15 +1685,94 @@ async def review_opportunity_assessment(
         "UPDATE opportunity_assessments SET review_status=?,updated_at=? WHERE id=?",
         (value.review_status, now, assessment_id),
     )
-    db.execute(
-        "UPDATE research_candidates SET status=?,updated_at=? WHERE id=?",
-        (candidate_status, now, candidate["id"]),
+    reviewed_assessment = decode_opportunity_assessment(
+        db.one("SELECT * FROM opportunity_assessments WHERE id=?", (assessment_id,))
+    )
+    if value.review_status == "approved":
+        try:
+            signal = _create_signal_from_assessment(
+                reviewed_assessment,
+                candidate,
+                bundle,
+                event,
+                evidence,
+                value.note.strip(),
+            )
+        except Exception:
+            db.execute(
+                "UPDATE opportunity_assessments SET review_status='pending',updated_at=? WHERE id=?",
+                (utc_now(), assessment_id),
+            )
+            raise
+    transition_research_candidate(
+        db, int(candidate["id"]), candidate_status, now=now
     )
     return {
-        "assessment": decode_opportunity_assessment(
-            db.one("SELECT * FROM opportunity_assessments WHERE id=?", (assessment_id,))
-        ),
+        "assessment": reviewed_assessment,
         "opportunity_signal": signal,
+    }
+
+
+@app.post("/api/research-candidates/{candidate_id}/opportunity-judgment")
+async def complete_opportunity_judgment(
+    candidate_id: int, value: OpportunityJudgmentInput
+):
+    """Complete one human opportunity-judgment task through the governed state chain."""
+    candidate = _candidate_or_404(candidate_id)
+    if candidate["status"] in {"completed", "superseded"}:
+        raise HTTPException(409, "该待判断趋势已经完成或被替换")
+    pending = db.one(
+        """SELECT id FROM opportunity_assessments
+        WHERE candidate_id=? AND review_status='pending' ORDER BY id DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    if pending:
+        raise HTTPException(409, "已有待审核的机会判断，请先处理现有判断")
+
+    assessment_status = value.assessment.assessment_status
+    review_status = {
+        "worth_following": "approved",
+        "abstained": "rejected",
+        "insufficient_evidence": "needs_more_evidence",
+    }.get(assessment_status)
+    if review_status is None:
+        raise HTTPException(400, "无效的机会判断结果")
+
+    try:
+        run = start_research_run(
+            db,
+            candidate,
+            ResearchRunInput(
+                executor_type="human",
+                executor_name="opportunity-judgment-workbench",
+                budget=ResearchBudget(
+                    max_search_queries=settings.research_max_search_queries,
+                    max_fetch_pages=settings.research_max_fetch_pages,
+                    max_browser_pages=0,
+                    timeout_seconds=settings.research_timeout_seconds,
+                    markets=[],
+                    languages=[],
+                ),
+            ),
+        )
+        completed_run = complete_research_run(
+            db, run, ResearchRunCompleteInput(status="completed")
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    draft = value.assessment.model_copy(
+        update={"research_run_id": completed_run["id"]}
+    )
+    assessment = await create_opportunity_assessment(candidate_id, draft)
+    reviewed = await review_opportunity_assessment(
+        int(assessment["id"]),
+        AssessmentReviewInput(review_status=review_status, note=value.note),
+    )
+    return {
+        "research_run": completed_run,
+        "assessment": reviewed["assessment"],
+        "opportunity_signal": reviewed["opportunity_signal"],
     }
 
 
@@ -1575,6 +1828,11 @@ async def save_opportunity_signal_feedback(signal_id: int, value: SignalFeedback
         raise HTTPException(404, "opportunity signal not found")
     if signal["review_status"] == "superseded":
         raise HTTPException(409, "opportunity signal has been superseded")
+    if value.feedback_type != signal["review_status"] and db.one(
+        "SELECT id FROM product_hypotheses WHERE opportunity_signal_id=? LIMIT 1",
+        (signal_id,),
+    ):
+        raise HTTPException(409, "已有商品方向后不能改写上游机会结论")
     event = db.one("SELECT * FROM trend_events WHERE id=?", (signal["event_id"],))
     evidence_ids = decode_signal(signal)["evidence_ids"]
     evidence = []
@@ -1610,62 +1868,13 @@ async def save_opportunity_signal_feedback(signal_id: int, value: SignalFeedback
 
 
 @app.post("/api/events/{event_id}/opportunity-signals")
-async def create_manual_opportunity_signal(
-    event_id: int, value: OpportunitySignalInput
-):
-    event = db.one("SELECT * FROM trend_events WHERE id=?", (event_id,))
-    if not event:
+async def create_manual_opportunity_signal(event_id: int):
+    if not db.one("SELECT id FROM trend_events WHERE id=?", (event_id,)):
         raise HTTPException(404, "event not found")
-    valid_evidence = {
-        int(item["id"])
-        for item in db.all("SELECT id FROM evidence WHERE event_id=?", (event_id,))
-    }
-    if not set(value.evidence_ids).issubset(valid_evidence):
-        raise HTTPException(400, "signal cited evidence outside this event")
-    provenance = db.one(
-        """SELECT run_id FROM analyses WHERE event_id=? ORDER BY id DESC LIMIT 1""",
-        (event_id,),
-    ) or db.one(
-        """SELECT ss.run_id FROM event_members em
-        JOIN source_items i ON i.id=em.source_item_id
-        JOIN source_snapshots ss ON ss.id=i.snapshot_id
-        WHERE em.event_id=? ORDER BY ss.id DESC LIMIT 1""",
-        (event_id,),
+    raise HTTPException(
+        410,
+        "直接创建机会线索的兼容入口已停用；请通过待判断趋势完成机会判断",
     )
-    if not provenance:
-        raise HTTPException(409, "event has no pipeline provenance")
-    now = utc_now()
-    output = {
-        "event_summary": event["canonical_title"],
-        "inference_notice": "人工创建的 OpportunitySignal；仍需独立审核和后续市场验证。",
-        "signals": [value.model_dump()],
-        "opportunities": [],
-    }
-    analysis_id = db.execute(
-        """INSERT INTO analyses
-        (event_id,run_id,engine,model,prompt_version,output_json,status,created_at)
-        VALUES (?,?,'human','human-workbench','human-signal-v1',?,'succeeded',?)""",
-        (event_id, provenance["run_id"], db.json(output), now),
-    )
-    signal_id = db.execute(
-        """INSERT INTO opportunity_signals
-        (event_id,analysis_id,change_type,consumer_relevance_score,
-         product_opportunity_score,target_users_json,new_scenarios_json,
-         unmet_needs_json,related_product_categories_json,durability,lead_time_fit,
-         evidence_ids_json,confidence,missing_evidence_json,review_status,
-         engine,model,version,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending','human','human-workbench',
-                'human-signal-v1',?,?)""",
-        (
-            event_id, analysis_id, value.change_type,
-            value.consumer_relevance_score, value.product_opportunity_score,
-            db.json(value.target_users), db.json(value.new_scenarios),
-            db.json(value.unmet_needs), db.json(value.related_product_categories),
-            value.durability, value.lead_time_fit, db.json(value.evidence_ids),
-            value.confidence, db.json(value.missing_evidence), now, now,
-        ),
-    )
-    return {"status": "created", "signal_id": signal_id, "review_status": "pending"}
 
 
 @app.post("/api/events/{event_id}/semantic-label")
@@ -1916,14 +2125,59 @@ async def api_product_hypotheses(status: str | None = None, limit: int = 200):
     return product_hypothesis_rows(status, limit)
 
 
+def _assert_governed_signal_chain(signal: dict) -> dict:
+    assessment_id = signal.get("opportunity_assessment_id")
+    if not assessment_id:
+        raise HTTPException(409, "机会必须来自已批准的机会判断")
+    chain = db.one(
+        """SELECT a.assessment_status,a.review_status assessment_review_status,
+        c.status candidate_status,b.readiness_status
+        FROM opportunity_assessments a
+        JOIN research_candidates c ON c.id=a.candidate_id
+        JOIN evidence_bundles b ON b.id=a.evidence_bundle_id
+        WHERE a.id=? AND c.event_id=?""",
+        (assessment_id, signal["event_id"]),
+    )
+    if not chain:
+        raise HTTPException(409, "机会判断链不完整")
+    if (
+        chain["assessment_status"] != "worth_following"
+        or chain["assessment_review_status"] != "approved"
+        or chain["candidate_status"] != "completed"
+        or chain["readiness_status"] != "ready_for_assessment"
+    ):
+        raise HTTPException(409, "机会判断尚未满足商品方向准入条件")
+    if signal["review_status"] != "follow_up":
+        raise HTTPException(409, "只有已确认机会可以创建商品方向")
+    return chain
+
+
+def _assert_governed_hypothesis_chain(hypothesis: dict) -> dict:
+    signal_row = db.one(
+        "SELECT * FROM opportunity_signals WHERE id=?",
+        (hypothesis["opportunity_signal_id"],),
+    )
+    if not signal_row:
+        raise HTTPException(409, "商品方向缺少上游机会")
+    signal = decode_signal(signal_row)
+    _assert_governed_signal_chain(signal)
+    return signal
+
+
 @app.post("/api/opportunity-signals/{signal_id}/product-hypotheses")
 async def create_product_hypothesis(signal_id: int, value: ProductHypothesisInput):
     signal_raw = db.one("SELECT * FROM opportunity_signals WHERE id=?", (signal_id,))
     if not signal_raw:
         raise HTTPException(404, "opportunity signal not found")
-    if signal_raw["review_status"] != "follow_up":
-        raise HTTPException(409, "only a reviewed follow-up signal can create a hypothesis")
     signal = decode_signal(signal_raw)
+    _assert_governed_signal_chain(signal)
+    active_count = db.one(
+        """SELECT COUNT(*) n FROM product_hypotheses
+        WHERE opportunity_signal_id=? AND status!='rejected'""",
+        (signal_id,),
+    )["n"]
+    if int(active_count) >= 3:
+        raise HTTPException(409, "每个已确认机会最多保留 3 个有效商品方向")
     event = db.one("SELECT * FROM trend_events WHERE id=?", (signal["event_id"],))
     allowed_evidence = set(int(item) for item in signal["evidence_ids"])
     if not set(value.evidence_ids).issubset(allowed_evidence):
@@ -1971,6 +2225,25 @@ async def review_product_hypothesis(
     if not raw:
         raise HTTPException(404, "product hypothesis not found")
     hypothesis = decode_hypothesis(raw)
+    _assert_governed_hypothesis_chain(hypothesis)
+    current_status = hypothesis["status"]
+    if current_status == value.status:
+        return {"status": current_status, "feedback_id": None}
+    allowed_transitions = {
+        "draft": {"ready_for_validation", "rejected"},
+        "ready_for_validation": {"draft", "rejected"},
+        "rejected": set(),
+        "validated": set(),
+    }
+    if value.status not in allowed_transitions.get(current_status, set()):
+        raise HTTPException(
+            409, f"商品方向不能从 {current_status} 转为 {value.status}"
+        )
+    if current_status == "ready_for_validation" and db.one(
+        "SELECT id FROM market_evidence WHERE product_hypothesis_id=? LIMIT 1",
+        (hypothesis_id,),
+    ):
+        raise HTTPException(409, "已有市场证据后不能退回或否决商品方向")
     if value.status == "ready_for_validation":
         if hypothesis["risk_level"] == "blocking":
             raise HTTPException(409, "blocking risk must be resolved before validation")
@@ -2008,7 +2281,6 @@ async def validation_workbench(request: Request, marketplace: str = "ALL"):
         if marketplace.strip().upper() == "ALL"
         else normalize_target_marketplace(marketplace)
     )
-    rows = pending_validation_rows(target, 100)
     hypotheses = product_hypothesis_rows("ready_for_validation", 200)
     if target != "ALL":
         hypotheses = [
@@ -2026,16 +2298,9 @@ async def validation_workbench(request: Request, marketplace: str = "ALL"):
         request,
         "validation.html",
         {
-            "opportunities": rows,
             "hypotheses": hypotheses,
             "selected_marketplace": target,
             "marketplaces": AMAZON_MARKETPLACES,
-            "ready_count": sum(
-                item["query_readiness"] == "ready" for item in rows
-            ),
-            "waiting_count": sum(
-                item["query_readiness"] != "ready" for item in rows
-            ),
         },
     )
 
@@ -2062,6 +2327,7 @@ async def save_product_hypothesis_market_evidence(
     if not raw:
         raise HTTPException(404, "product hypothesis not found")
     hypothesis = decode_hypothesis(raw)
+    _assert_governed_hypothesis_chain(hypothesis)
     provider = ManualMarketplaceDataProvider(value)
     result = await provider.validate(hypothesis)
     return persist_hypothesis_market_evidence(hypothesis, result)
@@ -2075,6 +2341,7 @@ async def import_product_hypothesis_amazon_raw_files(
     if not raw:
         raise HTTPException(404, "product hypothesis not found")
     hypothesis = decode_hypothesis(raw)
+    _assert_governed_hypothesis_chain(hypothesis)
     provider = SellerCentralCsvProvider(
         value.product_opportunity_csv, value.hot_search_terms_csv
     )
@@ -2523,6 +2790,53 @@ async def healthz():
         """SELECT engine,model,status,error,created_at FROM analyses
         ORDER BY id DESC LIMIT 1"""
     )
+    run_started_at = str((latest_run or {}).get("started_at") or "")
+    screening_counts = {
+        item["decision"]: int(item["n"])
+        for item in (
+            db.all(
+                """SELECT decision,COUNT(*) n FROM research_screenings
+                WHERE created_at>=? GROUP BY decision""",
+                (run_started_at,),
+            )
+            if run_started_at
+            else []
+        )
+    }
+    collection_metrics = (
+        db.one(
+            """SELECT COUNT(*) collection_count,
+            COALESCE(SUM(fetch_attempt_count),0) fetch_attempt_count,
+            COALESCE(SUM(successful_document_count),0) successful_document_count,
+            COALESCE(SUM(CASE WHEN stop_reason='minimum_evidence_reached' THEN 1 ELSE 0 END),0)
+                minimum_evidence_stop_count
+            FROM evidence_collection_runs WHERE started_at>=?""",
+            (run_started_at,),
+        )
+        if run_started_at
+        else {
+            "collection_count": 0,
+            "fetch_attempt_count": 0,
+            "successful_document_count": 0,
+            "minimum_evidence_stop_count": 0,
+        }
+    )
+    selected_count = int((latest_run or {}).get("selected_count") or 0)
+    eligible_count = int(screening_counts.get("eligible", 0))
+    journey_metrics = db.one(
+        """SELECT
+        (SELECT COUNT(*) FROM research_screenings s
+         LEFT JOIN research_screening_reviews r ON r.screening_id=s.id
+         WHERE s.decision='needs_review' AND r.id IS NULL
+           AND s.id=(SELECT MAX(latest.id) FROM research_screenings latest
+                     WHERE latest.event_id=s.event_id)) pending_screening_reviews,
+        (SELECT COUNT(*) FROM research_candidates WHERE status!='superseded') active_candidates,
+        (SELECT COUNT(*) FROM opportunity_assessments WHERE review_status='pending') pending_assessments,
+        (SELECT COUNT(*) FROM opportunity_signals WHERE review_status='follow_up') confirmed_opportunities,
+        (SELECT COUNT(*) FROM product_hypotheses WHERE status='draft') draft_product_directions,
+        (SELECT COUNT(*) FROM product_hypotheses WHERE status='ready_for_validation') pending_market_validations,
+        (SELECT COUNT(*) FROM validated_recommendations WHERE status='active') validated_recommendations"""
+    )
     return {
         "status": "ok",
         "database": str(settings.database_path),
@@ -2536,7 +2850,23 @@ async def healthz():
             settings.reddit_client_id and settings.reddit_client_secret
         ),
         "latest_run": latest_run,
+        "latest_pipeline_observation": {
+            "selected_count": selected_count,
+            "screening_decisions": {
+                "eligible": eligible_count,
+                "needs_review": int(screening_counts.get("needs_review", 0)),
+                "rejected": int(screening_counts.get("rejected", 0)),
+            },
+            "screening_eligible_rate": (
+                round(eligible_count / selected_count, 4) if selected_count else None
+            ),
+            **collection_metrics,
+        },
+        "journey_metrics": journey_metrics,
         "latest_research_run": latest_research_run,
         "latest_assessment": latest_assessment,
-        "legacy_latest_analysis": legacy_latest_analysis,
+        "legacy_audit": {
+            "active_pipeline": False,
+            "latest_historical_analysis": legacy_latest_analysis,
+        },
     }

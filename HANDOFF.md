@@ -1,10 +1,10 @@
 # 项目交接：全球趋势驱动新品机会系统
 
-更新时间：2026-07-18
+更新时间：2026-07-22
 工作目录：`D:\code\xpzs`
 当前分支：`agent/research-architecture`
-当前 HEAD：`bcf8c57 Implement evidence-backed research architecture`
-Git 状态：当前分支已推送到 `origin/agent/research-architecture`，但尚未合并到 `main`，也未创建 PR；本轮二级正文与独立来源采集修复、测试和文档修改尚未提交。不要擅自提交、重置或推送。
+当前 HEAD：`fe04a96 Improve evidence collection and research workflow`
+Git 状态：`fe04a96` 已推送到 `origin/agent/research-architecture`，当前分支比 `main` 超前 3 个提交且尚未合并。本轮 2026-07-22 的快速初筛、证据早停、机会判断页面闭环、P1 信息架构收敛、测试和文档修改仍在工作区，尚未提交或推送。不要擅自提交、重置或推送。
 
 ## 1. 产品目标、唯一主链与本轮审查结论
 
@@ -19,7 +19,7 @@ Git 状态：当前分支已推送到 `origin/agent/research-architecture`，但
 ```text
 趋势发现
   -> 机会判断
-  -> 商品构思
+  -> 商品方向
   -> 市场验证
   -> 已验证选品
 ```
@@ -38,7 +38,7 @@ TrendEvent
 
 EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent、模型和工具调用属于“机会判断”的内部支撑，不再与五个用户业务阶段平级。事实、判断、假设和验证结果必须分层；缺少证据时允许为空或弃权，不允许用趋势分、规则分、模型置信度、向量相似度或假设分冒充市场需求。
 
-### 1.1 2026-07-18 全面审查结论
+### 1.1 2026-07-18 全面审查时的问题（历史基线）
 
 当前数据模型基本能承载正确目标，但运行和页面没有稳定沿着主链前进：
 
@@ -50,7 +50,7 @@ EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent
 6. 主导航和页面大量显示 EvidenceBundle、ResearchRun、语义差值、engine、model、version、HTTP 错误和请求哈希，内部工程概念压过了用户任务。
 7. 新旧商品机会和市场验证链仍同时展示，增加了结果解释和维护成本。
 
-准确判断不是“项目完全走错”，而是：**正确的业务骨架上叠加了过重的研究工程层，而且从证据到机会判断的页面闭环尚未完成。**
+当时的准确判断不是“项目完全走错”，而是：**正确的业务骨架上叠加了过重的研究工程层，而且从证据到机会判断的页面闭环尚未完成。** 第 2.6、2.7 节记录了本轮对这些问题的处理结果。
 
 ### 1.2 正文证据的权威停止规则
 
@@ -120,8 +120,8 @@ EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent
 - 未完成市场验证时，推荐分保持为空。
 - 首页和飞书摘要只展示事实层趋势，不展示未验证商品榜单。
 - 已建立独立 `opportunity_signals` 和反馈快照。
-- 支持人工创建 OpportunitySignal，但必须引用本事件证据。
-- 线索必须审核为 `follow_up` 才能创建商品假设。
+- OpportunitySignal 只能由证据就绪且已批准的 `worth_following` OpportunityAssessment 创建；直接人工 Signal API 已返回 410。
+- 已批准的机会判断直接形成 `follow_up` 线索，不再要求在隐藏反馈页二次确认后才能创建商品方向。
 
 ### 2.2 Phase 2 工程闭环：已完成
 
@@ -182,7 +182,7 @@ EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent
 - 兼容迁移会重新验证旧文章正文；只有通过长度、模板污染和正文相关性校验的内容才保留为 `full_article`/`article_summary`，hotlist、搜索页和伪正文降级为不可分析的 `title_only`。
 - 已新增不可变 `evidence_bundles` 快照、输入哈希、幂等持久化、历史分析事件回填和安全清理顺序。
 - Pipeline 会为被分析事件持久化 EvidenceBundle；近期分析直接复用时也会补 Bundle。
-- 已新增 `EventResearchView`，事件页按“结论、停止原因、类目联想、正负差值、证据覆盖、失败原因、缺失证据、下一步”展示。
+- 已新增 `EventResearchView`，事件页默认按“结论与当前阶段、1–2 条关键证据、机会判断/下一步”展示，停止原因、类目联想、正负差值、失败来源和运行审计折叠在技术详情中。
 - Embedding 的 disabled、unavailable、ready 和未运行状态以及人工标签均显示中文解释。
 - “沈阳暴雨”式三条纯标题证据固定为 `insufficient`，即使标题来自两个不同域名也不会升级为 partial。
 - 阶段 3：安全重定向逐跳校验公网地址，支持 meta、JSON-LD 和正文抽取、标准失败状态、Google Trends 关联新闻与人工证据 API。
@@ -190,7 +190,7 @@ EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent
 - 阶段 5：新增可恢复 `research_runs`、不可变 `opportunity_assessments`、人工/规则 Provider、引用校验和人工审核；只有批准 `worth_following` 才创建 OpportunitySignal。
 - 阶段 6：建立 `skills/trend-opportunity-research`，提供受控上下文、公开页面、关联新闻和 Bundle 重建工具；工具调用只保存请求哈希、状态、耗时和证据 ID，并执行租约、幂等、预算和凭证脱敏。
 - 阶段 7：新增可选 OpenAI Structured Outputs Provider；低质量 Bundle 和敏感事件在模型前拦截，模型失败显式弃权，Schema 禁止 ProductHypothesis 字段。
-- 事件页现在显示结论、停止原因、下一步、Candidate、Run 预算/工具审计、Assessment 和人工审核；研究工具补证据后会把当前 Candidate 前移到新的不可变 Bundle 快照。
+- 事件页主流程显示结论、当前阶段、关键证据、下一步、机会判断结果和下游业务对象；Candidate、Run 预算/工具审计、语义状态和旧版对象只在折叠审计详情中显示。研究工具补证据后会把当前 Candidate 前移到新的不可变 Bundle 快照。
 - MCP 和浏览器登录态仍不是核心依赖，浏览器证据默认关闭。系统不会自动创建 OpportunitySignal、商品假设或推荐。
 - 二级新闻补证已接入：Trafilatura 抽取正文，Google News RSS + `googlenewsdecoder` 作为默认无密钥搜索，SearXNG 作为可选第二 Provider；原站直链仍逐跳执行 SSRF 校验。
 - 独立来源按 Public Suffix List 的注册域计数；同域子站和跨域近重复转载不会被重复计算，纯标题也不再贡献独立来源数。
@@ -202,26 +202,82 @@ EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、Agent
 - 最新真实 Pipeline 已成功创建 9 个 ResearchCandidate，其中 5 个 `ready_for_assessment`、4 个 `partial`；说明正文补证入口已经生效。
 - 最新结果同时暴露了更重要的问题：候选包含山体崩塌、世界杯、软件/代码项目，且多个事件抓到 10–13 篇正文。后续优先级已从“继续提高正文数量”切换为“抓取前初筛、1–2 篇即停和机会判断页面闭环”。
 
+### 2.6 2026-07-22：三个 P0 已实现，初筛与早停已通过真实 Pipeline 验收
+
+- 新增独立、不可变的 `research_screenings` 初筛记录，保存输入哈希、决定、原因、命中信号和版本；明显的灾难/伤亡、案件、赛事、人物八卦、软件/代码、医疗功效和政治人事热点在正文抓取前退出。
+- 标题和来源摘要无法描述实体消费用户、场景或约束时标记为 `needs_review`，不消耗正文抓取预算；已出现实体消费关联但持续性不明确时，只进入有限正文核实。
+- Pipeline 在事件聚类和去重之后执行初筛；未通过事件只保留标题快照、初筛结果和不足 Bundle，不创建 Candidate。
+- 默认预算从 8 次搜索/15 个页面收紧为 1 次搜索/4 个页面，`ResearchBudget`、Pipeline、受控研究工具和示例配置已经统一。
+- 直接来源、关联新闻和公共搜索均改为逐页抓取；每保存一页就重算 Bundle，达到 2 个独立来源且至少 1 篇完整正文或官方公告后立即停止。
+- Bundle 就绪不再额外要求质量分达到 1.8；质量分保留为诊断指标，因此“1 篇完整正文 + 第 2 个可靠摘要”现在可以按产品规则进入判断。
+- 新增 `evidence_collection_runs`，审计尝试页数、成功正文数、独立来源数和停止原因；事件页显示中文初筛结论和停止原因。
+- 受控 `collect_related_news` 工具也改成逐页重算和早停，避免 Agent 补证继续一次抓满预算。
+- 事件页新增结构化“完成机会判断”表单：选择“值得跟进 / 不适合选品 / 需要补证据”，直接勾选已采用证据，不再手填证据 ID；单一接口沿原状态机完成 Human ResearchRun、OpportunityAssessment 和审核，只有证据就绪的 `worth_following` 才创建 OpportunitySignal。
+- 真实 Pipeline Run `07d45deb-1737-4673-8184-4b1c331dfaa2` 已完成：采集 328 条、形成 319 个事件、初筛 10 个最高优先级事件。9 个消费关联不清的话题未抓正文，1 个事件只尝试 2 个公开页面即达到 2 个独立来源并以 `minimum_evidence_reached` 停止。
+- 运行前已创建一致性备份：`data/backups/trends-before-screening-20260722-113338.db`。
+- 首轮真实验收发现“父亲在家长群公开夫妻矛盾被认定家暴”因缺少“家暴”风险表达而误放。规则已补充家暴、逝世、伤员、沉船、OpenAI/Hugging Face 等表达，并将初筛版本升级为 `research-screening-v2`。
+- 新增旧队列安全重筛：每次 Pipeline 会重筛尚未处理的 Candidate；本次对 10 个旧/新 pending Candidate 回填后，6 个明确拒绝、4 个消费关联不清，10 个均已 `superseded`，当前活跃研究队列为 0。
+- 临时数据库回归已经跑通一条 `Candidate -> completed ResearchRun -> approved Assessment -> Signal`，以及一条 `needs_more_evidence` 无 Signal 路径；真实库因当前没有通过初筛的活跃 Candidate，仍没有 Run、Assessment 或 Signal。这是合法空结果，不应人为制造机会。
+
+### 2.7 2026-07-22：P1 信息架构和中文主流程已完成
+
+- 主导航只保留“趋势发现、机会判断、商品方向、市场验证、已验证选品”；语义评测、反馈记录和系统状态移入“系统”二级入口，旧 `/signals` 只保留兼容访问。
+- Dashboard 以五阶段业务数量和用户状态为主；数据源状态和最近运行记录默认折叠，不再让 Provider、运行和模型信息占据主流程。
+- 事件页先显示一句话结论、当前业务阶段、唯一下一步和最多 2 条强且独立的关键证据；机会判断表单只让用户引用这组关键证据。
+- 未采用来源、抓取失败、趋势分项、语义特征、Candidate、ResearchRun、工具请求哈希、旧版商品机会和原始记录统一放入“系统与审计详情”。
+- `/research` 使用“待处理趋势 / 机会判断”中文任务语言；合法空队列会明确说明当前没有通过初筛的趋势，不再暗示系统失败。
+- 事件页已移除直接人工创建 OpportunitySignal 的旧入口；该兼容 API 已在 P2 固定返回 410，唯一 Signal 写入点是批准的机会判断。
+
+### 2.8 2026-07-22：P2 唯一状态链已完成
+
+- Candidate 状态只允许沿定义路径转换；`researching`、`evidence_ready`、`awaiting_review`、`completed` 等状态分别要求真实 Run、Bundle、Assessment 和 Signal 记录证明，状态 API 不能再任意跳转。
+- OpportunityAssessment 必须引用本 Candidate 已完成的 ResearchRun；审核一旦完成不可改写，同一批准 Assessment 通过唯一索引最多产生一个 Signal。
+- `POST /api/events/{event_id}/opportunity-signals` 已停用并返回 410；应用中唯一 Signal 写入点是批准 `worth_following` Assessment。
+- 已批准的机会判断直接生成 `follow_up` Signal。商品方向创建会复核 ready Bundle、completed Candidate 和 approved Assessment，旧 Signal 即使标记为 `follow_up` 也不能进入下游。
+- 每个已确认机会最多保留 3 个非否决商品方向；商品方向使用受控状态转换，写入 MarketEvidence 后不能退回或否决，`validated` 为终态。
+- 事件页使用结构化商品方向表单并自动引用上游证据，不再连续 prompt 或手填证据 ID。
+- `/validation` 只展示 `ready_for_validation` 的新 ProductHypothesis；旧 `product_opportunities` 队列和写按钮已退出用户页面，旧事件记录只保留折叠的只读迁移审计。
+- MarketEvidence 写入会复核完整上游链；只有市场证据完整、单位经济和证据评分至少 3、风险为 low/medium 才创建 ValidatedRecommendation。
+
+### 2.9 2026-07-22：第二次自然 Pipeline 观察通过
+
+- 运行前备份：`data/backups/trends-before-observation-20260722-122043.db`。
+- Pipeline Run `a2138bbf-be06-40e3-897b-2858a5a0ded3` 正常完成：采集 329 条、形成 319 个聚类事件、选择 10 个高优先级事件。
+- v2 初筛分布为 3 个 `rejected`、7 个 `needs_review`、0 个 `eligible`。拒绝项包括逝世、家暴和软件安全事件；“未来五年坐火车有这些变化”等标题因无法仅凭标题确认实体消费用户/场景而留在待复核而非盲目深抓。
+- 本次没有创建 `evidence_collection_runs`，说明 10 个事件均在页面抓取前退出；没有新增 Candidate，活跃研究队列仍为 0，也没有 Signal 或下游对象。
+- 真实库迁移后 `idx_opportunity_signals_assessment` 唯一索引存在，`PRAGMA foreign_key_check` 为空。
+
+### 2.10 2026-07-22：`needs_review` 初筛项已形成用户可操作闭环
+
+- 自然运行暴露出 7 个 `needs_review` 事件只写入审计表、没有进入任何用户任务的问题；`/research` 现在新增“初筛待复核”，展示每个事件的初筛解释和原因。
+- 新增不可变 `research_screening_reviews`：同一初筛只能选择一次“允许有限补证”或“排除”；相同请求幂等，冲突改写返回 409。
+- “排除”只保存人工决定，不发起页面抓取；“允许有限补证”复用 Pipeline 原有 1 次搜索、最多 4 页和证据够用即停路径，只形成一个 `evidence_collection_runs`。
+- 人工复核不会创建 Signal、商品方向或推荐；只有补证后的 Bundle 通过既有门槛才可能创建 Candidate。旧的按事件直接创建 Candidate API 也已收紧，必须存在最新合规初筛和已完成采集，不能绕过审计链。
+- 真实数据库迁移前备份：`data/backups/trends-before-screening-review-20260722-123631.db`。迁移只新增表和索引，没有替用户审批任何事件；当前共有 15 个尚未处理的最新 `needs_review`（最新自然运行 7 个，之前运行遗留 8 个），复核记录仍为 0，外键检查为空。
+
 ## 3. 真实数据库状态
 
-当前 `data/trends.db`（2026-07-18 最新真实运行后）：
+当前 `data/trends.db`（2026-07-22 两次真实 Pipeline 和旧队列安全重筛后）：
 
 ```text
-trend_events                    1415
-evidence                         156
-evidence_bundles                  94
+trend_events                    1814
+evidence                         176
+evidence_bundles                 115
+research_screenings               30
+research_screening_reviews          0（待复核 15）
+evidence_collection_runs           1
 opportunity_signals                0
 semantic_event_features           24
 semantic_evaluation_labels         7
 semantic_duplicate_candidates     11
-research_candidates                9
+research_candidates               10（全部 superseded，活跃 0）
 research_runs                      0
 research_tool_calls                0
 opportunity_assessments            0
 product_hypotheses                 0
 market_evidence                    0
 validated_recommendations          0
-pipeline_runs                      16
+pipeline_runs                      18
 legacy product_opportunities       34
 legacy market_validations          12
 ```
@@ -229,26 +285,27 @@ legacy market_validations          12
 当前证据和 Bundle 分布：
 
 ```text
-full_article ready                 58
-article_summary ready               2
-title_only ready                     9
-content_too_short                   67
+full_article ready                 59
+article_summary ready               3
+content_too_short                   89
 robots_or_access_denied              9
 http_error                           6
 content_irrelevant                   4
+login_required                       1
+title_only ready                     5
 
-EvidenceBundle insufficient         61
+EvidenceBundle insufficient         79
 EvidenceBundle partial              28
-EvidenceBundle ready_for_assessment  5
+EvidenceBundle ready_for_assessment  8
 ```
 
-零 OpportunitySignal、零商品假设和零推荐仍是合法结果，但已经不再能只用“缺少正文”解释。当前主要原因是：
+零 OpportunitySignal、零商品假设和零推荐仍是合法结果。当前主要原因是：
 
 - 定时 Pipeline 按设计只创建 ResearchCandidate，不自动创建 OpportunitySignal；
 - 默认未配置 OpenAI OpportunityAssessment Provider；
 - embedding 只用于候选特征，不允许自动生产线索；
-- 页面没有从 ResearchRun 到 OpportunityAssessment 的完整操作闭环；
-- 候选初筛不准确，研究预算被高热但不适合选品的事件占用。
+- 当前真实运行没有任何事件自动通过 v2 初筛形成活跃 Candidate；15 个最新 `needs_review` 已在页面等待人工决定是否允许有限补证；
+- 页面闭环已经可用，但不能为验收而人为制造机会或 Signal。
 
 ## 4. 问题诊断与已实现解法
 
@@ -292,18 +349,11 @@ EvidenceBundle
 
 不要把绕过登录、验证码或付费墙作为核心能力。
 
-### 4.2 页面已有解释结构，但仍不符合用户任务
+### 4.2 已解决：页面按用户任务组织
 
-事件页已经使用确定性的 `EventResearchView`，能够显示结论、证据计数、缺失项、失败原因和下一步；但本轮截图与模板审查确认，当前信息顺序仍会误导用户：
+事件页使用确定性的 `EventResearchView`，默认先显示当前结论、当前阶段、唯一下一步和最多 2 条强且独立的关键证据，再进入结构化机会判断。未采用来源、抓取失败、ResearchCandidate、ResearchRun、OpportunityAssessment 内部字段、语义特征、engine/model/version、请求哈希和旧版商品机会均在“系统与审计详情”中默认折叠。
 
-- “完整正文 10”下方直接突出很长的“抓取失败原因”，成功采用的正文没有先展示，用户容易理解成全部失败；
-- ResearchCandidate、ResearchRun、OpportunityAssessment、语义特征、engine/model/version 和原始英文错误直接暴露；
-- 页面把运行预算、工具审计和技术状态放在业务决策主链中；
-- “启动人工 ResearchRun”之后缺少完成机会判断的页面操作；
-- 人工创建 Signal 和商品假设依赖连续 prompt，并要求用户手填证据 ID；
-- 旧版商品机会和验证卡仍与新主链同时出现。
-
-后续页面必须先展示结论、当前阶段、已采用的 1–2 条关键证据和唯一下一步；未采用来源与技术审计默认折叠。详细中文命名和页面顺序以第 1.5 节为准。
+主导航、Dashboard、机会判断队列、商品方向、市场验证和已验证选品页面已统一为第 1.5 节的用户语言。直接人工创建 Signal 和旧验证写入口均已移除；商品方向使用结构化表单并自动继承上游证据。
 
 ### 4.3 “沈阳暴雨”案例
 
@@ -387,14 +437,15 @@ TrendEvent
 
 正文真实性、主动公共新闻搜索和独立来源去重已经生效。当前优先级不再是继续增加抓取量，而是让系统选对研究对象、证据够用即停并真正完成一次机会判断。
 
-### P0：抓取前快速初筛
+### P0：抓取前快速初筛（已完成真实运行验收）
 
 1. 在任何正文深度抓取前检查实体消费关联、持续性、交付周期、安全风险和重复事件。
 2. 明确排除灾难、伤亡、案件、赛事、人物、软件服务和代码项目。
 3. 不再仅按趋势分决定 ResearchCandidate；趋势热度只作为发现和排序的一部分。
 4. 初筛结果必须可解释，但不能生成商品名或购买需求结论。
+5. `needs_review` 必须进入用户可见复核队列；人工只能选择排除或批准一个受限采集记录，决定不可静默改写。
 
-### P0：每话题 1–2 篇正文，够用即停
+### P0：每话题 1–2 篇正文，够用即停（已完成真实运行验收）
 
 1. 默认门槛为 2 个独立来源、至少 1 篇完整正文或官方公告。
 2. 每抓取成功一个来源就重算 EvidenceBundle，而不是完成全部预算后才计算。
@@ -402,21 +453,21 @@ TrendEvent
 4. 只有事实冲突、高风险官方确认、仍无法判断消费场景或用户明确要求时扩大预算。
 5. 记录“为什么已经停止”，不只记录抓取失败。
 
-### P0：完成机会判断页面闭环
+### P0：完成机会判断页面闭环（页面与测试已完成，待真实样本）
 
 1. 把 ResearchRun 和 OpportunityAssessment 封装成一个“机会判断”用户任务。
 2. 页面内提供 Agent 草稿或结构化人工表单，并允许从已采用证据中勾选引用。
 3. 页面内完成“值得跟进 / 不适合选品 / 需要补证据”，不要求用户手填证据 ID。
 4. 真实完成至少 1 条 Candidate -> Assessment -> Signal 样本，再评估批量运营。
 
-### P1：简化信息架构和中文文案
+### P1：简化信息架构和中文文案（已完成）
 
 1. 主导航收敛到五个业务阶段；语义评测、运行日志和 Agent 配置退出主导航。
 2. 成功采用的证据优先展示，失败来源和技术审计默认折叠。
 3. 所有状态、空页面和错误信息使用中文，并给出唯一下一步。
 4. ResearchCandidate 与 OpportunityAssessment 在页面上统一归入“机会判断”。
 
-### P2：商品方向到市场验证闭环
+### P2：商品方向到市场验证闭环（已完成）
 
 1. 只从已确认 OpportunitySignal 生成少量 ProductHypothesis。
 2. 商品方向审核后进入唯一 MarketEvidence 链。
@@ -447,8 +498,11 @@ TrendEvent
 最后完整验证：
 
 ```text
-uv run pytest -q
-  -> 63 passed，1 个上游 TestClient 弃用警告
+uv run pytest -q tests\test_core.py
+  -> 78 passed，1 个上游 TestClient 弃用警告
+
+uv run pytest -q tests\test_live_sources.py
+  -> 2 passed
 
 python -m compileall -q app
   -> passed
@@ -460,13 +514,13 @@ git diff --check
   -> passed，仅 Windows LF/CRLF 提示
 
 PRAGMA foreign_key_check
-  -> []
+  -> 真实数据库迁移后 []；`research_screening_reviews` 与 `idx_opportunity_signals_assessment` 已建立
 
 Skill quick_validate
   -> Skill is valid!
 ```
 
-上述 63 项测试、迁移副本和“沈阳暴雨”联网样本是在最新真实 Pipeline 运行前完成的工程验证。此后真实 `data/trends.db` 已重新采集，当前状态以第 3 节为准：58 条 ready 完整正文、94 个 Bundle、5 个 ready Bundle、9 个 Candidate，仍无 Run、Assessment、Signal 或下游选品对象。
+2026-07-22 的 80 项分拆测试覆盖快速初筛不发起页面请求、`needs_review` 排除不抓取、批准只执行一个受限采集且幂等、旧 Candidate 安全重筛、逐页达到两个独立来源后立即停止、可靠摘要作为第二来源、受控工具早停、页面机会判断正向 Signal 路径和补证无 Signal 路径、关键证据最多 2 条且跨独立来源、Candidate 创建与状态旁路拦截、直接 Signal API 停用、旧 Signal 下游拦截、Assessment 审核不可变、商品方向与市场证据状态门，以及浏览器预算明确不可用；其中 78 项核心回归和 2 项真实外部来源测试均通过。真实数据库迁移和 Pipeline 已完成，外键检查为空，当前业务数量以第 3 节为准。
 
 全量测试包含真实外部来源。单次 NewsNow/Google Trends 失败应先单独复测，不要直接判定代码回归。
 
@@ -478,6 +532,7 @@ Skill quick_validate
 - 正文抓取：`app/evidence.py`
 - Evidence 类型与 Bundle：`app/evidence_types.py`、`app/evidence_bundle.py`
 - Evidence Collector：`app/evidence_collectors.py`
+- 抓取前快速初筛：`app/research_screening.py`
 - ResearchCandidate：`app/research_candidates.py`
 - ResearchRun 与受控工具：`app/research.py`、`app/research_tools.py`
 - OpportunityAssessment：`app/opportunity_assessment.py`
@@ -500,7 +555,7 @@ Skill quick_validate
 
 静态结构基本符合 `docs/research-agent-architecture.md` 和 `docs/research-agent-implementation-plan.md`：EvidenceBundle、ResearchCandidate、ResearchRun、OpportunityAssessment、OpportunitySignal 已分层；Bundle 和 Assessment 使用快照；引用、风险门、人工审核、受控工具、租约与幂等均已落地；定时 Pipeline 不会自动创建 Signal、商品假设或推荐；MCP 和浏览器登录态没有成为核心依赖。
 
-默认 `ENABLE_EMBEDDINGS=false` 的 Bundle -> Candidate 已通过真实运行验收，真实库已有 9 个 Candidate；但仍没有 Candidate -> Run -> Assessment -> Signal 人工样本。当前更准确的状态是：**证据抓取和 Candidate 入口已贯通，但候选初筛、抓取早停和真实机会判断闭环仍未完成。**
+默认 `ENABLE_EMBEDDINGS=false` 的 Bundle -> Candidate 已通过真实运行验收；抓取前初筛、人工复核、证据早停和页面机会判断闭环均已实现。真实库现有 10 个历史 Candidate 均被 v2 重筛安全 supersede，当前活跃 Candidate 为 0，也仍没有 Candidate -> Run -> Assessment -> Signal 人工样本。当前更准确的状态是：**系统已能把模糊初筛项交给用户决定是否花一次有限预算，并在证据够用后继续页面判断；下一步是处理真实待复核队列，而不是等待这些记录静默消失。**
 
 ### 10.2 已解决：默认配置可以进入 ResearchCandidate
 
@@ -508,7 +563,7 @@ Skill quick_validate
 
 证据：默认 Pipeline 回归测试直接断言 `disabled` 特征仍创建无类目 Candidate、页面显示非结论提示、后续 ready 特征可安全替换并 supersede；真实数据库副本的实际 Pipeline Candidate 阶段也创建成功，未创建 Signal，外键检查通过。
 
-剩余事项：`/research` 已有 9 个候选，但候选质量不符合产品目标，且页面不能独立完成机会判断。问题已从“入口不可达”转为“选错对象、抓取过量和操作闭环缺失”。
+剩余事项：用户在 `/research` 逐条复核真实 `needs_review` 队列；只对确有稳定实体消费场景的事件允许有限补证。若自然形成 Candidate，再在事件页完成一次机会判断；不为验收人为制造 Signal。
 
 ### 10.3 已解决：二级正文真实性与主动独立来源采集
 
@@ -518,47 +573,47 @@ Skill quick_validate
 
 证据：63 项回归通过；真实数据库副本降级 7 条伪正文；真实联网样本成功抓到独立原站正文；最新真实运行累计 58 条 ready 完整正文并形成 5 个 ready Bundle。剩余瓶颈不再是正文数量，而是抓取前初筛、达到 1–2 篇后早停和真实 OpportunityAssessment 样本。
 
-### 10.4 P1：采集成功、证据质量和研究就绪状态没有统一监控
+### 10.4 已解决：按阶段的研究与业务漏斗监控
 
-现状：真实库已有 16 次 Pipeline Run、94 个 Bundle、5 个 `ready_for_assessment` Bundle 和 9 个 Candidate。Dashboard 的“来源健康”仍主要看主源请求是否成功，不能表达候选是否适合选品、是否抓取过量、是否完成机会判断或是否产生下游对象。
+真实库已有 18 次 Pipeline Run、115 个 Bundle、30 条初筛记录、15 个待复核最新初筛、10 个已 supersede Candidate 和 0 个活跃 Candidate。Dashboard 显示五阶段业务数量，并把来源健康与最近运行折叠为系统详情；`/healthz` 的 `latest_pipeline_observation` 统一报告最近运行 selected 数、eligible/needs_review/rejected 分布、初筛通过率、页面抓取尝试、成功正文和达到最低证据早停数量，`journey_metrics` 额外报告待复核初筛、活跃 Candidate、待审判断、已确认机会、商品方向、待市场验证和已验证选品数量。
 
 性能风险：最新一轮多个主源延迟较高，例如百度约 24 秒、B 站 36 秒、酷安 39 秒、贴吧 43 秒、Google Trends DE/GB/US 约 47/55/59 秒、Hacker News 51 秒。当前没有按阶段区分的超时率或质量 SLO。
 
-历史状态混淆：`/healthz` 顶层已报告新 Pipeline 模式，但 `latest_run.config_json` 和 `legacy_latest_analysis` 仍会展示数据库中的历史 `local-rules` / `local-rules-v1`，容易被误解为旧规则仍在活跃运行。活跃代码已删除，问题在于监控语义和历史字段未隔离。
+历史 `analyses` 不再以 `legacy_latest_analysis` 顶层字段出现，而是放在明确标记 `active_pipeline: false` 的 `legacy_audit.latest_historical_analysis` 下，避免被误解为旧规则仍在活跃运行。来源延迟仍可在 Dashboard 系统详情中查看；如果未来需要正式 SLO，再基于这些统一字段设定窗口和阈值。
 
-### 10.5 P1：人工研究工作台只完成展示和启动，操作闭环仍依赖 API/Skill
+### 10.5 已解决：页面可以完成结构化人工机会判断
 
-现状：`/research` 和事件页可以启动人工 ResearchRun、显示工具审计、展示并审核已有 Assessment；但页面没有执行受控工具、添加人工 Evidence、完成 Run、创建人工 Assessment 或触发云端 Assessment 的操作入口。
+实现：事件页现在提供结构化“完成机会判断”表单，用户选择“值得跟进 / 不适合选品 / 需要补证据”，直接勾选已采用证据并填写事实、推断、消费关联、持续性和交付周期。单一页面接口复用既有状态机完成 Human ResearchRun、OpportunityAssessment 和审核；证据就绪的 `worth_following` 才创建 Signal，其他两种结果不会创建 Signal。
 
-影响：后端 API 和 Skill 具备这些能力，但普通用户仅靠页面无法完成实施计划所述的人工研究闭环。真实库中仍是 0 Run、0 ToolCall、0 Assessment，说明这条链尚未经过真实操作验收。
+验证：临时数据库已覆盖正向 Signal 路径和 `needs_more_evidence` 路径。真实库仍是 0 Run、0 Assessment、0 Signal，因此还需要人工选择一条真实 Candidate 完成页面验收。受控工具执行和人工新增 Evidence 仍属于补证入口，不影响已有证据上的结构化判断闭环。
 
-### 10.6 P1：新研究状态机仍有兼容旁路
+### 10.6 已解决：新研究状态机兼容旁路已封闭
 
-Candidate 状态接口目前允许把非 `superseded` Candidate 直接更新为任一合法状态，没有校验允许的状态转换，也没有在写入 `evidence_ready`、`awaiting_review` 或 `completed` 时复核 Bundle 和 Assessment 条件。
+Candidate 状态接口现在执行显式允许路径，并复核运行中的/已完成 ResearchRun、Bundle readiness、待审或已审 Assessment 以及批准 Assessment 对应的 Signal。内部 Run、Assessment 审核路径也复用同一转换器。
 
-事件页和 `POST /api/events/{event_id}/opportunity-signals` 仍支持直接人工创建 Signal；它只要求证据 ID 属于事件，不要求有效正文、ready Bundle、Candidate 或批准的 OpportunityAssessment。这是 Phase 1 人工工作台的兼容路径，但意味着目标架构中“只有人工确认 `worth_following` Assessment 后才创建 Signal”尚不是唯一受控路径。
+`POST /api/events/{event_id}/opportunity-signals` 兼容 API 现在固定返回 410；应用内只有 `_create_signal_from_assessment()` 写入 Signal。下游商品方向和 MarketEvidence 再次校验 Assessment、Candidate 与 Bundle，因此历史无 Assessment Signal 也不能绕过。
 
-需要后续明确：这些接口是受信任管理员的显式旁路，还是应收紧到新状态机；在决定前不能宣称所有新 Signal 都能回溯完整 Research 链。
+OpportunityAssessment 审核完成后不可切换为另一结论；批准结果使用唯一索引保证一个 Assessment 最多一个 Signal。现在可以声明所有经应用新建并进入下游的 Signal 都能回溯完整 Research 链。
 
-### 10.7 P2：Agent 与浏览器配置尚未接入执行器（搜索已接入）
+### 10.7 已解决：未接入的 Agent 与浏览器开关已移除
 
-当前受控工具仍是 `get_context`、`fetch_public_page`、`collect_related_news` 和 `rebuild_evidence_bundle`，但 `collect_related_news` 已使用 `RESEARCH_MAX_SEARCH_QUERIES` 执行主动公共新闻搜索。仍没有浏览器工具或独立 Research Agent worker；`ENABLE_RESEARCH_AGENT`、`ENABLE_BROWSER_EVIDENCE` 和 `RESEARCH_MAX_BROWSER_PAGES` 仍是预留配置，`AbstainingRulesAssessmentProvider` 也没有接入 API 或 Pipeline。
+当前受控工具是 `get_context`、`fetch_public_page`、`collect_related_news` 和 `rebuild_evidence_bundle`，其中 `collect_related_news` 已使用 `RESEARCH_MAX_SEARCH_QUERIES` 执行主动公共新闻搜索。系统仍没有浏览器工具或独立 Research Agent worker。
 
-这些能力在实施计划中属于默认关闭或第二版可选项，不阻塞最小人工闭环，但配置项会让使用者误以为开启后已有实际执行能力。后续应实现、隐藏或明确标记为预留。
+为避免“设置为 true 就会工作”的错误预期，未接入的 `ENABLE_RESEARCH_AGENT`、`ENABLE_BROWSER_EVIDENCE`、`RESEARCH_MAX_BROWSER_PAGES` 配置和未使用的 `AbstainingRulesAssessmentProvider` 已删除；ResearchBudget 的兼容字段固定只能为 0，事件页明确显示“自动执行器尚未接入”。只有出现真实跨进程需求后才重新设计 worker 或浏览器能力。
 
-### 10.8 P2：新主链仍受旧数据模型约束
+### 10.8 P3：新主链仍受旧数据模型约束
 
-`opportunity_signals.analysis_id` 仍是非空外键。批准 OpportunityAssessment 或人工创建 Signal 时，代码会额外插入兼容用 `pipeline_runs` 和 `analyses` 记录，再创建 Signal。旧 `product_opportunities`、`market_validations`、旧页面/API 和 `/healthz` 的 legacy 字段也仍保留。
+`opportunity_signals.analysis_id` 仍是非空外键。批准 OpportunityAssessment 时，代码会额外插入兼容用 `pipeline_runs` 和 `analyses` 记录，再创建 Signal。旧 `product_opportunities`、`market_validations`、旧 API 和 `/healthz` 的 legacy 字段也仍保留；用户页面已不再提供旧链写操作。
 
 这保证旧数据可用，但增加了双轨查询、清理顺序和状态解释成本。长期架构若要完全独立，需要迁移 `analysis_id` 约束并明确旧表/API 的退役条件；当前仅做到“新推荐不再由旧链生产”。
 
-### 10.9 P2：生产安全边界尚未完成
+### 10.9 P3：生产安全边界尚未完成
 
 写 API 当前使用浏览器 Origin 校验、本机限制或单一 `ADMIN_TOKEN`，README 已明确这是 Demo 级保护。没有正式用户身份、角色权限、审计主体和限流；适合本机或可信内网，不适合直接公网部署。浏览器登录态、Cookie 和验证码绕过仍按设计不实现。
 
-### 10.10 P2：验证、文档与发布状态仍有缺口
+### 10.10 P3：验证、文档与发布状态仍有缺口
 
-- 63 个测试和外键检查均通过，真实数据库副本已验证 v2 证据迁移，联网样本已验证主动搜索与正文抓取；但仍没有真实 Candidate -> Run -> Assessment -> Signal 端到端样本，云端 Provider 只通过 fake client 验证，没有真实模型灰度样本。
+- 76 个核心测试、2 个真实来源测试和外键检查均通过，真实数据库已完成 v2 证据及 Signal 唯一索引迁移，联网样本已验证主动搜索与正文抓取；但仍没有真实 Candidate -> Run -> Assessment -> Signal 端到端样本，云端 Provider 只通过 fake client 验证，没有真实模型灰度样本。
 - 测试仍有 1 个 Starlette `TestClient` 上游弃用警告，不影响当前结果，但应在依赖升级时处理。
 - `docs/research-agent-implementation-plan.md` 的实现说明和正文元数据已统一为“核心实施完成，运行验收进行中”。
 - 代码提交 `bcf8c57` 已推送到 `origin/agent/research-architecture`，尚未创建 PR，也未合并到 `main`；本轮 `HANDOFF.md` 问题盘点尚未提交。
@@ -591,4 +646,4 @@ uv run pytest -q tests\test_core.py
 
 最合理的续做入口是：
 
-> 显式重跑 Pipeline 或实现可审计安全回填，使真实 `/research` 队列出现 Candidate；随后补齐人工研究工作台或严格按 Skill/API 完成一个真实 Run 与 OpportunityAssessment 样本。在证据质量和样本验收前保持 `ENABLE_RESEARCH_AGENT=false`，不要自动生产 Signal。
+> 打开 `/research` 处理 15 个真实“初筛待复核”：明显无实体消费关系的直接排除，只对确有稳定用户、场景或约束的事件允许一次有限补证。若补证后自然形成 Candidate，再在事件页完成机会判断；不为验收制造 Signal。独立 worker、浏览器证据和旧表/`analysis_id` 迁移继续等待真实需求或明确迁移窗口。

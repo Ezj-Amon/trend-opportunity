@@ -7,77 +7,63 @@
   <div class="hero-score"><strong>{{ event.trend_score }}</strong><span>趋势分</span></div>
 </section>
 
-<section class="score-grid">
-  {% for label, value in [('跨源覆盖',event.coverage_score),('榜单排名',event.rank_score),('上升速度',event.velocity_score),('持续性',event.persistence_score),('新鲜度',event.freshness_score)] %}
-  <div><span>{{ label }}</span><strong>{{ value }}</strong><div class="bar"><i style="width:{{ value }}%"></i></div></div>
-  {% endfor %}
-</section>
-
 <section class="panel research-decision {{ research_view.conclusion_code }}">
-  <div class="panel-head"><h2>当前结论</h2><span>{{ research_view.evidence_summary.readiness_label }}</span></div>
+  <div class="panel-head"><h2>当前结论</h2><span>当前阶段：{{ research_view.stage_label }}</span></div>
   <h3>{{ research_view.conclusion_label }}</h3>
-  <p class="muted">{{ research_view.producer_status }}</p>
-  <div class="research-columns">
-    <div><h4>为什么停在这里</h4><ul>{% for reason in research_view.stop_reasons %}<li>{{ reason }}</li>{% endfor %}</ul></div>
-    <div><h4>下一步需要什么</h4><ul>{% for action in research_view.next_actions %}<li>{{ action }}</li>{% endfor %}</ul></div>
-  </div>
-  <p class="research-label"><b>人工标签：</b>{{ research_view.human_label }} · <b>语义特征：</b>{{ research_view.semantic_status }}</p>
+  <p class="primary-next-action"><b>下一步：</b>{{ research_view.primary_action }}</p>
 </section>
 
 <section class="panel research-evidence">
-  <div class="panel-head"><h2>证据覆盖</h2><span>准备度质量分 {{ '%.2f'|format(research_view.evidence_summary.readiness_score) }}</span></div>
-  <div class="evidence-metrics">
-    <span>完整正文 {{ research_view.evidence_summary.full_text_count }}</span>
-    <span>标题证据 {{ research_view.evidence_summary.title_only_count }}</span>
-    <span>独立来源 {{ research_view.evidence_summary.independent_source_count }}</span>
-    <span>消费者声音 {{ research_view.evidence_summary.consumer_voice_count }}</span>
-    <span>官方来源 {{ research_view.evidence_summary.official_source_count }}</span>
+  <div class="panel-head"><h2>已采用的关键证据</h2><span>{{ key_evidence|length }} 条</span></div>
+  <div class="key-evidence-grid">
+    {% for item in key_evidence %}<article class="key-evidence-card"><span class="evidence-kind">{{ evidence_type_labels.get(item.evidence_type, '公开证据') }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer"><strong>{{ item.title }}</strong></a><p>{{ item.excerpt[:420] }}</p><small>{{ item.source_name or '未知来源' }}</small></article>
+    {% else %}<div class="empty">当前没有可分析的正文或可靠摘要，因此不会形成机会结论。</div>{% endfor %}
   </div>
-  {% if research_view.fetch_failures %}<div class="fetch-failures"><h4>抓取失败原因</h4>{% for failure in research_view.fetch_failures %}<p><b>证据 #{{ failure.evidence_id }} · {{ failure.status_label }}</b>{% if failure.source_name %} · {{ failure.source_name }}{% endif %}{% if failure.detail %}<small>{{ failure.detail }}</small>{% endif %}</p>{% endfor %}</div>{% endif %}
-  {% if research_view.missing_evidence %}<div class="missing-evidence"><h4>仍缺失的证据</h4><ul>{% for item in research_view.missing_evidence %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+  {% if research_view.missing_evidence %}<p class="muted">还需要：{{ research_view.missing_evidence|join('；') }}</p>{% endif %}
 </section>
 
-<section class="panel semantic-exploration">
-  <div class="panel-head"><h2>探索性类目联想</h2><span>仅用于研究导航，不是需求概率或商品推荐</span></div>
-  {% if research_view.category_candidates %}<div class="category-candidates">{% for item in research_view.category_candidates %}<article><strong>{{ item.category }}</strong><span>{{ '%.4f'|format(item.similarity) }}</span></article>{% endfor %}</div>{% else %}<p class="muted">当前没有可展示的类目联想。</p>{% endif %}
-  <div class="semantic-comparison">
-    <span>正向原型 {% if research_view.positive_similarity is not none %}<strong>{{ '%.4f'|format(research_view.positive_similarity) }}</strong>{% else %}未计算{% endif %}</span>
-    <span>负向原型 {% if research_view.negative_similarity is not none %}<strong>{{ '%.4f'|format(research_view.negative_similarity) }}</strong>{% else %}未计算{% endif %}</span>
-    <span>机会差值 {% if research_view.opportunity_delta is not none %}<strong>{{ '%.4f'|format(research_view.opportunity_delta) }}</strong>{% else %}未计算{% endif %}</span>
-  </div>
-  <p>{{ research_view.delta_explanation }}</p>
-</section>
-
-{% if research_candidate %}
-<section class="panel research-candidate-detail">
-  <div class="panel-head"><h2>待研究方向</h2><span>{{ research_candidate.status }} · 优先级 {{ research_candidate.priority }}</span></div>
-  <p>{{ research_candidate.candidate_reason }}</p>
-  {% if research_candidate.category_candidates %}<div class="chips">{% for item in research_candidate.category_candidates %}<span>{{ item.category }} {{ '%.4f'|format(item.similarity) }}</span>{% endfor %}</div>{% else %}<p class="muted">尚无可靠类目联想；该候选只用于补证，不代表商品方向或需求结论。</p>{% endif %}
-  <h4>研究问题</h4><ul>{% for question in research_candidate.research_questions %}<li>{{ question }}</li>{% endfor %}</ul>
-  {% if research_candidate.status in ['pending','evidence_ready','insufficient_evidence','failed'] %}<button class="compact primary" onclick="startResearchRun({{ research_candidate.id }})">启动人工 ResearchRun</button>{% endif %}
-</section>
-{% endif %}
-
-{% if research_candidate %}
-<section class="panel research-run-detail">
-  <div class="panel-head"><h2>Research Agent / Run</h2><span>{% if research_agent_enabled %}自动 Agent 已启用{% else %}自动 Agent 未启用{% endif %}</span></div>
-  <p class="muted">{% if research_agent_enabled %}Agent 仍只能调用受控研究工具，不能直接写数据库或发布推荐。{% else %}ENABLE_RESEARCH_AGENT=false；当前只会由用户明确启动人工或受控 ResearchRun。{% endif %} 浏览器证据：{{ '已启用' if browser_evidence_enabled else '未启用' }}。</p>
-  {% if research_run %}
-  <article class="research-run-card">
-    <p><b>Run：</b>{{ research_run.id }} · {{ research_run.executor_type }} / {{ research_run.executor_name }} · <span class="status {{ research_run.status }}">{{ research_run.status }}</span></p>
-    <p><b>预算：</b>搜索 {{ research_run.budget.max_search_queries|default(0) }} · 公开页面 {{ research_run.budget.max_fetch_pages|default(0) }} · 浏览器页面 {{ research_run.budget.max_browser_pages|default(0) }} · 超时 {{ research_run.budget.timeout_seconds|default(0) }} 秒</p>
-    {% if research_run.error %}<p class="error"><b>运行失败：</b>{{ research_run.error }}</p>{% endif %}
-    {% if research_tool_calls %}<details open><summary>工具调用审计（{{ research_tool_calls|length }}）</summary><ul>{% for call in research_tool_calls %}<li><b>{{ call.tool_name }}</b> · {{ call.status }} · {{ call.latency_ms }} ms · 请求哈希 {{ call.request_hash[:12] }}{% if call.result_evidence_ids %} · 证据 {{ call.result_evidence_ids|join('、') }}{% endif %}{% if call.error %} · {{ call.error }}{% endif %}</li>{% endfor %}</ul></details>{% else %}<p class="muted">此 Run 尚无工具调用记录。</p>{% endif %}
-  </article>
-  {% else %}<p class="muted">尚未启动 ResearchRun；现有事件事实和审核状态不会因此改变。</p>{% endif %}
+{% if research_candidate and not opportunity_assessments and research_candidate.status not in ['completed','superseded'] %}
+<section class="panel opportunity-judgment">
+  <div class="panel-head"><h2>完成机会判断</h2><span>一次提交完成研究记录、判断与审核</span></div>
+  <p class="muted">先选择结论，再勾选支持该结论的已采用证据。这里判断消费变化是否值得跟进，不填写商品名、价格或平台查询词。</p>
+  <form id="opportunity-judgment-form" onsubmit="submitOpportunityJudgment(event, {{ research_candidate.id }})">
+    <label class="judgment-field"><span>判断结果</span><select id="judgment-decision" onchange="toggleJudgmentFields()">
+      <option value="worth_following" {% if research_view.evidence_summary.readiness_status == 'ready_for_assessment' %}selected{% endif %}>值得跟进</option>
+      <option value="insufficient_evidence" {% if research_view.evidence_summary.readiness_status != 'ready_for_assessment' %}selected{% endif %}>需要补证据</option>
+      <option value="abstained">不适合选品</option>
+    </select></label>
+    <div id="worth-following-fields" class="judgment-grid">
+      <label class="judgment-field"><span>变化类型</span><input id="judgment-change-type" maxlength="500" placeholder="例如：居住空间约束持续变化"></label>
+      <label class="judgment-field"><span>目标用户</span><input id="judgment-users" placeholder="多个值用分号分隔"></label>
+      <label class="judgment-field judgment-wide"><span>消费关联</span><textarea id="judgment-consumer-relevance" rows="3" maxlength="4000" placeholder="证据显示哪些消费行为、环境或生活方式发生变化"></textarea></label>
+      <label class="judgment-field"><span>持续性</span><input id="judgment-durability" maxlength="1000" placeholder="为什么能持续到商品交付以后"></label>
+      <label class="judgment-field"><span>交付周期匹配</span><input id="judgment-lead-time" maxlength="1000" placeholder="开发、生产和运输周期是否匹配"></label>
+      <label class="judgment-field"><span>新场景</span><input id="judgment-scenarios" placeholder="多个值用分号分隔"></label>
+      <label class="judgment-field"><span>未满足需求</span><input id="judgment-needs" placeholder="多个值用分号分隔"></label>
+      <label class="judgment-field"><span>相关实体类目</span><input id="judgment-categories" placeholder="多个值用分号分隔"></label>
+      <label class="judgment-field judgment-wide"><span>关键事实</span><textarea id="judgment-fact" rows="3" maxlength="2000" placeholder="只写下方证据能够直接支持的事实"></textarea></label>
+      <label class="judgment-field judgment-wide"><span>判断推断（可选）</span><textarea id="judgment-inference" rows="2" maxlength="2000" placeholder="明确说明从事实到机会判断的推断"></textarea></label>
+    </div>
+    <label id="judgment-reason-field" class="judgment-field judgment-wide"><span>不跟进或补证原因</span><textarea id="judgment-reason" rows="3" maxlength="4000" placeholder="说明为什么不适合选品，或还缺什么证据"></textarea></label>
+    <label class="judgment-field judgment-wide"><span>仍缺失的证据（可选）</span><input id="judgment-missing" placeholder="多个值用分号分隔"></label>
+    <fieldset class="judgment-evidence"><legend>采用的关键证据</legend>
+      {% for item in key_evidence %}
+      <label><input type="checkbox" name="judgment-evidence" value="{{ item.id }}" checked><span><b>{{ item.source_name or '未知来源' }}</b> · {{ item.title }}</span></label>
+      {% else %}<p class="muted">当前没有可用于判断的正文或摘要，请选择“需要补证据”。</p>{% endfor %}
+    </fieldset>
+    <label class="judgment-field judgment-wide"><span>审核说明（可选）</span><input id="judgment-note" maxlength="2000" placeholder="记录本次人工确认依据"></label>
+    <div class="actions"><button id="judgment-submit" class="primary" type="submit">保存机会判断</button></div>
+  </form>
 </section>
 {% endif %}
 
 {% if opportunity_assessments %}
 <section class="panel assessment-section">
-  <div class="panel-head"><h2>机会评估</h2><span>研究结果 · 不是商品假设</span></div>
+  {% set assessment_labels = {'worth_following':'值得跟进','abstained':'不适合选品','insufficient_evidence':'需要补证据'} %}
+  {% set review_labels = {'pending':'等待确认','approved':'已确认','rejected':'不跟进','needs_more_evidence':'需要补证据'} %}
+  <div class="panel-head"><h2>机会判断结果</h2><span>事实、判断与引用分开保存</span></div>
   {% for item in opportunity_assessments %}<article class="assessment-card">
-    <div><span class="status {{ item.review_status }}">{{ item.review_status }}</span> <strong>{{ item.assessment_status }}</strong> · {{ item.engine }}{% if item.model %} / {{ item.model }}{% endif %}</div>
+    <div><span class="status {{ item.review_status }}">{{ review_labels.get(item.review_status, '待确认') }}</span> <strong>{{ assessment_labels.get(item.assessment_status, '暂不判断') }}</strong></div>
     {% if item.change_type %}<p><b>变化：</b>{{ item.change_type }}</p><p><b>消费关联：</b>{{ item.consumer_relevance }}</p><p><b>持续性：</b>{{ item.durability }} · <b>交付周期：</b>{{ item.lead_time_fit }}</p>{% endif %}
     {% if item.fact_claims %}<details><summary>事实与引用</summary><ul>{% for claim in item.fact_claims %}<li>{{ claim.claim }}（证据 {{ claim.evidence_ids|join('、') }}）</li>{% endfor %}</ul></details>{% endif %}
     {% if item.inferences %}<details><summary>推断与引用</summary><ul>{% for claim in item.inferences %}<li>{{ claim.claim }}（证据 {{ claim.evidence_ids|join('、') }}）</li>{% endfor %}</ul></details>{% endif %}
@@ -87,27 +73,91 @@
 </section>
 {% endif %}
 
+{% if signals %}
 <section class="panel signal-section">
-  <div class="panel-head"><h2>新品机会线索</h2><span>判断层 · 可为空 · 不是商品推荐</span></div>
-  <details class="manual-create"><summary>人工创建一条可审计的机会线索</summary><p class="muted">只填写从本页证据能够支持的判断；多个值用分号分隔，证据 ID 在页面底部可见。</p><button class="compact" onclick="createSignal({{ event.id }})">开始填写</button></details>
+  <div class="panel-head"><h2>已确认机会</h2><span>仍不是商品推荐</span></div>
   <div class="signal-grid">
   {% for signal in signals %}
     <article class="signal-card">
-      <div class="signal-card-head"><span class="status {{ signal.review_status }}">{{ signal.review_status }}</span><strong>{{ signal.change_type }}</strong><b>{{ signal.product_opportunity_score }}</b></div>
+      <div class="signal-card-head"><span class="status {{ signal.review_status }}">{{ '可以进入商品方向' if signal.review_status == 'follow_up' else '等待确认' }}</span><strong>{{ signal.change_type }}</strong></div>
       <p><b>目标用户：</b>{{ signal.target_users|join('、') }}</p>
       <p><b>新场景：</b>{{ signal.new_scenarios|join('、') }}</p>
       <p><b>未满足需求：</b>{{ signal.unmet_needs|join('、') }}</p>
-      <small>消费关联 {{ signal.consumer_relevance_score }} · 置信度 {{ signal.confidence }} · {{ signal.engine }} / {{ signal.model }}</small>
-      {% if signal.review_status == 'follow_up' %}<div class="signal-feedback"><button class="compact primary" onclick="createHypothesis({{ signal.id }}, '{{ signal.evidence_ids|join(',') }}')">基于该线索创建实体商品假设</button></div>{% endif %}
+      {% if signal.review_status == 'follow_up' %}
+      <details class="product-direction-form"><summary>创建商品方向</summary>
+        <form onsubmit='submitProductDirection(event, {{ signal.id }}, {{ signal.evidence_ids|tojson }})'>
+          <div class="judgment-grid">
+            <label class="judgment-field"><span>方向名称</span><input name="name" required maxlength="160" placeholder="具体实体商品方向"></label>
+            <label class="judgment-field"><span>实体形态</span><input name="physical_form" required maxlength="500" placeholder="材料、结构和可运输形态"></label>
+            <label class="judgment-field"><span>目标用户</span><input name="target_users" required placeholder="多个值用分号分隔"></label>
+            <label class="judgment-field"><span>使用场景</span><input name="scenarios" required placeholder="多个值用分号分隔"></label>
+            <label class="judgment-field judgment-wide"><span>待解决问题</span><textarea name="problem" required rows="2" maxlength="1000"></textarea></label>
+            <label class="judgment-field judgment-wide"><span>预期差异</span><textarea name="expected_difference" required rows="2" maxlength="1000"></textarea></label>
+            <label class="judgment-field"><span>商品中心词</span><input name="product_keywords" required placeholder="多个值用分号分隔"></label>
+            <label class="judgment-field"><span>平台查询词</span><input name="query_terms" placeholder="多个值用分号分隔；进入验证前必须填写"></label>
+            <label class="judgment-field"><span>目标 Amazon 站点</span><select name="target_marketplace">{% for code, name in marketplaces.items() %}<option value="{{ code }}">{{ code }} · {{ name }}</option>{% endfor %}</select></label>
+          </div>
+          <p class="muted">自动引用本机会判断已确认的证据：#{{ signal.evidence_ids|join('、#') }}</p>
+          <button class="compact primary" type="submit">保存商品方向</button>
+        </form>
+      </details>
+      {% endif %}
     </article>
-  {% else %}<div class="empty">当前只有趋势事实，没有达到线索门槛的消费变化判断。</div>{% endfor %}
+  {% endfor %}
   </div>
 </section>
+{% endif %}
 
+{% if product_hypotheses %}
 <section class="panel">
-  <div class="panel-head"><h2>商品假设</h2><span>构思层 · 待市场验证 · 不是推荐</span></div>
-  <div class="cards">{% for item in product_hypotheses %}<article class="opportunity-card"><div class="card-top"><div><span class="status {{ item.status }}">{{ item.status }}</span><span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>#{{ item.id }}</strong><span>假设编号</span></div></div><p><b>实体形态：</b>{{ item.physical_form }}</p><p><b>目标用户：</b>{{ item.target_users|join('、') }}</p><p><b>场景：</b>{{ item.scenarios|join('、') }}</p><p><b>问题：</b>{{ item.problem }}</p><p><b>预期差异：</b>{{ item.expected_difference }}</p><p><b>查询词候选：</b>{{ item.query_terms|join('、') if item.query_terms else '尚未填写' }} · {{ item.target_marketplace }}</p><a class="button-link compact" href="/hypotheses">进入商品假设工作台</a></article>{% else %}<div class="empty">尚无独立商品假设。只有标记为“值得跟进”的线索可创建。</div>{% endfor %}</div>
+  <div class="panel-head"><h2>商品方向</h2><span>待市场验证 · 不是推荐</span></div>
+  <div class="cards">{% for item in product_hypotheses %}<article class="opportunity-card"><div class="card-top"><div><span class="status {{ item.status }}">{{ item.status }}</span><span class="status {{ item.risk_level }}">风险 {{ item.risk_level }}</span><h3>{{ item.name }}</h3></div><div class="op-score"><strong>#{{ item.id }}</strong><span>方向编号</span></div></div><p><b>实体形态：</b>{{ item.physical_form }}</p><p><b>目标用户：</b>{{ item.target_users|join('、') }}</p><p><b>场景：</b>{{ item.scenarios|join('、') }}</p><p><b>问题：</b>{{ item.problem }}</p><p><b>预期差异：</b>{{ item.expected_difference }}</p><a class="button-link compact" href="/hypotheses">进入商品方向工作台</a></article>{% endfor %}</div>
 </section>
+{% endif %}
+
+<details class="technical-audit">
+<summary>系统与审计详情</summary>
+
+{% if research_screening %}
+<section class="panel">
+  <div class="panel-head"><h2>抓取前初筛</h2><span>{{ research_screening.decision_label }}</span></div>
+  <p>{{ research_screening.explanation }}</p>
+  {% if screening_review %}<p><b>人工复核：</b>{{ screening_review.decision_label }}{% if screening_review.note %} · {{ screening_review.note }}{% endif %}</p>{% endif %}
+  {% if collection_outcome %}<p class="muted">{{ collection_outcome.stop_label }} · 尝试公开页面 {{ collection_outcome.fetch_attempt_count }} 个 · 完整正文或官方公告 {{ collection_outcome.successful_document_count }} 篇 · 独立来源 {{ collection_outcome.independent_source_count }} 个</p>{% endif %}
+  <ul>{% for label in research_screening.reason_labels %}<li>{{ label }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
+<section class="score-grid">
+  {% for label, value in [('跨源覆盖',event.coverage_score),('榜单排名',event.rank_score),('上升速度',event.velocity_score),('持续性',event.persistence_score),('新鲜度',event.freshness_score)] %}
+  <div><span>{{ label }}</span><strong>{{ value }}</strong><div class="bar"><i style="width:{{ value }}%"></i></div></div>
+  {% endfor %}
+</section>
+
+<section class="panel research-evidence">
+  <div class="panel-head"><h2>证据状态详情</h2><span>诊断分 {{ '%.2f'|format(research_view.evidence_summary.readiness_score) }}</span></div>
+  <div class="evidence-metrics"><span>完整正文 {{ research_view.evidence_summary.full_text_count }}</span><span>标题证据 {{ research_view.evidence_summary.title_only_count }}</span><span>独立来源 {{ research_view.evidence_summary.independent_source_count }}</span><span>消费者声音 {{ research_view.evidence_summary.consumer_voice_count }}</span><span>官方来源 {{ research_view.evidence_summary.official_source_count }}</span></div>
+  {% if research_view.fetch_failures %}<div class="fetch-failures"><h4>未采用来源（{{ research_view.fetch_failures|length }} 条）</h4><p class="muted">已采用的关键证据显示在页面上方；以下来源未采用，不影响当前证据判断。</p>{% for failure in research_view.fetch_failures %}<p><b>证据 #{{ failure.evidence_id }} · {{ failure.status_label }}</b>{% if failure.source_name %} · {{ failure.source_name }}{% endif %}{% if failure.detail %}<small>{{ failure.detail }}</small>{% endif %}</p>{% endfor %}</div>{% endif %}
+  {% if research_view.stop_reasons %}<div class="missing-evidence"><h4>停止与缺失原因</h4><ul>{% for item in research_view.stop_reasons %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+</section>
+
+<section class="panel semantic-exploration">
+  <div class="panel-head"><h2>探索性语义信息</h2><span>只用于研究导航</span></div>
+  {% if research_view.category_candidates %}<div class="category-candidates">{% for item in research_view.category_candidates %}<article><strong>{{ item.category }}</strong><span>{{ '%.4f'|format(item.similarity) }}</span></article>{% endfor %}</div>{% else %}<p class="muted">当前没有可展示的类目联想。</p>{% endif %}
+  <div class="semantic-comparison"><span>正向原型 {% if research_view.positive_similarity is not none %}<strong>{{ '%.4f'|format(research_view.positive_similarity) }}</strong>{% else %}未计算{% endif %}</span><span>负向原型 {% if research_view.negative_similarity is not none %}<strong>{{ '%.4f'|format(research_view.negative_similarity) }}</strong>{% else %}未计算{% endif %}</span><span>机会差值 {% if research_view.opportunity_delta is not none %}<strong>{{ '%.4f'|format(research_view.opportunity_delta) }}</strong>{% else %}未计算{% endif %}</span></div>
+  <p>{{ research_view.delta_explanation }}</p><p class="muted">人工标签：{{ research_view.human_label }} · 语义状态：{{ research_view.semantic_status }}</p>
+</section>
+
+{% if research_candidate %}
+<section class="panel research-candidate-detail">
+  <div class="panel-head"><h2>待判断趋势内部记录</h2><span>{{ research_candidate.status }} · 优先级 {{ research_candidate.priority }}</span></div>
+  <p>{{ research_candidate.candidate_reason }}</p><h4>研究问题</h4><ul>{% for question in research_candidate.research_questions %}<li>{{ question }}</li>{% endfor %}</ul>
+</section>
+<section class="panel research-run-detail">
+  <div class="panel-head"><h2>研究任务审计</h2><span>自动执行器尚未接入</span></div>
+  {% if research_run %}<article class="research-run-card"><p><b>任务：</b>{{ research_run.id }} · {{ research_run.executor_type }} / {{ research_run.executor_name }} · <span class="status {{ research_run.status }}">{{ research_run.status }}</span></p><p><b>预算：</b>搜索 {{ research_run.budget.max_search_queries|default(0) }} · 公开页面 {{ research_run.budget.max_fetch_pages|default(0) }} · 浏览器页面 {{ research_run.budget.max_browser_pages|default(0) }} · 超时 {{ research_run.budget.timeout_seconds|default(0) }} 秒</p>{% if research_run.error %}<p class="error"><b>运行失败：</b>{{ research_run.error }}</p>{% endif %}{% if research_tool_calls %}<details><summary>工具调用（{{ research_tool_calls|length }}）</summary><ul>{% for call in research_tool_calls %}<li><b>{{ call.tool_name }}</b> · {{ call.status }} · {{ call.latency_ms }} ms · 请求哈希 {{ call.request_hash[:12] }}{% if call.result_evidence_ids %} · 证据 {{ call.result_evidence_ids|join('、') }}{% endif %}{% if call.error %} · {{ call.error }}{% endif %}</li>{% endfor %}</ul></details>{% endif %}</article>{% else %}<p class="muted">尚无研究任务记录。</p>{% endif %}
+</section>
+{% endif %}
 
 <section class="panel">
   <div class="panel-head"><h2>商品假设（旧版）</h2><span>不是推荐；仅作迁移期审计</span></div>
@@ -150,85 +200,87 @@
       <div class="outcomes"><b>结果回流：</b>
         {% for outcome in item.outcomes %}<span>{{ outcome.horizon_days }} 天 {{ outcome.result }}{% if outcome.note %} · {{ outcome.note }}{% endif %}</span>{% else %}<span>尚未记录</span>{% endfor %}
       </div>
-      <div class="actions">
-        <button onclick="reviewWithNote({{ item.id }}, 'approved')">通过</button>
-        <button class="ghost" onclick="reviewWithNote({{ item.id }}, 'rejected')">驳回</button>
-        <button class="ghost" onclick="saveValidation({{ item.id }})">录入市场验证</button>
-        <select id="marketplace-{{ item.id }}" aria-label="目标 Amazon 站点">
-          {% for code, name in marketplaces.items() %}<option value="{{ code }}" {% if code == item.target_marketplace %}selected{% endif %}>{{ code }} · {{ name }}</option>{% endfor %}
-        </select>
-        <button class="ghost" onclick="changeMarketplace({{ item.id }})">更换目标站点</button>
-        <button class="ghost" onclick="saveOutcome({{ item.id }}, 7)">记录 7 天</button>
-        <button class="ghost" onclick="saveOutcome({{ item.id }}, 30)">记录 30 天</button>
-        <button class="primary" onclick="pushFeishu({{ item.id }})" {% if not feishu_configured or item.validated_recommendation_score is none or item.validation_status != 'completed' or item.review_status != 'approved' %}disabled title="仅已审核且完成市场验证的推荐可推送"{% endif %}>推送已验证推荐</button>
-      </div>
+      <p class="muted">旧版记录为只读迁移审计，不能再从用户页面修改或推进。</p>
     </article>
   {% else %}<div class="empty">该事件只有事实层趋势，当前没有合格的商品假设。</div>{% endfor %}
   </div>
 </section>
 
 <div class="layout">
-  <section class="panel grow"><div class="panel-head"><h2>真实来源证据</h2><span>{{ evidence|length }} 条</span></div>
-    {% for item in evidence %}<article class="evidence"><span class="evidence-kind">证据 #{{ item.id }} · {{ evidence_type_labels.get(item.evidence_type, '仅标题') }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>{{ item.source_name or '未知来源' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.http_status %} · HTTP {{ item.http_status }}{% endif %}</small></article>{% else %}<p class="muted">暂无证据</p>{% endfor %}
+  <section class="panel grow"><div class="panel-head"><h2>其他来源与原始记录</h2><span>{{ unused_evidence|length }} 条</span></div>
+    {% for item in unused_evidence %}<article class="evidence"><span class="evidence-kind">证据 #{{ item.id }} · {{ evidence_type_labels.get(item.evidence_type, '仅标题') }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><p>{{ item.excerpt[:500] }}</p><small>{{ item.source_name or '未知来源' }} · {{ item.fetched_at[:16].replace('T',' ') }}{% if item.http_status %} · HTTP {{ item.http_status }}{% endif %}</small></article>{% else %}<p class="muted">没有其他来源。</p>{% endfor %}
   </section>
   <aside class="side"><section class="panel"><div class="panel-head"><h2>聚类成员</h2></div>
     {% for item in members %}<div class="member"><span>{{ item.source }} #{{ item.rank }} · {{ item.market }} · {{ item.signal_type }}</span><a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a><small>{{ item.match_method }} · {{ '%.2f'|format(item.match_score) }}</small></div>{% endfor %}
   </section></aside>
 </div>
+</details>
 {% endblock %}
 {% block scripts %}<script>
 function splitValues(value) { return value.split(/[;；]/).map(v=>v.trim()).filter(Boolean); }
-async function createSignal(eventId) {
-  const change_type=prompt('变化类型（行为变化/环境约束/法规变化/技术能力/生活方式变化等）',''); if(!change_type)return;
-  const target_users=splitValues(prompt('目标用户，多个用分号分隔','')||''); const new_scenarios=splitValues(prompt('新场景，多个用分号分隔','')||''); const unmet_needs=splitValues(prompt('未满足需求，多个用分号分隔','')||'');
-  const related_product_categories=splitValues(prompt('相关实体类目，可留空，多个用分号分隔','')||''); const durability=prompt('持续性：短时/季节性/中期/结构性','中期')||''; const lead_time_fit=prompt('开发交付周期是否匹配','需评估')||'';
-  const evidence_ids=splitValues(prompt('引用证据 ID，多个用分号分隔','')||'').map(Number).filter(Number.isInteger); const consumer_relevance_score=Number(prompt('消费关联排序分 0-100','50')); const product_opportunity_score=Number(prompt('新品机会排序分 0-100','50')); const confidence=Number(prompt('判断置信度 0-100（不是市场概率）','50')); const missing_evidence=splitValues(prompt('仍缺失的证据，可留空','')||'');
-  if(!target_users.length||!new_scenarios.length||!unmet_needs.length||!evidence_ids.length){toast('目标用户、新场景、未满足需求和证据 ID 不能为空',true);return;}
-  if(await postAction(`/api/events/${eventId}/opportunity-signals`,'人工线索已创建，等待审核',{change_type,consumer_relevance_score,product_opportunity_score,target_users,new_scenarios,unmet_needs,related_product_categories,durability,lead_time_fit,evidence_ids,confidence,missing_evidence}))setTimeout(()=>location.reload(),400);
+function toggleJudgmentFields() {
+  const decision = document.getElementById('judgment-decision');
+  if (!decision) return;
+  const worthFollowing = decision.value === 'worth_following';
+  document.getElementById('worth-following-fields').hidden = !worthFollowing;
+  document.getElementById('judgment-reason-field').hidden = worthFollowing;
 }
-async function startResearchRun(candidateId) {
-  if(await postAction(`/api/research-candidates/${candidateId}/runs`,'ResearchRun 已启动',{executor_type:'human',executor_name:'event-workbench',budget:{}}))setTimeout(()=>location.reload(),350);
+async function submitOpportunityJudgment(event, candidateId) {
+  event.preventDefault();
+  const decision = document.getElementById('judgment-decision').value;
+  const evidenceIds = [...document.querySelectorAll('input[name="judgment-evidence"]:checked')].map(node => Number(node.value));
+  const value = id => document.getElementById(id).value.trim();
+  const fact = value('judgment-fact');
+  const inference = value('judgment-inference');
+  const reason = value('judgment-reason');
+  const assessment = {
+    assessment_status: decision,
+    change_type: value('judgment-change-type'),
+    consumer_relevance: value('judgment-consumer-relevance'),
+    durability: value('judgment-durability'),
+    lead_time_fit: value('judgment-lead-time'),
+    target_users: splitValues(value('judgment-users')),
+    new_scenarios: splitValues(value('judgment-scenarios')),
+    unmet_needs: splitValues(value('judgment-needs')),
+    related_product_categories: splitValues(value('judgment-categories')),
+    fact_claims: fact ? [{claim: fact, evidence_ids: evidenceIds}] : [],
+    inferences: inference ? [{claim: inference, evidence_ids: evidenceIds}] : [],
+    evidence_ids: evidenceIds,
+    missing_evidence: splitValues(value('judgment-missing')),
+    abstention_reason: decision === 'worth_following' ? '' : reason,
+  };
+  if (decision === 'worth_following' && (
+    !assessment.change_type || !assessment.consumer_relevance || !assessment.durability ||
+    !assessment.lead_time_fit || !assessment.target_users.length ||
+    !assessment.new_scenarios.length || !assessment.unmet_needs.length ||
+    !assessment.related_product_categories.length || !fact || !evidenceIds.length
+  )) {
+    toast('“值得跟进”需要完整填写变化、用户、场景、需求、持续性、交付周期、关键事实并勾选证据', true);
+    return;
+  }
+  if (decision !== 'worth_following' && !reason) {
+    toast('请填写不跟进或需要补证据的原因', true);
+    return;
+  }
+  const button = document.getElementById('judgment-submit');
+  button.disabled = true;
+  const result = await postAction(
+    `/api/research-candidates/${candidateId}/opportunity-judgment`,
+    decision === 'worth_following' ? '已确认值得跟进并创建机会线索' : '机会判断已保存',
+    {assessment, note: value('judgment-note')},
+  );
+  if (result) setTimeout(() => location.reload(), 450);
+  else button.disabled = false;
 }
 async function reviewAssessment(assessmentId, review_status) {
   const note=prompt('审核说明（可留空）','') ?? null; if(note===null)return;
   if(await postAction(`/api/opportunity-assessments/${assessmentId}/review`,'Assessment 审核已保存',{review_status,note}))setTimeout(()=>location.reload(),350);
 }
-async function createHypothesis(signalId, suggestedEvidence) {
-  const name=prompt('具体实体商品名称',''); if(!name)return; const physical_form=prompt('实体形态、材料或组成（不得是软件/服务）',''); if(!physical_form)return;
-  const target_users=splitValues(prompt('目标用户，多个用分号分隔','')||''); const scenarios=splitValues(prompt('使用场景，多个用分号分隔','')||''); const problem=prompt('要解决的新问题或约束','')||''; const expected_difference=prompt('相对现有商品的预期差异','')||''; const product_keywords=splitValues(prompt('商品中心词，多个用分号分隔','')||''); const query_terms=splitValues(prompt('人工确认的平台查询词候选，多个用分号分隔','')||''); const target_marketplace=prompt('目标 Amazon 站点代码','US')||'US'; const evidence_ids=splitValues(prompt('引用证据 ID，必须来自该线索',suggestedEvidence)||'').map(Number).filter(Number.isInteger);
-  if(!target_users.length||!scenarios.length||!problem||!expected_difference||!product_keywords.length||!evidence_ids.length){toast('请完整填写商品假设结构',true);return;}
-  if(await postAction(`/api/opportunity-signals/${signalId}/product-hypotheses`,'商品假设草稿已创建',{name,physical_form,target_users,scenarios,problem,expected_difference,product_keywords,query_terms,target_marketplace,evidence_ids}))setTimeout(()=>location.reload(),400);
+async function submitProductDirection(event, signalId, evidenceIds) {
+  event.preventDefault();
+  const form=event.currentTarget, data=new FormData(form), value=name=>String(data.get(name)||'').trim();
+  const payload={name:value('name'),physical_form:value('physical_form'),target_users:splitValues(value('target_users')),scenarios:splitValues(value('scenarios')),problem:value('problem'),expected_difference:value('expected_difference'),product_keywords:splitValues(value('product_keywords')),query_terms:splitValues(value('query_terms')),target_marketplace:value('target_marketplace'),evidence_ids:evidenceIds};
+  if(await postAction(`/api/opportunity-signals/${signalId}/product-hypotheses`,'商品方向已保存',payload))setTimeout(()=>location.reload(),400);
 }
-async function reviewWithNote(id, status) {
-  const note = prompt('请填写审核原因（可留空）', '') ?? null;
-  if (note === null) return;
-  if (await postAction(`/api/opportunities/${id}/review`, `已${status === 'approved' ? '通过' : '驳回'}`, {status, note})) setTimeout(()=>location.reload(),500);
-}
-async function saveValidation(id) {
-  const raw = prompt('录入 8 个 1-5 分，逗号分隔：需求,购买意图,竞争机会,单位经济,差异化,执行,时机,证据。未知写空，例如 4,3,,2,3,4,3,2', '');
-  if (raw === null) return;
-  const values = raw.split(',').map(v => v.trim() ? Number(v.trim()) : null);
-  if (values.length !== 8 || values.some(v => v !== null && (!Number.isInteger(v) || v < 1 || v > 5))) { toast('必须提供 8 项，分数为 1-5，未知项留空', true); return; }
-  const note = prompt('数据来源和说明', '') ?? '';
-  const keys = ['search_demand_score','purchase_intent_score','competition_score','unit_economics_score','differentiation_score','execution_score','timing_score','evidence_score'];
-  const scores = Object.fromEntries(keys.map((key, index) => [key, values[index]]));
-  if (await postAction(`/api/opportunities/${id}/validation`, '市场验证已保存', {provider:'manual',provider_version:'manual-v1',scores,metrics:{},sources:note ? [note] : [],note:''})) setTimeout(()=>location.reload(),500);
-}
-async function changeMarketplace(id) {
-  const target = document.getElementById(`marketplace-${id}`).value;
-  if (!confirm(`确认将目标站点改为 ${target}？旧站点验证分会失效，审核状态会回到 pending。`)) return;
-  if (await postAction(`/api/opportunities/${id}/target-marketplace`, '目标站点已更新', {target_marketplace:target})) setTimeout(()=>location.reload(),500);
-}
-async function saveOutcome(id, horizon) {
-  const result = prompt(`${horizon} 天结果：unknown / positive / negative / mixed / abandoned`, 'unknown');
-  if (result === null) return;
-  const note = prompt('结果说明与关键指标', '') ?? '';
-  if (await postAction(`/api/opportunities/${id}/outcomes/${horizon}`, `${horizon} 天结果已保存`, {result,metrics:{},note})) setTimeout(()=>location.reload(),500);
-}
-async function pushFeishu(id) {
-  const result = await postAction(`/api/opportunities/${id}/push`, null);
-  if (!result) return;
-  if (result.status === 'in_progress') toast('飞书推送正在处理中，请稍后确认');
-  else toast(result.status === 'already_sent' ? '此前已推送到飞书' : '已推送到飞书');
-}
+toggleJudgmentFields();
 </script>{% endblock %}
