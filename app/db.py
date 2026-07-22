@@ -89,6 +89,47 @@ CREATE TABLE IF NOT EXISTS event_members (
   match_score REAL NOT NULL,
   PRIMARY KEY(event_id, source_item_id)
 );
+CREATE TABLE IF NOT EXISTS research_screenings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  input_hash TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason_codes_json TEXT NOT NULL DEFAULT '[]',
+  explanation TEXT NOT NULL,
+  signals_json TEXT NOT NULL DEFAULT '{}',
+  version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(event_id, input_hash, version)
+);
+CREATE INDEX IF NOT EXISTS idx_research_screenings_event
+  ON research_screenings(event_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_research_screenings_decision
+  ON research_screenings(decision, id DESC);
+CREATE TABLE IF NOT EXISTS research_screening_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  screening_id INTEGER NOT NULL UNIQUE REFERENCES research_screenings(id),
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  decision TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_screening_reviews_event
+  ON research_screening_reviews(event_id, id DESC);
+CREATE TABLE IF NOT EXISTS evidence_collection_runs (
+  id TEXT PRIMARY KEY,
+  event_id INTEGER NOT NULL REFERENCES trend_events(id),
+  screening_id INTEGER NOT NULL REFERENCES research_screenings(id),
+  status TEXT NOT NULL,
+  fetch_attempt_count INTEGER NOT NULL DEFAULT 0,
+  successful_document_count INTEGER NOT NULL DEFAULT 0,
+  independent_source_count INTEGER NOT NULL DEFAULT 0,
+  stop_reason TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_collection_runs_event
+  ON evidence_collection_runs(event_id, started_at DESC);
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id INTEGER NOT NULL REFERENCES trend_events(id),
@@ -147,6 +188,7 @@ CREATE TABLE IF NOT EXISTS opportunity_signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id INTEGER NOT NULL REFERENCES trend_events(id),
   analysis_id INTEGER NOT NULL REFERENCES analyses(id),
+  opportunity_assessment_id INTEGER REFERENCES opportunity_assessments(id),
   change_type TEXT NOT NULL,
   consumer_relevance_score REAL NOT NULL,
   product_opportunity_score REAL NOT NULL,
@@ -529,6 +571,11 @@ class Database:
                 "opportunity_assessment_id",
                 "INTEGER REFERENCES opportunity_assessments(id)",
             )
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunity_signals_assessment
+                ON opportunity_signals(opportunity_assessment_id)
+                WHERE opportunity_assessment_id IS NOT NULL"""
+            )
             for table in ("source_snapshots", "source_items", "trend_events"):
                 self._ensure_column(conn, table, "market", "TEXT NOT NULL DEFAULT 'CN'")
                 self._ensure_column(conn, table, "language", "TEXT NOT NULL DEFAULT 'zh'")
@@ -807,6 +854,9 @@ class Database:
                 "semantic_duplicate_feedback",
                 "semantic_duplicate_candidates",
                 "research_candidates",
+                "evidence_collection_runs",
+                "research_screening_reviews",
+                "research_screenings",
                 "evidence_bundles",
                 "semantic_event_features",
                 "semantic_evaluation_labels",

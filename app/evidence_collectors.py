@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Protocol
+from typing import AsyncIterator, Awaitable, Callable, Protocol
 
 import httpx
 
@@ -143,17 +142,26 @@ class RelatedNewsCollector:
         current_evidence: list[dict],
         budget: ResearchBudget,
     ) -> list[CollectedEvidence]:
+        return [
+            item
+            async for item in self.iter_collect(event, current_evidence, budget)
+        ]
+
+    async def iter_collect(
+        self,
+        event: dict,
+        current_evidence: list[dict],
+        budget: ResearchBudget,
+    ) -> AsyncIterator[CollectedEvidence]:
         existing_urls = {str(row.get("url") or "") for row in current_evidence}
         targets = [
             item
             for item in related_news_targets(event.get("source_items") or [])
             if item[0] not in existing_urls
         ]
-        collected = []
         for url, title, source_name in targets[: budget.max_fetch_pages]:
             result = await self.fetcher(url, title or str(event["canonical_title"]))
-            collected.append(_from_result(result, source_name, self.name))
-        return collected
+            yield _from_result(result, source_name, self.name)
 
 
 class PublicNewsSearchCollector:
@@ -176,8 +184,19 @@ class PublicNewsSearchCollector:
         current_evidence: list[dict],
         budget: ResearchBudget,
     ) -> list[CollectedEvidence]:
+        return [
+            item
+            async for item in self.iter_collect(event, current_evidence, budget)
+        ]
+
+    async def iter_collect(
+        self,
+        event: dict,
+        current_evidence: list[dict],
+        budget: ResearchBudget,
+    ) -> AsyncIterator[CollectedEvidence]:
         if budget.max_search_queries <= 0 or budget.max_fetch_pages <= 0:
-            return []
+            return
         source_items = event.get("source_items") or []
         queries = build_fact_search_queries(
             event, source_items, budget.max_search_queries
@@ -217,11 +236,8 @@ class PublicNewsSearchCollector:
             if len(selected) >= budget.max_fetch_pages:
                 break
 
-        results = await asyncio.gather(
-            *[self.fetcher(hit.url, hit.title) for hit, _query in selected]
-        )
-        collected: list[CollectedEvidence] = []
-        for result, (hit, _query) in zip(results, selected, strict=True):
+        for hit, _query in selected:
+            result = await self.fetcher(hit.url, hit.title)
             metadata = {
                 **result.raw_metadata,
                 "search_provider": hit.provider,
@@ -230,27 +246,24 @@ class PublicNewsSearchCollector:
                 "search_published_at": hit.published_at,
                 "search_provider_url": hit.provider_url,
             }
-            collected.append(
-                CollectedEvidence(
-                    evidence_type=result.evidence_type,
-                    source_name=(
-                        registrable_domain(result.url)
-                        or hit.source_name
-                        or hit.provider
-                    ),
-                    url=result.url,
-                    title=result.title,
-                    excerpt=result.excerpt,
-                    fetch_method=self.name,
-                    fetch_status=result.fetch_status,
-                    fetched_at=result.fetched_at,
-                    http_status=result.http_status,
-                    content_hash=result.content_hash,
-                    error=result.error,
-                    raw_metadata=metadata,
-                )
+            yield CollectedEvidence(
+                evidence_type=result.evidence_type,
+                source_name=(
+                    registrable_domain(result.url)
+                    or hit.source_name
+                    or hit.provider
+                ),
+                url=result.url,
+                title=result.title,
+                excerpt=result.excerpt,
+                fetch_method=self.name,
+                fetch_status=result.fetch_status,
+                fetched_at=result.fetched_at,
+                http_status=result.http_status,
+                content_hash=result.content_hash,
+                error=result.error,
+                raw_metadata=metadata,
             )
-        return collected
 
 
 class ManualEvidenceCollector:

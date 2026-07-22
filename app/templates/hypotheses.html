@@ -1,8 +1,29 @@
 {% extends "base.html" %}
-{% block title %}商品假设 · 新品机会系统{% endblock %}
+{% block title %}商品方向 · 选品助手{% endblock %}
 {% block content %}
-<section class="hero compact-hero"><div><p class="eyebrow">PRODUCT HYPOTHESES</p><h1>商品假设</h1><p class="muted">这是待验证的具体实体商品构思，不是选品推荐。只有审核后的假设才能进入平台验证。</p></div><a class="button-link" href="/signals">从机会线索开始</a></section>
-<div class="notice"><strong>证据链：</strong>每条假设都引用已审核的 OpportunitySignal 和真实证据；阻断风险或缺少具体查询词时不能进入市场验证。</div>
-<section class="signal-grid">{% for item in hypotheses %}<article class="panel signal-card"><div class="signal-card-head"><div><span class="status {{ item.status }}">{{ statuses[item.status] }}</span><span>风险 {{ item.risk_level }}</span></div><b>#{{ item.id }}</b></div><a href="/events/{{ item.event_id }}"><h2>{{ item.name }}</h2></a><p class="signal-type">{{ item.physical_form }}</p><p><b>目标用户：</b>{{ item.target_users|join('、') }}</p><p><b>使用场景：</b>{{ item.scenarios|join('、') }}</p><p><b>待解决问题：</b>{{ item.problem }}</p><p><b>预期差异：</b>{{ item.expected_difference }}</p><p><b>查询词候选：</b>{{ item.query_terms|join('、') if item.query_terms else '尚未填写' }} · {{ item.target_marketplace }}</p>{% if item.risk_flags %}<details><summary>风险检查</summary><ul>{% for risk in item.risk_flags %}<li>{{ risk.severity }} · {{ risk.reason }}</li>{% endfor %}</ul></details>{% endif %}<small>{{ item.generator_type }} / {{ item.provider }} / {{ item.version }}</small><div class="signal-feedback"><button class="compact primary" onclick="reviewHypothesis({{ item.id }},'ready_for_validation')">进入市场验证</button><button class="compact ghost" onclick="reviewHypothesis({{ item.id }},'rejected')">否决</button><button class="compact ghost" onclick="reviewHypothesis({{ item.id }},'draft')">退回草稿</button></div></article>{% else %}<section class="panel empty"><p>当前没有商品假设。</p><p>先在线索页将一条线索标为“值得跟进”，再从事件详情人工创建。</p></section>{% endfor %}</section>
+<section class="hero compact-hero"><div><p class="eyebrow">机会判断 → 商品方向 → 市场验证</p><h1>商品方向</h1><p class="muted">每个方向都必须来自已批准的机会判断并引用其证据。这里描述具体实体商品，不代表平台需求已验证。</p></div><a class="button-link" href="/research">返回机会判断</a></section>
+<section class="signal-grid">
+{% for item in hypotheses %}
+  <article class="panel signal-card">
+    <div class="signal-card-head"><div><span class="status {{ item.status }}">{{ statuses[item.status] }}</span><span>风险 {{ item.risk_level }}</span></div><b>#{{ item.id }}</b></div>
+    <a href="/events/{{ item.event_id }}"><h2>{{ item.name }}</h2></a>
+    <p class="signal-type">{{ item.physical_form }}</p>
+    <p><b>目标用户：</b>{{ item.target_users|join('、') }}</p><p><b>使用场景：</b>{{ item.scenarios|join('、') }}</p><p><b>待解决问题：</b>{{ item.problem }}</p><p><b>预期差异：</b>{{ item.expected_difference }}</p>
+    <p><b>查询词：</b>{{ item.query_terms|join('、') if item.query_terms else '尚未填写，不能进入市场验证' }} · {{ item.target_marketplace }}</p>
+    {% if item.risk_flags %}<details><summary>风险检查</summary><ul>{% for risk in item.risk_flags %}<li>{{ risk.severity }} · {{ risk.reason }}</li>{% endfor %}</ul></details>{% endif %}
+    <details><summary>系统记录</summary><small>{{ item.generator_type }} / {{ item.provider }} / {{ item.version }}</small></details>
+    <div class="signal-feedback">
+      {% if item.status == 'draft' %}<button class="compact primary" onclick="reviewHypothesis({{ item.id }},'ready_for_validation')">进入市场验证</button><button class="compact ghost" onclick="reviewHypothesis({{ item.id }},'rejected')">否决</button>
+      {% elif item.status == 'ready_for_validation' %}<a class="button-link compact primary" href="/validation">继续市场验证</a><button class="compact ghost" onclick="reviewHypothesis({{ item.id }},'draft')">退回草稿</button>
+      {% elif item.status == 'validated' %}<a class="button-link compact primary" href="/recommendations">查看已验证选品</a>
+      {% else %}<span class="muted">该方向已结束，不再进入后续流程。</span>{% endif %}
+    </div>
+  </article>
+{% else %}
+  <section class="panel empty"><p>当前没有商品方向。</p><p>先在机会判断中确认一条值得跟进的消费变化，再从事件页创建方向。</p></section>
+{% endfor %}
+</section>
 {% endblock %}
-{% block scripts %}<script>async function reviewHypothesis(id,status){const note=prompt('审核说明（可留空）','')??'';if(await postAction(`/api/product-hypotheses/${id}/review`,'商品假设状态已更新',{status,note}))setTimeout(()=>location.reload(),350);}</script>{% endblock %}
+{% block scripts %}<script>
+async function reviewHypothesis(id,status){const note=prompt('审核说明（可留空）','')??'';if(await postAction(`/api/product-hypotheses/${id}/review`,'商品方向状态已更新',{status,note}))setTimeout(()=>location.reload(),350);}
+</script>{% endblock %}

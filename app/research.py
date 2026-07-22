@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 from .db import Database
+from .research_candidates import transition_research_candidate
 
 
 _SENSITIVE_REQUEST_KEYS = {
@@ -23,9 +24,9 @@ _SENSITIVE_REQUEST_KEYS = {
 
 
 class ResearchBudget(BaseModel):
-    max_search_queries: int = Field(default=8, ge=0, le=100)
-    max_fetch_pages: int = Field(default=15, ge=0, le=200)
-    max_browser_pages: int = Field(default=3, ge=0, le=50)
+    max_search_queries: int = Field(default=1, ge=0, le=100)
+    max_fetch_pages: int = Field(default=4, ge=0, le=200)
+    max_browser_pages: int = Field(default=0, ge=0, le=0)
     timeout_seconds: int = Field(default=300, ge=1, le=3600)
     markets: list[str] = Field(default_factory=list, max_length=20)
     languages: list[str] = Field(default_factory=list, max_length=20)
@@ -60,7 +61,13 @@ def start_research_run(
 ) -> dict:
     if value.executor_type not in {"human", "rules", "agent"}:
         raise ValueError("invalid executor type")
-    if candidate["status"] in {"completed", "superseded"}:
+    if candidate["status"] not in {
+        "pending",
+        "researching",
+        "evidence_ready",
+        "insufficient_evidence",
+        "failed",
+    }:
         raise ValueError("candidate is not runnable")
     existing = db.one(
         """SELECT * FROM research_runs
@@ -103,10 +110,7 @@ def start_research_run(
     except Exception:
         db.release_lease(lease_name, run_id)
         raise
-    db.execute(
-        "UPDATE research_candidates SET status='researching',updated_at=? WHERE id=?",
-        (now, candidate["id"]),
-    )
+    transition_research_candidate(db, int(candidate["id"]), "researching", now=now)
     return decode_research_run(
         db.one("SELECT * FROM research_runs WHERE id=?", (run_id,))
     )
@@ -138,10 +142,8 @@ def complete_research_run(
             if bundle and bundle["readiness_status"] == "ready_for_assessment"
             else "insufficient_evidence"
         )
-    db.execute(
-        """UPDATE research_candidates SET status=?,updated_at=?
-        WHERE id=? AND status='researching'""",
-        (candidate_status, now, run["candidate_id"]),
+    transition_research_candidate(
+        db, int(run["candidate_id"]), candidate_status, now=now
     )
     db.release_lease(f"research-candidate:{run['candidate_id']}", run["id"])
     return decode_research_run(

@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .evidence_quality import content_near_duplicate, registrable_domain
+
 
 FETCH_STATUS_LABELS = {
     "content_too_short": "正文过短",
@@ -73,8 +75,10 @@ class FetchFailureView(BaseModel):
 
 
 class EventResearchView(BaseModel):
+    stage_label: str
     conclusion_code: str
     conclusion_label: str
+    primary_action: str
     stop_reasons: list[str] = Field(default_factory=list)
     category_candidates: list[CategoryCandidateView] = Field(default_factory=list)
     positive_similarity: float | None = None
@@ -114,6 +118,52 @@ def _producer_status(analysis: dict | None) -> str:
     return "存在历史分析记录；是否形成线索仍以审核后的 OpportunitySignal 为准。"
 
 
+def select_key_evidence(evidence: list[dict], limit: int = 2) -> list[dict]:
+    """Select the strongest independent evidence for the product-facing summary."""
+    type_priority = {
+        "official_notice": 5,
+        "full_article": 4,
+        "consumer_discussion": 3,
+        "article_summary": 2,
+        "consumer_comment": 1,
+        "manual_evidence": 1,
+    }
+    candidates = [
+        row
+        for row in evidence
+        if bool(row.get("valid_for_analysis"))
+        and str(row.get("fetch_status") or "") == "ready"
+        and str(row.get("evidence_type") or "") in type_priority
+    ]
+    candidates.sort(
+        key=lambda row: (
+            type_priority.get(str(row.get("evidence_type") or ""), 0),
+            float(row.get("quality_score") or 0),
+            int(row.get("id") or 0),
+        ),
+        reverse=True,
+    )
+    selected: list[dict] = []
+    identities: set[str] = set()
+    for row in candidates:
+        identity = registrable_domain(str(row.get("url") or "")) or str(
+            row.get("source_name") or "unknown"
+        ).casefold()
+        if identity in identities:
+            continue
+        excerpt = str(row.get("excerpt") or "")
+        if any(
+            content_near_duplicate(excerpt, str(item.get("excerpt") or ""))
+            for item in selected
+        ):
+            continue
+        selected.append(row)
+        identities.add(identity)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def build_event_research_view(
     event: dict,
     bundle: dict[str, Any],
@@ -126,23 +176,35 @@ def build_event_research_view(
 ) -> EventResearchView:
     readiness_status = str(bundle.get("readiness_status") or "insufficient")
     if signals:
+        stage_label = "已确认机会"
         conclusion_code = "signal_created"
-        conclusion_label = "已形成机会线索，等待或已完成人工审核"
+        conclusion_label = "消费变化已通过人工确认，可以进入商品方向"
+        primary_action = "从已确认机会生成少量实体商品方向"
     elif assessment and assessment.get("review_status") == "pending":
+        stage_label = "机会判断"
         conclusion_code = "assessment_pending"
-        conclusion_label = "机会评估已完成，等待人工审核"
+        conclusion_label = "机会判断草稿已完成，等待人工确认"
+        primary_action = "审核当前判断：值得跟进、不适合选品或需要补证据"
     elif candidate:
+        stage_label = "机会判断"
         conclusion_code = "research_candidate"
-        conclusion_label = "已形成待研究方向，尚未形成机会线索"
+        conclusion_label = "证据与研究问题已准备，尚未形成消费机会结论"
+        primary_action = "使用本页表单完成一次结构化机会判断"
     elif readiness_status == "ready_for_assessment":
+        stage_label = "机会判断"
         conclusion_code = "ready_for_assessment"
         conclusion_label = "证据已准备，等待机会判断"
+        primary_action = "将该趋势加入机会判断队列"
     elif bundle.get("evidence_ids"):
+        stage_label = "趋势发现"
         conclusion_code = "insufficient_evidence"
-        conclusion_label = "证据不足，暂不形成机会线索"
+        conclusion_label = "当前证据不足，暂不进入机会判断"
+        primary_action = "等待新的独立来源；不要生成商品方向"
     else:
+        stage_label = "趋势发现"
         conclusion_code = "no_evidence"
         conclusion_label = "尚无证据，暂不判断"
+        primary_action = "等待公开证据；不要根据标题猜测需求"
 
     missing = list(bundle.get("missing_evidence") or [])
     stop_reasons = [] if signals else list(missing)
@@ -211,8 +273,10 @@ def build_event_research_view(
     elif assessment and not signals:
         producer_status = "OpportunityAssessment 已保存；只有人工批准后才会映射为机会线索。"
     return EventResearchView(
+        stage_label=stage_label,
         conclusion_code=conclusion_code,
         conclusion_label=conclusion_label,
+        primary_action=primary_action,
         stop_reasons=stop_reasons,
         category_candidates=categories,
         positive_similarity=float(positive) if positive is not None else None,

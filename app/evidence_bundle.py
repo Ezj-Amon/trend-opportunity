@@ -192,7 +192,6 @@ def build_evidence_bundle(
     ready = (
         independent_source_count >= 2
         and full_text_count >= 1
-        and readiness_score >= ready_score
     )
     if ready:
         readiness_status = "ready_for_assessment"
@@ -206,8 +205,11 @@ def build_evidence_bundle(
         missing_evidence.append("至少需要 2 个独立来源")
     if full_text_count < 1:
         missing_evidence.append("至少需要 1 条完整正文或官方公告")
-    if readiness_score < ready_score:
-        missing_evidence.append(f"证据质量分需达到 {ready_score:.2f}")
+    # ``ready_score`` is retained for API compatibility and as a diagnostic
+    # display value. Readiness itself follows the product rule: two genuinely
+    # independent sources, including at least one full article or official notice.
+    # This deliberately permits a reliable summary to be the second source.
+    _ = ready_score
     if consumer_voice_count < 1:
         missing_evidence.append("缺少公开消费者声音（非强制，但有助于验证具体痛点）")
 

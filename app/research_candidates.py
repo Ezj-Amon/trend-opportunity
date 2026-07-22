@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 from .db import Database
+from .research_screening import screen_research_event
 
 
 RESEARCH_CANDIDATE_STATUSES = {
@@ -17,6 +18,17 @@ RESEARCH_CANDIDATE_STATUSES = {
     "completed",
     "failed",
     "superseded",
+}
+
+RESEARCH_CANDIDATE_TRANSITIONS = {
+    "pending": {"researching"},
+    "researching": {"evidence_ready", "insufficient_evidence", "failed"},
+    "evidence_ready": {"researching", "awaiting_review"},
+    "insufficient_evidence": {"researching", "awaiting_review"},
+    "awaiting_review": {"completed", "insufficient_evidence"},
+    "failed": {"researching"},
+    "completed": set(),
+    "superseded": set(),
 }
 
 COMMERCIAL_RESEARCH_BLOCKLIST = {
@@ -93,7 +105,9 @@ def is_commercial_research_blocked(event: dict) -> bool:
     if label == "high_risk":
         return True
     corpus = str(event.get("canonical_title") or "").casefold()
-    return any(word.casefold() in corpus for word in COMMERCIAL_RESEARCH_BLOCKLIST)
+    if any(word.casefold() in corpus for word in COMMERCIAL_RESEARCH_BLOCKLIST):
+        return True
+    return screen_research_event(event).decision == "rejected"
 
 
 def candidate_from_event(
@@ -281,6 +295,112 @@ def persist_research_candidate(db: Database, draft: ResearchCandidateDraft) -> d
     if row is None:
         raise RuntimeError("failed to persist research candidate")
     return decode_research_candidate(row)
+
+
+def transition_research_candidate(
+    db: Database,
+    candidate_id: int,
+    target_status: str,
+    *,
+    now: str | None = None,
+) -> dict:
+    """Move a candidate only when the persisted workflow proves the transition."""
+    if target_status not in RESEARCH_CANDIDATE_STATUSES - {"superseded"}:
+        raise ValueError("invalid research candidate status")
+    row = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    if row is None:
+        raise LookupError("research candidate not found")
+    current_status = str(row["status"])
+    if current_status == target_status:
+        return decode_research_candidate(row)
+    if target_status not in RESEARCH_CANDIDATE_TRANSITIONS.get(current_status, set()):
+        raise ValueError(
+            f"research candidate cannot move from {current_status} to {target_status}"
+        )
+
+    if target_status == "researching":
+        proof = db.one(
+            """SELECT id FROM research_runs
+            WHERE candidate_id=? AND status='running' ORDER BY started_at DESC LIMIT 1""",
+            (candidate_id,),
+        )
+        if not proof:
+            raise ValueError("a running research run is required")
+    elif target_status in {"evidence_ready", "failed"}:
+        run_status = "completed" if target_status == "evidence_ready" else "failed"
+        proof = db.one(
+            """SELECT id FROM research_runs
+            WHERE candidate_id=? AND status=? ORDER BY started_at DESC LIMIT 1""",
+            (candidate_id, run_status),
+        )
+        if not proof:
+            raise ValueError(f"a {run_status} research run is required")
+        if target_status == "evidence_ready":
+            bundle = db.one(
+                """SELECT b.readiness_status FROM research_candidates c
+                JOIN evidence_bundles b ON b.id=c.evidence_bundle_id WHERE c.id=?""",
+                (candidate_id,),
+            )
+            if not bundle or bundle["readiness_status"] != "ready_for_assessment":
+                raise ValueError("candidate evidence bundle is not ready for assessment")
+    elif target_status == "insufficient_evidence":
+        if current_status == "researching":
+            proof = db.one(
+                """SELECT id FROM research_runs
+                WHERE candidate_id=? AND status='completed'
+                ORDER BY started_at DESC LIMIT 1""",
+                (candidate_id,),
+            )
+            bundle = db.one(
+                """SELECT b.readiness_status FROM research_candidates c
+                JOIN evidence_bundles b ON b.id=c.evidence_bundle_id WHERE c.id=?""",
+                (candidate_id,),
+            )
+            if not proof or (
+                bundle and bundle["readiness_status"] == "ready_for_assessment"
+            ):
+                raise ValueError("completed research must prove insufficient evidence")
+        else:
+            proof = db.one(
+                """SELECT id FROM opportunity_assessments
+                WHERE candidate_id=? AND review_status='needs_more_evidence'
+                ORDER BY id DESC LIMIT 1""",
+                (candidate_id,),
+            )
+            if not proof:
+                raise ValueError("a reviewed more-evidence decision is required")
+    elif target_status == "awaiting_review":
+        proof = db.one(
+            """SELECT id FROM opportunity_assessments
+            WHERE candidate_id=? AND review_status='pending' ORDER BY id DESC LIMIT 1""",
+            (candidate_id,),
+        )
+        if not proof:
+            raise ValueError("a pending opportunity assessment is required")
+    elif target_status == "completed":
+        assessment = db.one(
+            """SELECT * FROM opportunity_assessments
+            WHERE candidate_id=? AND review_status IN ('approved','rejected')
+            ORDER BY id DESC LIMIT 1""",
+            (candidate_id,),
+        )
+        if not assessment:
+            raise ValueError("a completed opportunity assessment review is required")
+        if assessment["review_status"] == "approved" and not db.one(
+            "SELECT id FROM opportunity_signals WHERE opportunity_assessment_id=?",
+            (assessment["id"],),
+        ):
+            raise ValueError("an approved assessment must have an opportunity signal")
+
+    updated_at = now or datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "UPDATE research_candidates SET status=?,updated_at=? WHERE id=?",
+        (target_status, updated_at, candidate_id),
+    )
+    updated = db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,))
+    if updated is None:
+        raise RuntimeError("research candidate disappeared during transition")
+    return decode_research_candidate(updated)
 
 
 def decode_research_candidate(row: dict) -> dict:

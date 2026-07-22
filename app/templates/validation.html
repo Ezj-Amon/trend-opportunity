@@ -1,192 +1,66 @@
 {% extends "base.html" %}
-{% block title %}市场验证任务 · 选品助手{% endblock %}
+{% block title %}市场验证 · 选品助手{% endblock %}
 {% block content %}
 <section class="hero validation-hero">
   <div>
-    <p class="eyebrow">TODAY'S VALIDATION TASKS</p>
-    <h1>市场验证任务</h1>
-    <p class="muted">只有人工确认、结构完整的具体商品假设才能进入这里。旧规则产物不会自动生成查询词或验证任务。</p>
+    <p class="eyebrow">商品方向 → 市场验证 → 已验证选品</p>
+    <h1>市场验证</h1>
+    <p class="muted">这里只接收已审核、低风险且带明确查询词的商品方向。平台需求、竞争、成本和经济性证据不完整时，不会生成选品推荐。</p>
   </div>
-  {% if ready_count %}<a class="button-link primary" href="#task-{{ opportunities[0].id }}">开始第 1 条验证</a>{% endif %}
+  {% if hypotheses %}<a class="button-link primary" href="#hypothesis-{{ hypotheses[0].id }}">开始第 1 条验证</a>{% endif %}
 </section>
 
 <section class="panel validation-guide">
-  <div class="panel-head"><div><h2>独立 ProductHypothesis 验证队列</h2><span>以下任务来自已审核的实体商品假设；平台证据将写入独立 MarketEvidence。</span></div><strong>{{ hypotheses|length }} 条</strong></div>
-  <div class="validation-task-list">{% for item in hypotheses %}<article class="validation-task">
-    <div class="task-order"><span>{{ loop.index }}</span><small>顺序</small></div><div class="task-product"><p class="task-label">具体商品假设 #{{ item.id }}</p><a href="/events/{{ item.event_id }}"><h3>{{ item.name }}</h3></a><p>{{ item.physical_form }}</p><span class="route-label">{{ item.signal_market }} → {{ item.target_marketplace }}</span></div>
-    <div class="task-query"><p class="task-label">人工确认查询词</p><div class="query-ready"><code>{{ item.query_terms[0] }}</code></div><p class="muted">只使用具体商品中心词，不使用新闻关键词。</p></div>
-    <div class="task-action"><p class="task-label">上传 Amazon 第一方证据</p><details class="raw-import"><summary>选择两份 Seller Central CSV</summary><label>商机探测器 CSV<input id="new-poe-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label><label>热门搜索词 CSV<input id="new-hot-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label><button id="new-import-button-{{ item.id }}" class="compact primary" onclick="importHypothesisAmazonFiles({{ item.id }})">上传并验证</button></details><button class="compact ghost" onclick="supplementEconomics({{ item.id }},'{{ item.target_marketplace }}')">补充单位经济与执行证据</button>{% if item.market_evidence %}<p><span class="status {{ item.market_evidence.status }}">最近证据 {{ item.market_evidence.status }}</span>{% if item.market_evidence.market_score is not none %} 市场分 {{ item.market_evidence.market_score }}{% endif %}</p>{% endif %}</div>
-  </article>{% else %}<div class="empty">当前没有审核完成且带具体查询词的商品假设。</div>{% endfor %}</div>
-</section>
-
-<section class="panel validation-guide">
-  <div class="panel-head">
-    <div><h2>按这 3 步完成</h2><span>不需要人工打分，系统会读取原始指标并完成评分</span></div>
-    <strong>{{ ready_count }} 个可立即验证{% if waiting_count %} · {{ waiting_count }} 个由系统继续准备{% endif %}</strong>
-  </div>
-  <div class="workflow-steps">
-    <article><span>1</span><div><b>确认商品查询词</b><p>查询词必须来自具体商品形态、目标用户和场景，不能从新闻关键词自动补齐。</p></div></article>
-    <article><span>2</span><div><b>导出两份原始 CSV</b><p>在商机探测器和品牌分析的热门搜索词中搜索同一个词并下载。</p></div></article>
-    <article><span>3</span><div><b>上传，系统自动评分</b><p>系统匹配查询词、读取指标并更新机会排序，不要求你判断 1–5 分。</p></div></article>
-  </div>
-</section>
-
-{% if ready_count %}
-<div class="notice next-task"><strong>现在从第 1 条开始。</strong> 复制查询词，在 Seller Central 导出两份文件，然后回到同一行上传。完成一条再做下一条。</div>
-{% else %}
-<div class="notice next-task"><strong>当前没有可进入市场验证的商品假设。</strong> OpportunitySignal 与 ProductHypothesis 主链路完成前，系统不会用旧规则产物填充队列。</div>
-{% endif %}
-
-<section class="panel">
-  <div class="panel-head"><h2>验证队列</h2><span>{{ opportunities|length }} 个待完成机会</span></div>
+  <div class="panel-head"><div><h2>待验证商品方向</h2><span>每条市场证据都写入独立记录，并完整回溯到已批准的机会判断。</span></div><strong>{{ hypotheses|length }} 条</strong></div>
   <nav class="market-filters" aria-label="目标站点筛选">
     <a href="/validation?marketplace=ALL" class="{{ 'active' if selected_marketplace == 'ALL' else '' }}">全部</a>
     {% for code, name in marketplaces.items() %}<a href="/validation?marketplace={{ code }}" class="{{ 'active' if selected_marketplace == code else '' }}">{{ code }} · {{ name }}</a>{% endfor %}
   </nav>
   <div class="validation-task-list">
-    {% for item in opportunities %}
-    <article id="task-{{ item.id }}" class="validation-task {{ 'task-waiting' if item.query_readiness != 'ready' else '' }}">
-      <div class="task-order"><span>{{ item.queue_position }}</span><small>优先级</small></div>
-      <div class="task-product">
-        <p class="task-label">系统选出的产品机会</p>
-        <a href="/events/{{ item.event_id }}"><h3>{{ item.name }}</h3></a>
-        <p>{{ item.category or item.event_title }}</p>
-        <span class="route-label">{{ item.signal_market }} → {{ item.target_marketplace }} · {{ item.marketplace }}</span>
-      </div>
-      <div class="task-query">
-        <p class="task-label">已确认商品查询词</p>
-        {% if item.query_readiness == 'ready' %}
-        <div class="query-ready"><code id="query-text-{{ item.id }}">{{ item.amazon_search_term }}</code><button class="compact" onclick="copySearchTerm({{ item.id }})">复制</button></div>
-        <button class="text-button" onclick="toggleCorrection({{ item.id }})">查询词不准确？修正</button>
-        {% else %}
-        <strong class="system-preparing">系统尚未生成合格查询词</strong>
-        <p class="muted">这条不会要求你先做判断。</p>
-        <button class="text-button" onclick="toggleCorrection({{ item.id }})">我知道准确商品词，可手动补充</button>
-        {% endif %}
-        <div id="query-correction-{{ item.id }}" class="query-correction" hidden>
-          <label for="search-term-{{ item.id }}">修正后的买家查询词</label>
-          <div><input class="search-term-input" id="search-term-{{ item.id }}" value="{{ item.amazon_search_term }}" placeholder="例如 desk organizer"><button class="compact primary" onclick="saveSearchTerm({{ item.id }})">保存</button></div>
-        </div>
-      </div>
+  {% for item in hypotheses %}
+    <article id="hypothesis-{{ item.id }}" class="validation-task">
+      <div class="task-order"><span>{{ loop.index }}</span><small>顺序</small></div>
+      <div class="task-product"><p class="task-label">商品方向 #{{ item.id }}</p><a href="/events/{{ item.event_id }}"><h3>{{ item.name }}</h3></a><p>{{ item.physical_form }}</p><span class="route-label">{{ item.signal_market }} → {{ item.target_marketplace }}</span></div>
+      <div class="task-query"><p class="task-label">已确认查询词</p><div class="query-ready"><code>{{ item.query_terms[0] }}</code></div><p class="muted">查询词来自具体商品形态和使用场景，不使用新闻关键词。</p></div>
       <div class="task-action">
-        <p class="task-label">下一步</p>
-        {% if item.query_readiness == 'ready' %}
-        <p><b>去 Seller Central 搜索上面的词</b></p>
-        <ol><li>增长 → 商机探测器 → 下载 CSV</li><li>品牌 → 品牌分析 → 热门搜索词 → 下载 CSV</li></ol>
-        <details class="raw-import">
-          <summary>文件已下载，开始上传</summary>
-          <label>1. 商机探测器 CSV<input id="poe-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label>
-          <label>2. 热门搜索词 CSV<input id="hot-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label>
-          <button id="import-button-{{ item.id }}" class="compact primary" onclick="importRawAmazonFiles({{ item.id }})">上传并自动评分</button>
-          <p id="import-progress-{{ item.id }}" class="import-progress" hidden></p>
-        </details>
-        {% else %}
-        <p class="muted"><b>暂时不用处理。</b>系统补全查询词后再进入验证。</p>
-        {% endif %}
-        <div class="task-state">
-          {% if item.validation_status == 'partial' %}<span class="status partial">已有部分结果</span><small>可以补充文件，系统会重新计算</small>
-          {% elif item.validation_status == 'pending' %}<span class="status pending">等待验证</span><small>上传两份文件即可</small>
-          {% else %}<span class="status unavailable">尚无市场数据</span><small>上传后自动更新</small>{% endif %}
-        </div>
-        <details class="task-settings">
-          <summary>系统设置（一般不用改）</summary>
-          <label>目标站点
-            <select id="queue-marketplace-{{ item.id }}">
-              {% for code, name in marketplaces.items() %}<option value="{{ code }}" {% if code == item.target_marketplace %}selected{% endif %}>{{ code }} · {{ name }}</option>{% endfor %}
-            </select>
-          </label>
-          <button class="compact" onclick="changeQueueMarketplace({{ item.id }})">保存站点修正</button>
-        </details>
+        <p class="task-label">下一步：上传 Amazon 第一方证据</p>
+        <details class="raw-import"><summary>选择两份 Seller Central CSV</summary><label>商机探测器 CSV<input id="new-poe-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label><label>热门搜索词 CSV<input id="new-hot-file-{{ item.id }}" type="file" accept=".csv,text/csv"></label><button id="new-import-button-{{ item.id }}" class="compact primary" onclick="importHypothesisAmazonFiles({{ item.id }})">上传并验证</button></details>
+        <button class="compact ghost" onclick="supplementEconomics({{ item.id }},'{{ item.target_marketplace }}')">补充成本与执行证据</button>
+        {% if item.market_evidence %}<p><span class="status {{ item.market_evidence.status }}">最近证据：{{ '已完整' if item.market_evidence.status == 'completed' else '仍需补充' }}</span>{% if item.market_evidence.market_score is not none %} 市场分 {{ item.market_evidence.market_score }}{% endif %}</p>{% endif %}
       </div>
     </article>
-    {% else %}<div class="empty"><p>当前筛选下没有待验证机会。</p><p>下一轮趋势分析生成可验证任务后会出现在这里。</p></div>{% endfor %}
+  {% else %}
+    <div class="empty"><p>当前没有可进入市场验证的商品方向。</p><p><a href="/hypotheses">返回商品方向</a>；系统不会用旧规则产物填充队列。</p></div>
+  {% endfor %}
   </div>
 </section>
 
-<details class="panel advanced-import">
-  <summary>高级方式：导入已填写的标准验证表</summary>
-  <p class="muted">仅用于已有历史评分表的批量迁移。日常验证请直接在每条任务中上传两份 Seller Central 原始 CSV。</p>
-  <div class="advanced-import-actions">
-    <a class="button-link" href="/api/market-validations/template.csv?marketplace={{ selected_marketplace }}">下载标准验证表</a>
-    <label class="upload-button">选择标准验证 CSV<input id="validation-file" type="file" accept=".csv,text/csv" hidden></label>
-    <button id="upload-button" class="primary">导入历史结果</button>
+<section class="panel validation-guide">
+  <div class="panel-head"><div><h2>验证门槛</h2><span>全部通过才会进入“已验证选品”</span></div></div>
+  <div class="workflow-steps">
+    <article><span>1</span><div><b>需求与购买意图</b><p>使用同一商品查询词核对真实平台指标。</p></div></article>
+    <article><span>2</span><div><b>竞争与差异空间</b><p>确认竞争强度和方向的可验证差异，而不是只看趋势热度。</p></div></article>
+    <article><span>3</span><div><b>成本、执行与风险</b><p>单位经济性、证据完整度至少 3 分，且风险只能为低或中。</p></div></article>
   </div>
-</details>
+</section>
 {% endblock %}
 {% block scripts %}<script>
 async function importHypothesisAmazonFiles(id) {
-  const poe=document.getElementById(`new-poe-file-${id}`).files[0], hot=document.getElementById(`new-hot-file-${id}`).files[0]; if(!poe||!hot){toast('请同时选择两份 CSV',true);return;}
-  const button=document.getElementById(`new-import-button-${id}`); button.disabled=true; const token=localStorage.getItem('trendAdminToken'); const headers={'Content-Type':'application/json'}; if(token)headers['X-Admin-Token']=token;
-  const response=await fetch(`/api/product-hypotheses/${id}/amazon-raw-import`,{method:'POST',headers,body:JSON.stringify({product_opportunity_csv:await poe.text(),hot_search_terms_csv:await hot.text()})}); let body={};try{body=await response.json();}catch(_){} if(!response.ok){button.disabled=false;toast(body.detail||'市场证据导入失败',true);return;} const recommendation=body.recommendation; toast(recommendation?`验证通过，推荐分 ${recommendation.recommendation_score}`:`证据已保存，但尚未通过全部推荐门槛`); setTimeout(()=>location.reload(),700);
+  const poe=document.getElementById(`new-poe-file-${id}`).files[0], hot=document.getElementById(`new-hot-file-${id}`).files[0];
+  if(!poe||!hot){toast('请同时选择两份 CSV',true);return;}
+  const button=document.getElementById(`new-import-button-${id}`); button.disabled=true;
+  const token=localStorage.getItem('trendAdminToken'); const headers={'Content-Type':'application/json'}; if(token)headers['X-Admin-Token']=token;
+  const response=await fetch(`/api/product-hypotheses/${id}/amazon-raw-import`,{method:'POST',headers,body:JSON.stringify({product_opportunity_csv:await poe.text(),hot_search_terms_csv:await hot.text()})});
+  let body={};try{body=await response.json();}catch(_){}
+  if(!response.ok){button.disabled=false;toast(body.detail||'市场证据导入失败',true);return;}
+  toast(body.recommendation?`验证通过，推荐分 ${body.recommendation.recommendation_score}`:'证据已保存，但尚未通过全部推荐门槛'); setTimeout(()=>location.reload(),700);
 }
 async function supplementEconomics(id, marketplace) {
   const economics=Number(prompt('单位经济性评分 1-5（基于到岸成本、平台费、广告和退货）','')); if(!Number.isInteger(economics)||economics<1||economics>5){toast('单位经济性必须为 1-5',true);return;}
   const execution=Number(prompt('执行可行性评分 1-5（基于供应链、合规和交付）','')); if(!Number.isInteger(execution)||execution<1||execution>5){toast('执行可行性必须为 1-5',true);return;}
-  const source=prompt('证据来源或成本核算文件说明','')||''; const scores={search_demand_score:null,purchase_intent_score:null,competition_score:null,unit_economics_score:economics,differentiation_score:null,execution_score:execution,timing_score:null,evidence_score:null};
-  const body=await postAction(`/api/product-hypotheses/${id}/market-evidence`,null,{provider:'manual-economics',provider_version:'manual-economics-v1',marketplace,query:{},scores,metrics:{},sources:source?[source]:[],note:'补充单位经济与执行证据'}); if(!body)return; toast(body.recommendation?`组合证据通过，推荐分 ${body.recommendation.recommendation_score}`:'补充证据已保存，仍有门槛未通过'); setTimeout(()=>location.reload(),600);
-}
-const fileInput = document.getElementById('validation-file');
-fileInput?.addEventListener('change', () => {
-  const label = fileInput.closest('label');
-  if (fileInput.files[0]) label.firstChild.textContent = fileInput.files[0].name;
-});
-document.getElementById('upload-button')?.addEventListener('click', async () => {
-  const file = fileInput.files[0];
-  if (!file) { toast('请先选择 CSV 文件', true); return; }
-  const token = localStorage.getItem('trendAdminToken');
-  const headers = {'Content-Type':'text/csv; charset=utf-8'};
-  if (token) headers['X-Admin-Token'] = token;
-  const response = await fetch('/api/market-validations/import', {method:'POST', headers, body:await file.text()});
-  let body = {}; try { body = await response.json(); } catch (_) {}
-  if (!response.ok) { toast(body.detail || '导入失败', true); return; }
-  toast(`已导入 ${body.count} 条验证结果`);
-  setTimeout(()=>location.reload(),700);
-});
-
-async function copySearchTerm(id) {
-  const text = document.getElementById(`query-text-${id}`).textContent;
-  try { await navigator.clipboard.writeText(text); toast(`已复制：${text}`); }
-  catch (_) { toast(`请复制：${text}`); }
-}
-function toggleCorrection(id) {
-  const node = document.getElementById(`query-correction-${id}`);
-  node.hidden = !node.hidden;
-  if (!node.hidden) node.querySelector('input').focus();
-}
-async function changeQueueMarketplace(id) {
-  const target = document.getElementById(`queue-marketplace-${id}`).value;
-  if (await postAction(`/api/opportunities/${id}/target-marketplace`, '目标站点已修正', {target_marketplace:target})) setTimeout(()=>location.reload(),500);
-}
-async function saveSearchTerm(id) {
-  const searchTerm = document.getElementById(`search-term-${id}`).value.trim();
-  if (await postAction(`/api/opportunities/${id}/search-term`, '查询词已修正', {search_term:searchTerm})) setTimeout(()=>location.reload(),500);
-}
-async function importRawAmazonFiles(id) {
-  const poe = document.getElementById(`poe-file-${id}`).files[0];
-  const hot = document.getElementById(`hot-file-${id}`).files[0];
-  if (!poe || !hot) { toast('请同时选择商机探测器和热门搜索词 CSV', true); return; }
-  const button = document.getElementById(`import-button-${id}`);
-  const progress = document.getElementById(`import-progress-${id}`);
-  button.disabled = true;
-  progress.classList.remove('error');
-  progress.hidden = false;
-  progress.textContent = '正在读取文件并匹配已确认的商品查询词…';
-  const token = localStorage.getItem('trendAdminToken');
-  const headers = {'Content-Type':'application/json'};
-  if (token) headers['X-Admin-Token'] = token;
-  const response = await fetch(`/api/opportunities/${id}/amazon-raw-import`, {
-    method:'POST', headers,
-    body:JSON.stringify({product_opportunity_csv:await poe.text(),hot_search_terms_csv:await hot.text()})
-  });
-  let body = {}; try { body = await response.json(); } catch (_) {}
-  if (!response.ok) {
-    button.disabled = false;
-    progress.textContent = body.detail || '文件处理失败，请检查导出文件是否对应当前查询词。';
-    progress.classList.add('error');
-    return;
-  }
-  progress.textContent = `处理完成：市场分 ${body.market_score}，正在更新队列…`;
-  toast(`验证完成，市场分 ${body.market_score}`);
-  setTimeout(()=>location.reload(),1100);
+  const source=prompt('证据来源或成本核算文件说明','')||'';
+  const scores={search_demand_score:null,purchase_intent_score:null,competition_score:null,unit_economics_score:economics,differentiation_score:null,execution_score:execution,timing_score:null,evidence_score:null};
+  const body=await postAction(`/api/product-hypotheses/${id}/market-evidence`,null,{provider:'manual-economics',provider_version:'manual-economics-v1',marketplace,query:{},scores,metrics:{},sources:source?[source]:[],note:'补充单位经济与执行证据'});
+  if(!body)return; toast(body.recommendation?`组合证据通过，推荐分 ${body.recommendation.recommendation_score}`:'补充证据已保存，仍有门槛未通过'); setTimeout(()=>location.reload(),600);
 }
 </script>{% endblock %}

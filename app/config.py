@@ -45,15 +45,12 @@ class Settings:
     evidence_bundle_version: str = "evidence-bundle-v2"
     evidence_ready_score: float = 1.8
     research_candidate_version: str = "research-candidate-v2"
-    research_max_search_queries: int = 8
-    research_max_fetch_pages: int = 15
-    research_max_browser_pages: int = 3
+    research_max_search_queries: int = 1
+    research_max_fetch_pages: int = 4
     research_timeout_seconds: int = 300
     enable_public_news_search: bool = True
-    public_news_max_results: int = 8
+    public_news_max_results: int = 4
     searxng_base_url: str | None = None
-    enable_research_agent: bool = False
-    enable_browser_evidence: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -162,24 +159,19 @@ class Settings:
                 "RESEARCH_CANDIDATE_VERSION", "research-candidate-v2"
             ).strip(),
             research_max_search_queries=max(
-                0, int(os.getenv("RESEARCH_MAX_SEARCH_QUERIES", "8"))
+                0, int(os.getenv("RESEARCH_MAX_SEARCH_QUERIES", "1"))
             ),
             research_max_fetch_pages=max(
-                0, int(os.getenv("RESEARCH_MAX_FETCH_PAGES", "15"))
-            ),
-            research_max_browser_pages=max(
-                0, int(os.getenv("RESEARCH_MAX_BROWSER_PAGES", "3"))
+                0, int(os.getenv("RESEARCH_MAX_FETCH_PAGES", "4"))
             ),
             research_timeout_seconds=max(
                 1, int(os.getenv("RESEARCH_TIMEOUT_SECONDS", "300"))
             ),
             enable_public_news_search=_bool_env("ENABLE_PUBLIC_NEWS_SEARCH", True),
             public_news_max_results=max(
-                1, min(int(os.getenv("PUBLIC_NEWS_MAX_RESULTS", "8")), 30)
+                1, min(int(os.getenv("PUBLIC_NEWS_MAX_RESULTS", "4")), 30)
             ),
             searxng_base_url=(
                 os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/") or None
             ),
-            enable_research_agent=_bool_env("ENABLE_RESEARCH_AGENT"),
-            enable_browser_evidence=_bool_env("ENABLE_BROWSER_EVIDENCE"),
         )

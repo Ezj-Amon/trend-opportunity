@@ -22,8 +22,12 @@ from .news_search import build_public_news_search_provider
 from .research import ResearchBudget
 from .research_candidates import (
     candidate_from_event,
-    is_commercial_research_blocked,
     persist_research_candidate,
+)
+from .research_screening import (
+    persist_research_screening,
+    rescreen_pending_research_candidates,
+    screen_research_event,
 )
 from .semantic import (
     EmbeddingUnavailable,
@@ -233,6 +237,7 @@ class Pipeline:
                 events_count=len(event_ids),
             )
             self._update_run(run_id, stage="research", events_count=len(event_ids))
+            rescreen_pending_research_candidates(self.db)
             selected_ids = self._select_events(event_ids)
             self._set_progress(selected_count=len(selected_ids))
             for researched_count, event_id in enumerate(selected_ids, 1):
@@ -493,7 +498,8 @@ class Pipeline:
         events = self.db.all(
             f"""SELECT e.*,
             (SELECT COUNT(*) FROM analyses a WHERE a.event_id=e.id) analysis_count,
-            (SELECT COUNT(*) FROM evidence v WHERE v.event_id=e.id) evidence_count
+            (SELECT COUNT(*) FROM evidence v WHERE v.event_id=e.id) evidence_count,
+            (SELECT COUNT(*) FROM research_screenings s WHERE s.event_id=e.id) screening_count
             FROM trend_events e WHERE e.id IN ({placeholders}) ORDER BY e.id""",
             tuple(event_ids),
         )
@@ -513,13 +519,25 @@ class Pipeline:
                 merged, _, _ = should_merge(left["canonical_title"], right["canonical_title"])
                 if not merged:
                     continue
-                if left["analysis_count"] or left["evidence_count"]:
+                if (
+                    left["analysis_count"]
+                    or left["evidence_count"]
+                    or left["screening_count"]
+                ):
                     keeper, duplicate = left, right
-                elif right["analysis_count"] or right["evidence_count"]:
+                elif (
+                    right["analysis_count"]
+                    or right["evidence_count"]
+                    or right["screening_count"]
+                ):
                     keeper, duplicate = right, left
                 else:
                     keeper, duplicate = left, right
-                if duplicate["analysis_count"] or duplicate["evidence_count"]:
+                if (
+                    duplicate["analysis_count"]
+                    or duplicate["evidence_count"]
+                    or duplicate["screening_count"]
+                ):
                     continue
                 self.db.execute(
                     """INSERT OR IGNORE INTO event_members
@@ -564,7 +582,49 @@ class Pipeline:
         )
         return [int(row["id"]) for row in [*domestic, *overseas]]
 
-    async def _build_research_candidate(self, event_id: int) -> None:
+    async def collect_reviewed_screening(self, screening_id: int) -> dict[str, Any]:
+        screening = self.db.one(
+            "SELECT * FROM research_screenings WHERE id=?", (screening_id,)
+        )
+        if screening is None:
+            raise LookupError("未找到初筛记录")
+        latest = self.db.one(
+            "SELECT id FROM research_screenings WHERE event_id=? ORDER BY id DESC LIMIT 1",
+            (screening["event_id"],),
+        )
+        if screening["decision"] != "needs_review" or int(latest["id"]) != screening_id:
+            raise ValueError("只能对最新的待复核初筛执行补证")
+        review = self.db.one(
+            """SELECT * FROM research_screening_reviews
+            WHERE screening_id=? AND decision='collect_limited_evidence'""",
+            (screening_id,),
+        )
+        if review is None:
+            raise ValueError("有限补证必须先取得人工复核批准")
+        existing = self.db.one(
+            """SELECT * FROM evidence_collection_runs
+            WHERE screening_id=? ORDER BY started_at DESC LIMIT 1""",
+            (screening_id,),
+        )
+        if existing is not None:
+            candidate = self.db.one(
+                """SELECT * FROM research_candidates
+                WHERE event_id=? ORDER BY id DESC LIMIT 1""",
+                (screening["event_id"],),
+            )
+            return {
+                "status": "already_collected",
+                "screening_id": screening_id,
+                "collection_run": existing,
+                "candidate": candidate,
+            }
+        return await self._build_research_candidate(
+            int(screening["event_id"]), approved_screening_id=screening_id
+        )
+
+    async def _build_research_candidate(
+        self, event_id: int, approved_screening_id: int | None = None
+    ) -> dict[str, Any]:
         event = self.db.one("SELECT * FROM trend_events WHERE id = ?", (event_id,))
         members = self.db.all(
             """SELECT i.* FROM source_items i
@@ -572,6 +632,14 @@ class Pipeline:
             WHERE m.event_id=? ORDER BY i.rank LIMIT 5""",
             (event_id,),
         )
+        screening_decision = screen_research_event(event, members)
+        screening = persist_research_screening(self.db, screening_decision)
+        manually_approved = approved_screening_id is not None
+        if manually_approved:
+            if int(screening["id"]) != approved_screening_id:
+                raise ValueError("初筛输入已变化，请重新复核最新记录")
+            if screening["decision"] != "needs_review":
+                raise ValueError("人工补证只适用于待复核初筛")
         unique_urls: list[tuple[str, str, str]] = []
         seen_urls: set[str] = set()
         for member in members:
@@ -614,96 +682,173 @@ class Pipeline:
                         member["raw_json"],
                     ),
                 )
-        direct_targets = [
-            item for item in unique_urls if not is_signal_page_url(item[0])
-        ][:3]
-        fetched = await asyncio.gather(
-            *[fetch_evidence(url, title) for url, title, _source in direct_targets]
-        )
-        for result, (_url, _title, source_name) in zip(
-            fetched, direct_targets, strict=True
-        ):
-            persist_collected_evidence(
-                self.db,
-                event_id,
-                CollectedEvidence(
-                    evidence_type=result.evidence_type,
-                    source_name=source_name,
-                    url=result.url,
-                    title=result.title,
-                    excerpt=result.excerpt,
-                    fetch_method=result.fetch_method,
-                    fetch_status=result.fetch_status,
-                    fetched_at=result.fetched_at,
-                    http_status=result.http_status,
-                    content_hash=result.content_hash,
-                    error=result.error,
-                    raw_metadata=result.raw_metadata,
-                ),
-                allow_upgrade=True,
-            )
-        current_evidence = self.db.all(
-            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
-        )
-        remaining_fetches = max(0, self.settings.research_max_fetch_pages - len(fetched))
-        if remaining_fetches:
-            related = await RelatedNewsCollector(fetcher=fetch_evidence).collect(
-                {**event, "source_items": members},
-                current_evidence,
-                ResearchBudget(
-                    max_search_queries=0,
-                    max_fetch_pages=remaining_fetches,
-                    max_browser_pages=0,
-                    timeout_seconds=self.settings.research_timeout_seconds,
-                    markets=[str(event.get("market") or "")],
-                    languages=[str(event.get("language") or "")],
-                ),
-            )
-            for item in related:
-                persist_collected_evidence(
-                    self.db, event_id, item, allow_upgrade=True
-                )
-            remaining_fetches = max(0, remaining_fetches - len(related))
-        current_evidence = self.db.all(
-            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
-        )
-        if (
-            remaining_fetches
-            and self.news_search_provider is not None
-            and not is_commercial_research_blocked(event)
-        ):
-            searched = await PublicNewsSearchCollector(
-                self.news_search_provider,
-                fetcher=fetch_evidence,
-                max_results=self.settings.public_news_max_results,
-            ).collect(
-                {**event, "source_items": members},
-                current_evidence,
-                ResearchBudget(
-                    max_search_queries=self.settings.research_max_search_queries,
-                    max_fetch_pages=remaining_fetches,
-                    max_browser_pages=0,
-                    timeout_seconds=self.settings.research_timeout_seconds,
-                    markets=[str(event.get("market") or "")],
-                    languages=[str(event.get("language") or "")],
-                ),
-            )
-            for item in searched:
-                persist_collected_evidence(
-                    self.db, event_id, item, allow_upgrade=True
-                )
-        all_evidence = self.db.all(
-            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
-        )
-        bundle = persist_evidence_bundle(
-            self.db,
-            build_evidence_bundle(
+        def current_bundle_result():
+            return build_evidence_bundle(
                 event,
-                all_evidence,
+                self.db.all(
+                    "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+                ),
                 self.settings.evidence_bundle_version,
                 self.settings.evidence_ready_score,
-            ),
+            )
+
+        if not screening_decision.allows_deep_research and not manually_approved:
+            persist_evidence_bundle(self.db, current_bundle_result())
+            self.db.execute(
+                """UPDATE research_candidates SET status='superseded',updated_at=?
+                WHERE event_id=? AND status NOT IN ('completed','superseded')""",
+                (utc_now(), event_id),
+            )
+            return {
+                "status": "screened_out",
+                "screening_id": screening["id"],
+                "decision": screening["decision"],
+                "candidate": None,
+            }
+
+        collection_run_id = str(uuid.uuid4())
+        self.db.execute(
+            """INSERT INTO evidence_collection_runs
+            (id,event_id,screening_id,status,started_at)
+            VALUES(?,?,?,'running',?)""",
+            (collection_run_id, event_id, screening["id"], utc_now()),
         )
+        fetch_attempt_count = 0
+        max_fetch_pages = self.settings.research_max_fetch_pages
+        bundle_result = current_bundle_result()
+        stop_reason = (
+            "existing_evidence_ready"
+            if bundle_result.readiness_status == "ready_for_assessment"
+            else ""
+        )
+        try:
+            direct_targets = [
+                item for item in unique_urls if not is_signal_page_url(item[0])
+            ][: min(3, max_fetch_pages)]
+            for url, title, source_name in direct_targets:
+                if stop_reason or fetch_attempt_count >= max_fetch_pages:
+                    break
+                result = await fetch_evidence(url, title)
+                fetch_attempt_count += 1
+                persist_collected_evidence(
+                    self.db,
+                    event_id,
+                    CollectedEvidence(
+                        evidence_type=result.evidence_type,
+                        source_name=source_name,
+                        url=result.url,
+                        title=result.title,
+                        excerpt=result.excerpt,
+                        fetch_method=result.fetch_method,
+                        fetch_status=result.fetch_status,
+                        fetched_at=result.fetched_at,
+                        http_status=result.http_status,
+                        content_hash=result.content_hash,
+                        error=result.error,
+                        raw_metadata=result.raw_metadata,
+                    ),
+                    allow_upgrade=True,
+                )
+                bundle_result = current_bundle_result()
+                if bundle_result.readiness_status == "ready_for_assessment":
+                    stop_reason = "minimum_evidence_reached"
+
+            remaining_fetches = max(0, max_fetch_pages - fetch_attempt_count)
+            if remaining_fetches and not stop_reason:
+                current_evidence = self.db.all(
+                    "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+                )
+                collector = RelatedNewsCollector(fetcher=fetch_evidence)
+                async for item in collector.iter_collect(
+                    {**event, "source_items": members},
+                    current_evidence,
+                    ResearchBudget(
+                        max_search_queries=0,
+                        max_fetch_pages=remaining_fetches,
+                        max_browser_pages=0,
+                        timeout_seconds=self.settings.research_timeout_seconds,
+                        markets=[str(event.get("market") or "")],
+                        languages=[str(event.get("language") or "")],
+                    ),
+                ):
+                    fetch_attempt_count += 1
+                    persist_collected_evidence(
+                        self.db, event_id, item, allow_upgrade=True
+                    )
+                    bundle_result = current_bundle_result()
+                    if bundle_result.readiness_status == "ready_for_assessment":
+                        stop_reason = "minimum_evidence_reached"
+                        break
+
+            remaining_fetches = max(0, max_fetch_pages - fetch_attempt_count)
+            if (
+                remaining_fetches
+                and not stop_reason
+                and self.news_search_provider is not None
+            ):
+                current_evidence = self.db.all(
+                    "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event_id,)
+                )
+                collector = PublicNewsSearchCollector(
+                    self.news_search_provider,
+                    fetcher=fetch_evidence,
+                    max_results=self.settings.public_news_max_results,
+                )
+                async for item in collector.iter_collect(
+                    {**event, "source_items": members},
+                    current_evidence,
+                    ResearchBudget(
+                        max_search_queries=self.settings.research_max_search_queries,
+                        max_fetch_pages=remaining_fetches,
+                        max_browser_pages=0,
+                        timeout_seconds=self.settings.research_timeout_seconds,
+                        markets=[str(event.get("market") or "")],
+                        languages=[str(event.get("language") or "")],
+                    ),
+                ):
+                    fetch_attempt_count += 1
+                    persist_collected_evidence(
+                        self.db, event_id, item, allow_upgrade=True
+                    )
+                    bundle_result = current_bundle_result()
+                    if bundle_result.readiness_status == "ready_for_assessment":
+                        stop_reason = "minimum_evidence_reached"
+                        break
+
+            if not stop_reason:
+                if max_fetch_pages <= 0:
+                    stop_reason = "fetch_disabled"
+                elif fetch_attempt_count >= max_fetch_pages:
+                    stop_reason = "fetch_budget_exhausted"
+                else:
+                    stop_reason = "public_sources_exhausted"
+            bundle = persist_evidence_bundle(self.db, bundle_result)
+            self.db.execute(
+                """UPDATE evidence_collection_runs SET
+                status='completed',fetch_attempt_count=?,successful_document_count=?,
+                independent_source_count=?,stop_reason=?,finished_at=? WHERE id=?""",
+                (
+                    fetch_attempt_count,
+                    bundle_result.full_text_count,
+                    bundle_result.independent_source_count,
+                    stop_reason,
+                    utc_now(),
+                    collection_run_id,
+                ),
+            )
+        except Exception as exc:
+            self.db.execute(
+                """UPDATE evidence_collection_runs SET status='failed',
+                fetch_attempt_count=?,stop_reason='collector_failed',finished_at=?,error=?
+                WHERE id=?""",
+                (
+                    fetch_attempt_count,
+                    utc_now(),
+                    f"{type(exc).__name__}: {str(exc)[:1000]}",
+                    collection_run_id,
+                ),
+            )
+            raise
         evidence = self.db.all(
             "SELECT * FROM evidence WHERE event_id=? AND valid_for_analysis=1", (event_id,)
         )
@@ -722,8 +867,16 @@ class Pipeline:
             semantic_feature,
             version=self.settings.research_candidate_version,
         )
-        if draft:
-            persist_research_candidate(self.db, draft)
+        candidate = persist_research_candidate(self.db, draft) if draft else None
+        collection_run = self.db.one(
+            "SELECT * FROM evidence_collection_runs WHERE id=?", (collection_run_id,)
+        )
+        return {
+            "status": "collected",
+            "screening_id": screening["id"],
+            "collection_run": collection_run,
+            "candidate": candidate,
+        }
 
     async def _persist_semantic_features(
         self, event: dict[str, Any], evidence: list[dict[str, Any]]

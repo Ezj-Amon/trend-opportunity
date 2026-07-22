@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}全球趋势 · 新品机会系统{% endblock %}
+{% block title %}趋势发现 · 选品助手{% endblock %}
 {% block content %}
 <section class="hero">
   <div>
-    <p class="eyebrow">TREND → SIGNAL → HYPOTHESIS → EVIDENCE</p>
-    <h1>全球趋势与新品机会系统</h1>
-    <p class="muted">持续追踪国内外趋势信号。当前摘要只展示事实层趋势事件，不把规则推断包装成商品推荐。</p>
+    <p class="eyebrow">趋势发现 → 机会判断 → 商品方向 → 市场验证 → 已验证选品</p>
+    <h1>全球趋势发现</h1>
+    <p class="muted">持续追踪国内外事实层趋势。热点只是发现入口，不代表购买需求或商品推荐。</p>
   </div>
   <button id="run-button" class="primary" {% if pipeline_running %}disabled{% endif %}>
     {% if pipeline_running %}采集中…{% else %}立即运行真实采集{% endif %}
@@ -36,15 +36,11 @@
 </section>
 
 <section class="metric-grid">
-  <article class="metric"><span>事件</span><strong>{{ events|length }}</strong></article>
-  <article class="metric"><span>最近运行</span><strong>{{ runs[0].status if runs else '尚未运行' }}</strong></article>
-  <article class="metric"><span>研究主链</span><strong>Evidence → Candidate</strong></article>
-  <article class="metric"><span>飞书</span><strong>{{ '已配置' if settings.feishu_webhook_url else '待配置' }}</strong></article>
+  <article class="metric"><span>当前趋势</span><strong>{{ events|length }}</strong></article>
+  <article class="metric"><span>待机会判断</span><strong>{{ journey_counts.research }}</strong></article>
+  <article class="metric"><span>已确认机会</span><strong>{{ journey_counts.signals }}</strong></article>
+  <article class="metric"><span>已验证选品</span><strong>{{ journey_counts.recommendations }}</strong></article>
 </section>
-
-{% if not settings.openai_api_key %}
-<div class="notice"><strong>当前未配置云端 OpportunityAssessment。</strong> 定时管道只构建 EvidenceBundle 和 ResearchCandidate；人工研究与审核闭环仍可使用，不会从新闻关键词自动生成线索。</div>
-{% endif %}
 
 <section class="panel digest-panel">
   <div class="panel-head">
@@ -89,10 +85,9 @@
           <p>{{ event.source_count }} 个来源 · {{ event.member_count }} 条记录 · 最后出现 {{ event.last_seen_at[:16].replace('T',' ') }}</p>
         </div>
         <div class="opportunity-mark">
-          {% if event.best_signal_score is not none %}
-          <strong>{{ '%.1f'|format(event.best_signal_score) }}</strong><span>线索排序分</span>
-          {% elif event.latest_research_status %}<span>研究候选 · {{ event.latest_research_status }}</span>
-          {% else %}<span>待构建候选</span>{% endif %}
+          {% if event.best_signal_score is not none %}<span>已确认机会</span>
+          {% elif event.latest_research_status %}<span>机会判断中</span>
+          {% else %}<span>趋势发现</span>{% endif %}
         </div>
       </a>
       {% endfor %}
@@ -102,7 +97,7 @@
     {% endif %}
   </section>
 
-  <aside class="side">
+  <aside class="side"><details class="technical-audit"><summary>系统状态</summary>
     <section class="panel">
       <div class="panel-head"><h2>来源健康</h2></div>
       {% for source in source_health %}
@@ -115,7 +110,7 @@
       <div class="run-row"><span class="status {{ run.status }}">{{ run.status }}</span><span>{{ run.items_count }} 条</span><small>{{ run.started_at[:16].replace('T',' ') }}</small></div>
       {% else %}<p class="muted">暂无</p>{% endfor %}
     </section>
-  </aside>
+  </details></aside>
 </div>
 {% endblock %}
 {% block scripts %}
