@@ -1,5 +1,7 @@
 # 趋势机会研究架构：核心程序、EvidenceBundle 与 Research Agent
 
+> **Historical / Archived**：本文是历史设计记录，不再是当前实现依据。当前业务流程以 [业务流程合同](../workflow-contract.md) 为准，当前技术结构以 [技术架构](../architecture.md) 为准。
+
 > 实现状态（2026-07-18）：核心程序、EvidenceBundle、ResearchCandidate、ResearchRun、受控工具、Skill 和可选大模型 OpportunityAssessment 的结构与接口已落地，但尚未全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Candidate 入口已打通；二级正文已接入 Trafilatura 真实性校验、Google News RSS 主动搜索和独立来源去重。真实库仍缺少 ready Bundle 与人工研究样本。MCP 与浏览器登录态保持可选且默认不启用；当前状态以 `HANDOFF.md` 为准。
 
 状态：核心主结构已实现，默认 Candidate 入口已验收，仍有后续运行缺口

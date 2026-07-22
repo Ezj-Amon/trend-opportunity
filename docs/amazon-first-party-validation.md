@@ -8,7 +8,7 @@
 2. 在对应站点的 Seller Central 中用这个词分别导出“商机探测器”和“品牌分析 → 热门搜索词”两个 CSV。
 3. 回到同一条任务，上传这两个原始 CSV。系统负责匹配指标、评分并更新排序。
 
-不需要人工填写 1–5 分，不需要先判断应该搜什么词，也不需要理解系统内部的评分维度。查询词尚未准备好的任务会标为“暂时不用处理”。
+Amazon 两份 CSV 对应的平台维度由系统自动解析，不需要人工给需求、购买意图或竞争指标打分。CSV 不包含的单位经济性和执行可行性仍需在工作台根据成本、供应链和合规证据补充 1–5 分。查询词尚未准备好的任务会标为“暂时不用处理”。
 
 ## 系统会替你完成什么
 
@@ -22,6 +22,7 @@
 
 ```text
 POST /api/product-hypotheses/{hypothesis_id}/amazon-raw-import
+POST /api/product-hypotheses/{hypothesis_id}/market-evidence
 GET  /api/product-hypotheses/{hypothesis_id}/market-evidence
 GET  /api/validated-recommendations
 ```

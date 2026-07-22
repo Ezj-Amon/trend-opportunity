@@ -1,5 +1,7 @@
 # EvidenceBundle 与 Research Agent 可执行实施计划
 
+> **Historical / Archived**：本文是历史实施计划，不再是当前实现依据。当前业务流程以 [业务流程合同](../workflow-contract.md) 为准，当前技术结构以 [技术架构](../architecture.md) 为准。
+
 > 实现状态（2026-07-18）：阶段 0–7 的核心对象、表、接口和安全边界已实现，但并非全部通过运行验收。默认 `ENABLE_EMBEDDINGS=false` 的 Pipeline 已能为安全且至少 `partial` 的 Bundle 创建无类目 ResearchCandidate；纯标题 `insufficient` Bundle 仍显式弃权。二级正文已接入 Trafilatura 真实性校验和主动公共新闻搜索，真实数据库尚无 `ready_for_assessment` Bundle，也尚未完成真实人工 Run 到 Signal 的验收。本文继续作为设计与验收契约，真实验证结果与后续入口以 `HANDOFF.md` 为准。
 
 状态：核心实施完成，运行验收进行中

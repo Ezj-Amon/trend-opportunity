@@ -10,3 +10,5 @@ Use this order:
 6. User-provided URL or pasted evidence.
 
 Do not bypass authentication, CAPTCHA, paywalls, robots restrictions, or access controls. A login wall or unavailable dynamic page is a failure reason, not evidence content.
+
+These routes are used by controlled tools or a human-directed run. Their existence does not imply that a complete autonomous Research Agent is currently available.

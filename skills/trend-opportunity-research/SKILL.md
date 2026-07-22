@@ -7,6 +7,8 @@ description: Research a Trend Opportunity Lab ResearchCandidate by collecting pu
 
 Use the application's controlled Research and Evidence APIs. Never write the database directly.
 
+The business boundary is defined by [docs/workflow-contract.md](../../docs/workflow-contract.md). This Skill is an execution rule set, not a second workflow specification. The repository currently has controlled ResearchRun tools and assessment providers, but no complete autonomous Research Agent or agent worker.
+
 ## Workflow
 
 1. Read the ResearchCandidate, current EvidenceBundle, evidence items, ResearchRun budget, and prior tool calls.
@@ -16,8 +18,8 @@ Use the application's controlled Research and Evidence APIs. Never write the dat
 5. Invoke only controlled run tools. Record every call through the active ResearchRun; never store tokens, cookies, login pages, or credentials.
 6. Rebuild the EvidenceBundle after adding evidence. Stop when the budget is exhausted or the Bundle remains insufficient.
 7. Apply [references/abstention-rules.md](references/abstention-rules.md). With insufficient evidence, submit `insufficient_evidence`; do not infer missing facts.
-8. With a ready Bundle, submit an OpportunityAssessment matching [schemas/opportunity-assessment.json](schemas/opportunity-assessment.json). Cite database evidence IDs for every fact and inference.
-9. Wait for human review. Never create a ProductHypothesis, marketplace query, or recommendation.
+8. With a ready Bundle, submit an OpportunityAssessment matching [schemas/opportunity-assessment.json](schemas/opportunity-assessment.json). A configured model may only synthesize this draft from the existing Bundle. Cite database evidence IDs for every fact and inference.
+9. Wait for human review. Never approve the Assessment, create an OpportunitySignal, generate a ProductHypothesis, marketplace query, or recommendation.
 
 ## Controlled endpoints
 
@@ -27,5 +29,6 @@ Use the application's controlled Research and Evidence APIs. Never write the dat
 - `POST /api/research-runs/{run_id}/tools/{tool_name}`
 - `POST /api/research-runs/{run_id}/complete`
 - `POST /api/research-candidates/{candidate_id}/assessments`
+- `POST /api/research-candidates/{candidate_id}/assessments/cloud`
 
 Resume an existing running ResearchRun instead of starting a duplicate executor run.
