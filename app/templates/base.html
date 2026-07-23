@@ -3,31 +3,30 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% block title %}趋势选品助手{% endblock %}</title>
+  <title>{% block title %}趋势机会判断训练器{% endblock %}</title>
   <link rel="icon" href="{{ url_for('static', path='/favicon.svg') }}" type="image/svg+xml">
   <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
   <header class="topbar">
-    <a class="brand" href="/">趋势选品助手</a>
-    <span class="tag">真实数据 · 证据优先</span>
-    <nav class="topnav">
-      <a href="/">趋势发现</a>
-      <a href="/research">机会判断</a>
-      <a href="/hypotheses">商品方向</a>
-      <a href="/validation">市场验证</a>
-      <a href="/recommendations">已验证选品</a>
-      <details class="system-menu"><summary>系统</summary><div><a href="/semantic-review">语义评测</a><a href="/feedback">反馈记录</a><a href="/healthz">系统状态</a></div></details>
+    <a class="brand" href="/">趋势机会判断训练器</a>
+    <span class="tag">先看变化，再做判断</span>
+    <nav class="topnav" aria-label="主要导航">
+      <a href="/" {% if request.url.path == '/' or request.url.path.startswith('/events/') %}aria-current="page"{% endif %}>发现趋势</a>
+      <a href="/workbench" {% if request.url.path in ['/workbench','/workbench/pending'] or (request.url.path.startswith('/workbench/items/') and item|default(none) and item.status != 'completed') %}aria-current="page"{% endif %}>判断任务</a>
+      <a href="/workbench/processed" {% if request.url.path == '/workbench/processed' or (request.url.path.startswith('/workbench/items/') and item|default(none) and item.status == 'completed') %}aria-current="page"{% endif %}>判断记录</a>
     </nav>
   </header>
-  <main class="container">{% block content %}{% endblock %}</main>
-  <div id="toast" class="toast" hidden></div>
+  <main id="main-content" class="container" tabindex="-1">{% block content %}{% endblock %}</main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script>
     function toast(message, error=false) {
       const node = document.getElementById('toast');
-      node.textContent = message; node.hidden = false;
+      node.textContent = message;
+      node.hidden = false;
       node.className = error ? 'toast error' : 'toast';
-      setTimeout(() => node.hidden = true, 4000);
+      window.setTimeout(() => { node.hidden = true; }, 4000);
     }
     async function postAction(url, successMessage, data=null) {
       const token = localStorage.getItem('trendAdminToken');
@@ -37,8 +36,9 @@
         method: 'POST', headers,
         body: data === null ? undefined : JSON.stringify(data)
       });
-      let body = {}; try { body = await response.json(); } catch (_) {}
-      if (!response.ok) { toast(body.detail || '操作失败', true); return null; }
+      let body = {};
+      try { body = await response.json(); } catch (_) {}
+      if (!response.ok) { toast(body.detail || '操作失败，请稍后重试。', true); return null; }
       if (successMessage) toast(successMessage);
       return body;
     }

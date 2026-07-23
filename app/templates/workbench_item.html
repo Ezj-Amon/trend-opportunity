@@ -1,0 +1,301 @@
+{% extends "base.html" %}
+{% block title %}{{ event.canonical_title }} · 判断任务{% endblock %}
+{% block content %}
+{% set actions = item.allowed_actions|default({}, true) %}
+{% set generation_status = assessment.generation_status|default('completed', true) if assessment else '' %}
+{% set draft_ready = assessment and generation_status not in ['failed','generating','pending'] and not assessment.engine.endswith('-failed') %}
+{% set consumer = assessment.consumer_change_judgment|default({}, true) if assessment else {} %}
+{% set problem = assessment.problem_judgment|default({}, true) if assessment else {} %}
+{% set recommendation = assessment.research_recommendation|default({}, true) if assessment else {} %}
+{% set is_v2 = draft_ready and consumer and problem and recommendation %}
+{% set completed_review = assessment and assessment.review_status in ['approved','rejected'] %}
+{% set can_continue = is_v2 and assessment.assessment_status == 'worth_following' and recommendation.status == 'continue_research' %}
+
+<a class="back" href="{{ '/workbench/processed' if completed_review else '/workbench' }}">← 返回{{ '判断记录' if completed_review else '判断任务' }}</a>
+
+<ol class="decision-progress" aria-label="判断进度">
+  <li class="complete"><span>1</span><div><b>发现变化</b><small>趋势已入选</small></div></li>
+  <li class="{{ 'complete' if item.readiness_status == 'ready_for_assessment' else 'current' }}"><span>2</span><div><b>证据就绪</b><small>{{ '可以判断' if item.readiness_status == 'ready_for_assessment' else '仍需补证' }}</small></div></li>
+  <li class="{{ 'complete' if draft_ready else ('current' if item.readiness_status == 'ready_for_assessment' else '') }}"><span>3</span><div><b>AI 三级判断</b><small>{{ '草稿已生成' if draft_ready else ('生成失败' if generation_status == 'failed' else '等待生成') }}</small></div></li>
+  <li class="{{ 'complete' if completed_review else ('current' if draft_ready else '') }}"><span>4</span><div><b>我的决定</b><small>{{ '已保存' if completed_review else '等待确认' }}</small></div></li>
+</ol>
+
+<section class="panel workbench-decision {{ item.workbench_state }}">
+  <p class="eyebrow">{{ event.market }} · {{ event.signal_type }}</p>
+  <h1>{{ event.canonical_title }}</h1>
+  <div class="decision-state-line"><span class="status {{ item.workbench_state }}">{{ item.workbench_state_label }}</span><span>当前只需要完成下面这一件事</span></div>
+  {% if item.workbench_state == 'ready_for_ai' %}
+    <h2>让 AI 把证据整理成三级判断草稿</h2>
+    <p>草稿会明确区分事实、推断和缺失证据，不会直接联想商品。</p>
+    <button id="generate-ai-draft" class="primary" {% if not ai_configured %}disabled{% endif %}>生成三级判断卡</button>
+    {% if not ai_configured %}<p class="inline-help">需要先配置 <code>OPENAI_API_KEY</code> 并重启服务。</p>{% endif %}
+  {% elif item.workbench_state == 'ai_failed' or generation_status == 'failed' %}
+    <h2>这次生成没有成功，不是“放弃”结论</h2>
+    <p>系统保留了技术记录，你可以安全重试；失败结果不会进入人工审核。</p>
+    {% if item.retryable|default(false) or actions.generate|default(false) or item.workbench_state == 'ai_failed' %}<button id="generate-ai-draft" class="primary" {% if not ai_configured %}disabled{% endif %}>重新生成判断卡</button>{% endif %}
+    {% if not ai_configured %}<p class="inline-help">需要先配置 <code>OPENAI_API_KEY</code> 并重启服务。</p>{% endif %}
+  {% elif item.workbench_state == 'awaiting_review' %}
+    <h2>阅读三级判断卡，然后做一次人工决定</h2>
+    <p>先核对每一级的证据依据，再到页面下方确认事实、问题和持续性。</p>
+    <a class="button-link primary" href="#human-decision">开始人工确认</a>
+  {% elif completed_review %}
+    <h2>{{ '已决定继续研究' if assessment.review_status == 'approved' else '已决定放弃' }}</h2>
+    <p>这次判断已保存，历史依据不会被改写。</p>
+    <a class="button-link primary" href="/workbench/processed">返回判断记录</a>
+  {% elif item.workbench_state in ['needs_more_evidence','evidence_missing'] %}
+    <h2>先补齐关键证据，再生成判断卡</h2>
+    <p>缺少可靠依据时，系统会停在这里，不会用本地规则伪造答案。</p>
+    <a class="button-link primary" href="#supplement-evidence">补充一条证据</a>
+  {% else %}
+    <h2>系统正在准备这条判断</h2><p>现在可以查看证据状态，准备完成后才会开放下一步。</p>
+  {% endif %}
+  <p id="page-action-error" class="inline-error" role="alert" aria-live="assertive" hidden></p>
+</section>
+
+{% if draft_ready %}
+<section class="panel judgment-card" aria-labelledby="judgment-card-title">
+  <div class="panel-head"><div><p class="eyebrow">AI 判断草稿</p><h2 id="judgment-card-title">三级判断卡</h2></div><span>请逐项核对，不是最终结论</span></div>
+  {% if is_v2 %}
+    {% set consumer_labels = {'related':'相关','unrelated':'不相关','uncertain':'不确定'} %}
+    {% set problem_labels = {'clear':'存在明确问题','needs_evidence':'可能存在，需要补证','none':'没有明显问题'} %}
+    {% set recommendation_labels = {'continue_research':'值得继续研究','defer':'暂缓','abandon':'放弃'} %}
+    <div class="judgment-levels">
+      {% for number, title, question, judgment, labels in [
+        ('01','消费变化','这是否影响普通消费者？',consumer,consumer_labels),
+        ('02','新增问题','变化是否带来了新的场景或约束？',problem,problem_labels),
+        ('03','研究建议','是否值得进入下一步研究？',recommendation,recommendation_labels)
+      ] %}
+      <article class="judgment-level level-{{ judgment.status }}">
+        <div class="judgment-level-number">{{ number }}</div>
+        <div class="judgment-level-body">
+          <p class="level-question">{{ title }} · {{ question }}</p>
+          <h3>{{ labels.get(judgment.status, judgment.status) }}</h3>
+          <p>{{ judgment.rationale }}</p>
+          {% if judgment.evidence_ids %}<div class="citation-links" aria-label="{{ title }}引用的证据">{% for evidence_id in judgment.evidence_ids %}<a href="#evidence-{{ evidence_id }}">查看证据 #{{ evidence_id }}</a>{% endfor %}</div>{% else %}<small class="muted">没有可引用的直接证据</small>{% endif %}
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+
+    <div class="judgment-narrative">
+      <article><span>发生的变化</span><p>{{ assessment.change_type or '证据中尚未明确' }}</p></article>
+      <article><span>主要受影响用户</span><p>{{ assessment.target_users|join('、') if assessment.target_users else '证据中尚未明确' }}</p></article>
+      <article><span>新场景或约束</span><p>{{ assessment.new_scenarios|join('；') if assessment.new_scenarios else '证据中尚未明确' }}</p></article>
+      <article><span>可能未满足的需求</span><p>{{ assessment.unmet_needs|join('；') if assessment.unmet_needs else '尚不能确认' }}</p></article>
+      <article><span>现有解决方式</span><p>{{ assessment.existing_solutions|join('；') if assessment.existing_solutions else '当前证据没有可靠说明' }}</p></article>
+      <article><span>现有方式为什么不够</span><p>{{ assessment.solution_gaps|join('；') if assessment.solution_gaps else '当前证据没有可靠说明' }}</p></article>
+      <article><span>持续性</span><p>{{ assessment.durability or '尚不能确认' }}</p></article>
+      <article><span>开发交付周期</span><p>{{ assessment.lead_time_fit or '尚不能确认' }}</p></article>
+    </div>
+  {% else %}
+    <div class="legacy-assessment-note">
+      <h3>这是历史格式的判断记录</h3>
+      <p>旧记录没有三级判断字段，因此只按原始内容展示，不会自动补造结论。</p>
+    </div>
+    <dl class="draft-grid">
+      <div><dt>变化</dt><dd>{{ assessment.change_type or '未记录' }}</dd></div>
+      <div><dt>消费关联</dt><dd>{{ assessment.consumer_relevance or '未记录' }}</dd></div>
+      <div><dt>持续性</dt><dd>{{ assessment.durability or '未记录' }}</dd></div>
+      <div><dt>交付周期</dt><dd>{{ assessment.lead_time_fit or '未记录' }}</dd></div>
+    </dl>
+  {% endif %}
+
+  <div class="claim-columns">
+    <div><h3>证据支持的事实</h3>{% for claim in assessment.fact_claims %}<article class="cited-claim"><p>{{ claim.claim }}</p><div>{% for evidence_id in claim.evidence_ids %}<a href="#evidence-{{ evidence_id }}">证据 #{{ evidence_id }}</a>{% endfor %}</div></article>{% else %}<p class="muted">没有单独记录的事实声明。</p>{% endfor %}</div>
+    <div><h3>需要你核对的推断</h3>{% for claim in assessment.inferences %}<article class="cited-claim"><p>{{ claim.claim }}</p><div>{% for evidence_id in claim.evidence_ids %}<a href="#evidence-{{ evidence_id }}">证据 #{{ evidence_id }}</a>{% endfor %}</div></article>{% else %}<p class="muted">没有单独记录的推断。</p>{% endfor %}</div>
+  </div>
+  {% if assessment.missing_evidence %}<div class="missing-evidence user-facing-gap"><h3>仍缺少的证据</h3><ul>{% for gap in assessment.missing_evidence %}<li>{{ gap }}</li>{% endfor %}</ul></div>{% endif %}
+</section>
+{% endif %}
+
+<section class="panel workbench-evidence" aria-labelledby="evidence-title">
+  <div class="panel-head"><div><p class="eyebrow">原始依据</p><h2 id="evidence-title">证据</h2></div><span>{{ evidence|length }} 条</span></div>
+  <div class="key-evidence-grid">
+    {% for row in evidence %}
+    <article id="evidence-{{ row.id }}" class="key-evidence-card" tabindex="-1">
+      <span class="evidence-kind">证据 #{{ row.id }} · {{ evidence_type_labels.get(row.evidence_type, '公开证据') }}</span>
+      <a href="{{ row.url }}" target="_blank" rel="noreferrer"><strong>{{ row.title }}</strong></a>
+      <p>{{ row.excerpt[:500] }}</p><small>{{ row.source_name or '未知来源' }}</small>
+    </article>
+    {% else %}<div class="empty"><p>当前没有可展示的关键证据。</p></div>{% endfor %}
+  </div>
+  {% if bundle.missing_evidence %}<div class="missing-evidence user-facing-gap"><h3>证据缺口</h3><ul>{% for gap in bundle.missing_evidence %}<li>{{ gap }}</li>{% endfor %}</ul></div>{% endif %}
+</section>
+
+{% if draft_ready and assessment.review_status == 'pending' and is_v2 %}
+<section id="human-decision" class="panel workbench-review" aria-labelledby="review-title">
+  <div class="panel-head"><div><p class="eyebrow">最后一步</p><h2 id="review-title">我的确认</h2></div><span>保存决定后不可改写</span></div>
+  <p>你不需要重新写一遍判断，只需要核对下面三件事。</p>
+  <form id="review-form">
+    <div class="review-check-grid">
+      <fieldset><legend>1. 事实是否准确？</legend><label><input type="radio" name="fact_check" value="accurate"><span>准确</span></label><label><input type="radio" name="fact_check" value="inaccurate"><span>不准确</span></label><label><input type="radio" name="fact_check" value="uncertain"><span>不确定</span></label></fieldset>
+      <fieldset><legend>2. 问题是否真实？</legend><label><input type="radio" name="problem_check" value="real"><span>真实</span></label><label><input type="radio" name="problem_check" value="doubtful"><span>存疑</span></label><label><input type="radio" name="problem_check" value="uncertain"><span>不确定</span></label></fieldset>
+      <fieldset><legend>3. 持续性是否足够？</legend><label><input type="radio" name="durability_check" value="sufficient"><span>足够</span></label><label><input type="radio" name="durability_check" value="insufficient"><span>不足</span></label><label><input type="radio" name="durability_check" value="uncertain"><span>不确定</span></label></fieldset>
+    </div>
+    <label class="form-field"><span>判断备注（可选）</span><textarea name="note" rows="3" maxlength="2000" placeholder="记录你核对时看到的关键依据"></textarea></label>
+    <p id="review-error" class="inline-error" role="alert" aria-live="assertive" hidden></p>
+    <div class="decision-actions">
+      <button id="continue-button" class="primary" type="button" data-review="approved" {% if not can_continue %}disabled{% endif %}>继续研究</button>
+      <button id="show-supplement" type="button">补充证据</button>
+      <button id="show-abandon" class="ghost danger-action" type="button">放弃</button>
+    </div>
+    {% if not can_continue %}<p class="inline-help">AI 当前没有建议“继续研究”，因此不能直接批准。你可以补证后重新判断，或放弃。</p>{% else %}<p id="continue-help" class="inline-help">三项全部选择肯定答案后，才能继续研究。</p>{% endif %}
+    <div id="abandon-panel" class="sub-action-panel" hidden>
+      <label class="form-field"><span>放弃原因</span><select name="reason_code"><option value="">请选择</option><option value="not_consumer_change">不是消费变化</option><option value="problem_not_real">问题不真实或已有充分解决</option><option value="not_durable">持续性不足</option><option value="lead_time_mismatch">来不及开发交付</option><option value="insufficient_space">缺少低风险实体空间</option><option value="other">其他</option></select></label>
+      <button id="abandon-button" class="danger-action" type="button" data-review="rejected">确认放弃</button>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% set supplement_gaps = assessment.missing_evidence if assessment and assessment.missing_evidence else bundle.missing_evidence %}
+{% if not completed_review and (supplement_gaps or item.workbench_state in ['needs_more_evidence','evidence_missing']) %}
+<section id="supplement-evidence" class="panel supplement-panel" {% if draft_ready and assessment.review_status == 'pending' %}hidden{% endif %} aria-labelledby="supplement-title">
+  <div class="panel-head"><div><p class="eyebrow">补证</p><h2 id="supplement-title">补充一条能验证缺口的证据</h2></div><span>提交后会生成新版本</span></div>
+  <p>旧判断不会被覆盖。系统会重建证据包，再决定是否可以生成新的判断卡。</p>
+  <form id="supplement-form">
+    <label class="form-field"><span>这条证据准备验证什么？</span><select name="addressed_missing_evidence" required><option value="">请选择一个证据缺口</option>{% for gap in supplement_gaps %}<option value="{{ gap }}">{{ gap }}</option>{% endfor %}</select></label>
+    <div class="form-grid">
+      <label class="form-field"><span>来源名称</span><input name="source_name" required maxlength="200" placeholder="例如：航空公司官方公告"></label>
+      <label class="form-field"><span>来源链接</span><input name="url" type="url" required placeholder="https://..."></label>
+      <label class="form-field wide"><span>标题</span><input name="title" required maxlength="500" placeholder="填写页面或讨论标题"></label>
+      <label class="form-field wide"><span>关键摘录</span><textarea name="excerpt" required rows="5" maxlength="5000" placeholder="只摘录能直接支持或否定该缺口的内容"></textarea></label>
+    </div>
+    <label class="check-field"><input name="is_consumer_voice" type="checkbox"><span>这是消费者讨论或真实使用反馈</span></label>
+    <p id="supplement-error" class="inline-error" role="alert" aria-live="assertive" hidden></p>
+    <div class="actions"><button id="supplement-button" class="primary" type="submit">保存证据并重新判断</button><button id="cancel-supplement" type="button" hidden>取消</button></div>
+  </form>
+</section>
+{% endif %}
+
+{% if completed_review %}
+<section class="panel saved-decision">
+  <div class="panel-head"><div><p class="eyebrow">已审核判断卡</p><h2>你的决定：{{ '继续研究' if assessment.review_status == 'approved' else '放弃' }}</h2></div><span>不可改写</span></div>
+  {% if assessment.review_details %}
+  <dl class="saved-review-grid"><div><dt>事实</dt><dd>{{ assessment.review_details.fact_check|default('未记录') }}</dd></div><div><dt>问题</dt><dd>{{ assessment.review_details.problem_check|default('未记录') }}</dd></div><div><dt>持续性</dt><dd>{{ assessment.review_details.durability_check|default('未记录') }}</dd></div></dl>
+  {% endif %}
+  {% if assessment.review_details and assessment.review_details.note %}<p><b>备注：</b>{{ assessment.review_details.note }}</p>{% endif %}
+  <a class="button-link primary" href="/workbench/processed">返回判断记录</a>
+</section>
+{% endif %}
+
+{% if history|default([], true)|length > 1 %}
+<details class="technical-audit version-history"><summary>查看此前版本（{{ history|length - 1 }}）</summary>{% for version in history[1:] %}<p><b>版本 {{ version.version|default(loop.revindex) }}</b> · {{ version.review_status|default('已保存') }} · {{ version.updated_at|default('') }}</p>{% endfor %}</details>
+{% endif %}
+
+<details class="technical-audit workbench-audit">
+  <summary>技术与审计信息</summary>
+  <div class="audit-grid">
+    <div><b>EvidenceBundle</b><p>#{{ bundle.id }} · {{ bundle.readiness_status }} · {{ bundle.version }}</p></div>
+    <div><b>ResearchCandidate</b><p>#{{ item.id }} · {{ item.status }} · {{ item.engine }} / {{ item.version }}</p></div>
+    <div><b>ResearchRun</b><p>{% if research_run %}{{ research_run.id }} · {{ research_run.status }} · {{ research_run.executor_type }} / {{ research_run.executor_name }}{% else %}尚未创建{% endif %}</p></div>
+    <div><b>Provider / 模型</b><p>{% if assessment %}{{ assessment.engine }} · {{ assessment.model or '未调用' }} · {{ assessment.version }} · {{ generation_status }}{% else %}尚未生成{% endif %}</p></div>
+  </div>
+  {% if research_run and research_run.error %}<p class="error"><b>ResearchRun 错误：</b>{{ research_run.error }}</p>{% endif %}
+  {% if assessment and generation_status == 'failed' %}<p class="error"><b>模型错误：</b>{{ assessment.abstention_reason or '生成失败，请重试。' }}</p>{% endif %}
+</details>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const itemId = {{ item.id }};
+const assessmentId = {{ assessment.id if assessment else 0 }};
+const canContinueFromAI = {{ 'true' if can_continue else 'false' }};
+const needsReviewBeforeSupplement = {{ 'true' if assessment and assessment.review_status == 'pending' else 'false' }};
+
+function setInlineError(id, message='') {
+  const node = document.getElementById(id);
+  if (!node) return;
+  node.textContent = message;
+  node.hidden = !message;
+  if (message) node.focus?.();
+}
+async function requestJson(url, payload) {
+  const token = localStorage.getItem('trendAdminToken');
+  const headers = {'Content-Type': 'application/json'};
+  if (token) headers['X-Admin-Token'] = token;
+  try {
+    const response = await fetch(url, {method: 'POST', headers, body: JSON.stringify(payload)});
+    let body = {};
+    try { body = await response.json(); } catch (_) {}
+    return {ok: response.ok, body, message: body.detail || body.message || (response.ok ? '' : '操作失败，请稍后重试。')};
+  } catch (_) { return {ok: false, body: {}, message: '网络连接失败。你的填写内容仍保留在页面上。'}; }
+}
+
+document.getElementById('generate-ai-draft')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  setInlineError('page-action-error'); button.disabled = true; button.textContent = '正在整理证据…';
+  const result = await requestJson(`/api/workbench/research-candidates/${itemId}/ai-draft`, {});
+  if (result.ok) { location.reload(); return; }
+  setInlineError('page-action-error', result.message); button.disabled = false; button.textContent = '重新生成判断卡';
+});
+
+const reviewForm = document.getElementById('review-form');
+const continueButton = document.getElementById('continue-button');
+function selected(name) { return reviewForm?.querySelector(`input[name="${name}"]:checked`)?.value || ''; }
+function updateContinueState() {
+  if (!continueButton) return;
+  if (!canContinueFromAI) { continueButton.disabled = true; return; }
+  continueButton.disabled = !(selected('fact_check') === 'accurate' && selected('problem_check') === 'real' && selected('durability_check') === 'sufficient');
+}
+reviewForm?.querySelectorAll('input[type="radio"]').forEach(node => node.addEventListener('change', updateContinueState));
+
+async function submitReview(reviewStatus) {
+  setInlineError('review-error');
+  const checks = {fact_check: selected('fact_check'), problem_check: selected('problem_check'), durability_check: selected('durability_check')};
+  if (!checks.fact_check || !checks.problem_check || !checks.durability_check) { setInlineError('review-error', '请先完成事实、问题和持续性三项确认。'); return; }
+  if (reviewStatus === 'approved' && (checks.fact_check !== 'accurate' || checks.problem_check !== 'real' || checks.durability_check !== 'sufficient')) { setInlineError('review-error', '只有三项都确认无误时才能继续研究。'); return; }
+  const reasonCode = reviewForm.elements.reason_code?.value || '';
+  if (reviewStatus === 'rejected' && !reasonCode) { setInlineError('review-error', '请选择放弃原因。'); return; }
+  const buttons = reviewForm.querySelectorAll('button'); buttons.forEach(node => node.disabled = true);
+  const result = await requestJson(`/api/opportunity-assessments/${assessmentId}/review`, {
+    review_status: reviewStatus, ...checks, reason_code: reasonCode,
+    selected_missing_evidence: [], note: reviewForm.elements.note?.value.trim() || ''
+  });
+  if (result.ok) { location.href = '/workbench/processed'; return; }
+  setInlineError('review-error', result.message); buttons.forEach(node => node.disabled = false); updateContinueState();
+}
+continueButton?.addEventListener('click', () => submitReview('approved'));
+document.getElementById('show-abandon')?.addEventListener('click', () => { document.getElementById('abandon-panel').hidden = false; document.getElementById('abandon-panel').querySelector('select').focus(); });
+document.getElementById('abandon-button')?.addEventListener('click', () => submitReview('rejected'));
+document.getElementById('show-supplement')?.addEventListener('click', () => {
+  const panel = document.getElementById('supplement-evidence'); panel.hidden = false; panel.scrollIntoView({behavior: 'smooth', block: 'start'}); panel.querySelector('select').focus(); document.getElementById('cancel-supplement').hidden = false;
+});
+document.getElementById('cancel-supplement')?.addEventListener('click', () => { const panel = document.getElementById('supplement-evidence'); panel.hidden = true; document.getElementById('show-supplement')?.focus(); });
+
+document.getElementById('supplement-form')?.addEventListener('submit', async (event) => {
+  event.preventDefault(); setInlineError('supplement-error');
+  const form = event.currentTarget; const data = new FormData(form); const button = document.getElementById('supplement-button');
+  const payload = {
+    source_name: String(data.get('source_name') || '').trim(), url: String(data.get('url') || '').trim(),
+    title: String(data.get('title') || '').trim(), excerpt: String(data.get('excerpt') || '').trim(),
+    is_consumer_voice: data.get('is_consumer_voice') === 'on',
+    addressed_missing_evidence: [String(data.get('addressed_missing_evidence') || '').trim()].filter(Boolean)
+  };
+  if (!payload.addressed_missing_evidence.length || !payload.source_name || !payload.url || !payload.title || !payload.excerpt) { setInlineError('supplement-error', '请选择证据缺口，并完整填写来源、链接、标题和关键摘录。'); return; }
+  button.disabled = true; button.textContent = '正在保存并重建证据包…';
+  if (needsReviewBeforeSupplement) {
+    const checks = {fact_check: selected('fact_check'), problem_check: selected('problem_check'), durability_check: selected('durability_check')};
+    if (!checks.fact_check || !checks.problem_check || !checks.durability_check) {
+      setInlineError('supplement-error', '补证前，请先在上方完成事实、问题和持续性三项确认。');
+      button.disabled = false; button.textContent = '保存证据并重新判断'; return;
+    }
+    const reviewResult = await requestJson(`/api/opportunity-assessments/${assessmentId}/review`, {
+      review_status: 'needs_more_evidence', ...checks, reason_code: '',
+      selected_missing_evidence: payload.addressed_missing_evidence,
+      note: reviewForm?.elements.note?.value.trim() || ''
+    });
+    if (!reviewResult.ok) {
+      setInlineError('supplement-error', reviewResult.message);
+      button.disabled = false; button.textContent = '保存证据并重新判断'; return;
+    }
+  }
+  const result = await requestJson(`/api/workbench/research-candidates/${itemId}/evidence`, payload);
+  if (result.ok) {
+    const nextId = result.body.candidate_id || result.body.new_candidate_id || result.body.successor_candidate_id;
+    location.href = result.body.redirect_url || (nextId ? `/workbench/items/${nextId}` : '/workbench'); return;
+  }
+  setInlineError('supplement-error', result.message); button.disabled = false; button.textContent = '保存证据并重新判断';
+});
+</script>
+{% endblock %}

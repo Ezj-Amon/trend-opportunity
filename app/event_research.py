@@ -176,30 +176,30 @@ def build_event_research_view(
 ) -> EventResearchView:
     readiness_status = str(bundle.get("readiness_status") or "insufficient")
     if signals:
-        stage_label = "已确认机会"
+        stage_label = "判断已完成"
         conclusion_code = "signal_created"
-        conclusion_label = "消费变化已通过人工确认，可以进入商品方向"
-        primary_action = "从已确认机会生成少量实体商品方向"
+        conclusion_label = "这张判断卡已经通过人工确认"
+        primary_action = "返回判断记录"
     elif assessment and assessment.get("review_status") == "pending":
-        stage_label = "机会判断"
+        stage_label = "人工确认"
         conclusion_code = "assessment_pending"
-        conclusion_label = "机会判断草稿已完成，等待人工确认"
-        primary_action = "审核当前判断：值得跟进、不适合选品或需要补证据"
+        conclusion_label = "三级判断草稿已完成，等待人工确认"
+        primary_action = "核对事实、问题和持续性"
     elif candidate:
-        stage_label = "机会判断"
+        stage_label = "判断任务"
         conclusion_code = "research_candidate"
-        conclusion_label = "证据与研究问题已准备，尚未形成消费机会结论"
-        primary_action = "使用本页表单完成一次结构化机会判断"
+        conclusion_label = "证据与研究问题已准备，尚未形成判断结论"
+        primary_action = "进入判断任务"
     elif readiness_status == "ready_for_assessment":
-        stage_label = "机会判断"
+        stage_label = "判断任务"
         conclusion_code = "ready_for_assessment"
-        conclusion_label = "证据已准备，等待机会判断"
-        primary_action = "将该趋势加入机会判断队列"
+        conclusion_label = "证据已准备，等待生成三级判断卡"
+        primary_action = "将该趋势加入判断任务"
     elif bundle.get("evidence_ids"):
-        stage_label = "趋势发现"
+        stage_label = "证据准备"
         conclusion_code = "insufficient_evidence"
-        conclusion_label = "当前证据不足，暂不进入机会判断"
-        primary_action = "等待新的独立来源；不要生成商品方向"
+        conclusion_label = "当前证据不足，暂不生成判断卡"
+        primary_action = "等待新的独立来源"
     else:
         stage_label = "趋势发现"
         conclusion_code = "no_evidence"
@@ -209,9 +209,9 @@ def build_event_research_view(
     missing = list(bundle.get("missing_evidence") or [])
     stop_reasons = [] if signals else list(missing)
     if candidate and not assessment:
-        stop_reasons.append("ResearchCandidate 只保存研究方向，不能直接进入商品假设或推荐")
+        stop_reasons.append("ResearchCandidate 只保存判断任务，不能当作已审核结论")
     if not signals and readiness_status == "ready_for_assessment":
-        stop_reasons.append("证据已达到准备门槛，但当前生产器尚未形成经审核的机会线索")
+        stop_reasons.append("证据已达到准备门槛，但尚未形成经人工审核的判断卡")
     if not stop_reasons and not signals:
         stop_reasons.append("当前没有足够信息支持消费变化判断")
 

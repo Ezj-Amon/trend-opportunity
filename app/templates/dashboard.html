@@ -1,14 +1,20 @@
 {% extends "base.html" %}
-{% block title %}趋势发现 · 选品助手{% endblock %}
+{% block title %}发现趋势 · 趋势机会判断训练器{% endblock %}
 {% block content %}
-<section class="hero">
+{% set counts = namespace(needs_evidence=0, needs_judgment=0) %}
+{% for event in events %}
+  {% if event.latest_research_status == 'insufficient_evidence' %}{% set counts.needs_evidence = counts.needs_evidence + 1 %}
+  {% elif event.latest_research_status in ['pending','researching','evidence_ready','awaiting_review'] %}{% set counts.needs_judgment = counts.needs_judgment + 1 %}{% endif %}
+{% endfor %}
+
+<section class="hero discovery-hero">
   <div>
-    <p class="eyebrow">趋势发现 → 机会判断 → 商品方向 → 市场验证 → 已验证选品</p>
-    <h1>全球趋势发现</h1>
-    <p class="muted">持续追踪国内外事实层趋势。热点只是发现入口，不代表购买需求或商品推荐。</p>
+    <p class="eyebrow">第一步 · 发现真实变化</p>
+    <h1>先判断变化，<br>不急着想商品。</h1>
+    <p class="muted">从真实公开来源发现趋势。系统会先检查证据，再把值得判断的变化送入判断任务。</p>
   </div>
   <button id="run-button" class="primary" {% if pipeline_running %}disabled{% endif %}>
-    {% if pipeline_running %}采集中…{% else %}立即运行真实采集{% endif %}
+    {% if pipeline_running %}采集中…{% else %}运行真实趋势采集{% endif %}
   </button>
 </section>
 
@@ -17,7 +23,7 @@
     <div>
       <p class="eyebrow">本次采集进度</p>
       <h2 id="run-stage">正在准备数据源</h2>
-      <p id="run-detail" class="muted">系统会持续更新，你可以离开这个页面，采集仍会在后台继续。</p>
+      <p id="run-detail" class="muted">采集会在后台继续，可以暂时离开本页。</p>
     </div>
     <div class="run-time"><strong id="run-eta">正在估算</strong><span>预计剩余</span></div>
   </div>
@@ -25,9 +31,7 @@
     <i id="run-progress-bar" style="width:0%"></i>
   </div>
   <div class="run-progress-meta">
-    <span id="run-percent">0%</span>
-    <span id="run-elapsed">已用时 0 秒</span>
-    <span id="run-output">等待首个数据源返回</span>
+    <span id="run-percent">0%</span><span id="run-elapsed">已用时 0 秒</span><span id="run-output">等待首个数据源返回</span>
   </div>
   <details id="run-source-details">
     <summary>查看各数据源状态</summary>
@@ -35,87 +39,72 @@
   </details>
 </section>
 
-<section class="metric-grid">
-  <article class="metric"><span>当前趋势</span><strong>{{ events|length }}</strong></article>
-  <article class="metric"><span>待机会判断</span><strong>{{ journey_counts.research }}</strong></article>
-  <article class="metric"><span>已确认机会</span><strong>{{ journey_counts.signals }}</strong></article>
-  <article class="metric"><span>已验证选品</span><strong>{{ journey_counts.recommendations }}</strong></article>
+<section class="metric-grid discovery-metrics" aria-label="趋势处理概况">
+  <article class="metric"><span>发现的趋势</span><strong>{{ events|length }}</strong><small>当前筛选结果</small></article>
+  <article class="metric"><span>待补充证据</span><strong>{{ counts.needs_evidence }}</strong><small>还不能形成可靠判断</small></article>
+  <article class="metric"><span>待进入判断</span><strong>{{ counts.needs_judgment }}</strong><small>证据正在准备或待处理</small></article>
 </section>
 
-<section class="panel digest-panel">
+<section class="panel trend-panel">
   <div class="panel-head">
-    <div><h2>今日趋势信号摘要</h2><span>{{ digest.date }} · 事实层事件 · 不是商品推荐</span></div>
-    <button id="digest-button" class="primary" {% if not settings.feishu_webhook_url %}disabled title="请先配置 FEISHU_WEBHOOK_URL"{% endif %}>推送趋势摘要到飞书</button>
+    <div><p class="eyebrow">候选变化</p><h2>最新趋势</h2></div>
+    <a class="button-link" href="/workbench">前往判断任务</a>
   </div>
-  <div class="top-grid">
-    {% for title, items in [('中国趋势信号 Top 3', digest.cn_top3), ('海外趋势信号 Top 3', digest.overseas_top3)] %}
-    <div class="top-list">
-      <h3>{{ title }}</h3>
-      {% for item in items %}
-      <a href="/events/{{ item.event_id }}" class="top-item">
-        <strong>{{ loop.index }}. {{ item.event_title }}</strong>
-        <span>{{ item.market }} · {{ item.signal_type }} · 趋势分 {{ item.trend_score }}</span>
-        <small>{{ item.source_count }} 个来源 · {{ item.member_count }} 条记录</small>
-      </a>
-      {% else %}<p class="muted">当前没有趋势事件。</p>{% endfor %}
-    </div>
+  <nav class="market-filters" aria-label="市场筛选">
+    {% for market in market_options %}
+    <a href="/?market={{ market }}" class="{{ 'active' if selected_market == market else '' }}" {% if selected_market == market %}aria-current="page"{% endif %}>
+      {{ '全部' if market == 'ALL' else market }}
+      {% if market == 'ALL' %}{{ market_counts.values()|sum }}{% else %}{{ market_counts.get(market, 0) }}{% endif %}
+    </a>
+    {% endfor %}
+  </nav>
+  {% if events %}
+  <div class="event-list">
+    {% for event in events %}
+    <a class="event-row" href="/events/{{ event.id }}">
+      <div class="score-ring" aria-label="趋势分 {{ '%.0f'|format(event.trend_score) }}">{{ '%.0f'|format(event.trend_score) }}</div>
+      <div class="event-main">
+        <div class="event-tags"><span>{{ event.market }}</span><span>{{ event.signal_type }}</span></div>
+        <h3>{{ event.canonical_title }}</h3>
+        <p>{{ event.source_count }} 个来源 · {{ event.member_count }} 条记录 · 更新于 {{ event.last_seen_at[:16].replace('T',' ') }}</p>
+      </div>
+      <div class="opportunity-mark">
+        {% if event.latest_research_status == 'completed' %}<strong>判断已完成</strong><span>查看事实与证据</span>
+        {% elif event.latest_research_status == 'insufficient_evidence' %}<strong>需要补证</strong><span>查看缺少什么</span>
+        {% elif event.latest_research_status %}<strong>判断准备中</strong><span>查看当前状态</span>
+        {% else %}<strong>新趋势</strong><span>先查看事实</span>{% endif %}
+      </div>
+    </a>
     {% endfor %}
   </div>
+  {% else %}
+  <div class="empty discovery-empty">
+    <h2>今天没有值得判断的趋势，也完全正常</h2>
+    <p>可靠判断允许零结果。运行真实采集后，只有通过初筛的变化才会继续。</p>
+    <button id="empty-run-button" class="primary" {% if pipeline_running %}disabled{% endif %}>运行真实趋势采集</button>
+  </div>
+  {% endif %}
 </section>
 
-<div class="layout">
-  <section class="panel grow">
-    <div class="panel-head"><h2>最新趋势事件</h2><span>{{ events|length }} 条</span></div>
-    <nav class="market-filters" aria-label="市场筛选">
-      {% for market in market_options %}
-      <a href="/?market={{ market }}" class="{{ 'active' if selected_market == market else '' }}">
-        {{ '全部' if market == 'ALL' else market }}
-        {% if market == 'ALL' %}{{ market_counts.values()|sum }}{% else %}{{ market_counts.get(market, 0) }}{% endif %}
-      </a>
-      {% endfor %}
-    </nav>
-    {% if events %}
-    <div class="event-list">
-      {% for event in events %}
-      <a class="event-row" href="/events/{{ event.id }}">
-        <div class="score-ring">{{ '%.0f'|format(event.trend_score) }}</div>
-        <div class="event-main">
-          <div class="event-tags"><span>{{ event.market }}</span><span>{{ event.signal_type }}</span></div>
-          <h3>{{ event.canonical_title }}</h3>
-          <p>{{ event.source_count }} 个来源 · {{ event.member_count }} 条记录 · 最后出现 {{ event.last_seen_at[:16].replace('T',' ') }}</p>
-        </div>
-        <div class="opportunity-mark">
-          {% if event.best_signal_score is not none %}<span>已确认机会</span>
-          {% elif event.latest_research_status %}<span>机会判断中</span>
-          {% else %}<span>趋势发现</span>{% endif %}
-        </div>
-      </a>
-      {% endfor %}
-    </div>
-    {% else %}
-    <div class="empty"><p>当前筛选下还没有数据。</p><p>点击“立即运行真实采集”，系统会访问已配置的真实公共源。</p></div>
-    {% endif %}
-  </section>
-
-  <aside class="side"><details class="technical-audit"><summary>系统状态</summary>
-    <section class="panel">
-      <div class="panel-head"><h2>来源健康</h2></div>
-      {% for source in source_health %}
-      <div class="health-row"><span class="dot {{ 'ok' if source.success else 'bad' }}"></span><span>{{ source.source }} <em>{{ source.market }} · {{ source.signal_type }}</em></span><small>{{ source.latency_ms }} ms</small></div>
-      {% else %}<p class="muted">运行后显示</p>{% endfor %}
+<details class="technical-audit">
+  <summary>采集与来源状态</summary>
+  <div class="audit-grid">
+    <section>
+      <h3>最近运行</h3>
+      {% for run in runs[:5] %}<p><b>{{ run.status }}</b> · {{ run.started_at[:16].replace('T',' ') }}</p>{% else %}<p class="muted">还没有运行记录。</p>{% endfor %}
     </section>
-    <section class="panel">
-      <div class="panel-head"><h2>最近运行</h2></div>
-      {% for run in runs %}
-      <div class="run-row"><span class="status {{ run.status }}">{{ run.status }}</span><span>{{ run.items_count }} 条</span><small>{{ run.started_at[:16].replace('T',' ') }}</small></div>
-      {% else %}<p class="muted">暂无</p>{% endfor %}
+    <section>
+      <h3>来源健康</h3>
+      {% for source in source_health %}<p><b>{{ source.source }}</b> · {{ '可用' if source.success else '异常' }}</p>{% else %}<p class="muted">还没有来源状态。</p>{% endfor %}
     </section>
-  </details></aside>
-</div>
+  </div>
+</details>
 {% endblock %}
+
 {% block scripts %}
 <script>
   const runButton = document.getElementById('run-button');
+  const emptyRunButton = document.getElementById('empty-run-button');
   const runPanel = document.getElementById('run-progress');
   let runPoller = null;
 
@@ -124,7 +113,6 @@
     if (seconds < 60) return `${Math.max(1, seconds)} 秒`;
     return `约 ${Math.ceil(seconds / 60)} 分钟`;
   }
-
   function renderRunStatus(status) {
     if (!status || status.status === 'idle') return;
     runPanel.hidden = false;
@@ -136,67 +124,41 @@
     const bar = document.getElementById('run-progress-bar');
     bar.style.width = `${progress}%`;
     bar.closest('[role="progressbar"]').setAttribute('aria-valuenow', progress);
-
     let detail = '';
-    if (status.stage === 'ingest') detail = `已完成 ${status.sources_completed || 0}/${status.sources_total || 0} 个数据源，成功 ${status.sources_succeeded || 0} 个。外部源响应慢时预计时间会动态调整。`;
-    if (status.stage === 'cluster') detail = `已拿到 ${status.items_count || 0} 条原始记录，正在去重并合并成趋势事件。`;
-    if (status.stage === 'research') detail = `已形成 ${status.events_count || 0} 个趋势事件，正在为第 ${status.researched_count || 0}/${status.selected_count || 0} 个重点事件构建证据包与研究候选。`;
-    if (status.stage === 'analyze') detail = `正在读取历史运行状态。`;
-    if (status.stage === 'completed') detail = `本次采集完成：${status.items_count || 0} 条原始记录、${status.events_count || 0} 个趋势事件、${status.selected_count || 0} 个重点研究候选。`;
+    if (status.stage === 'ingest') detail = `已完成 ${status.sources_completed || 0}/${status.sources_total || 0} 个数据源，成功 ${status.sources_succeeded || 0} 个。`;
+    if (status.stage === 'cluster') detail = `已拿到 ${status.items_count || 0} 条原始记录，正在去重并合并成趋势。`;
+    if (status.stage === 'research') detail = `已形成 ${status.events_count || 0} 个趋势，正在为第 ${status.researched_count || 0}/${status.selected_count || 0} 个候选准备证据。`;
+    if (status.stage === 'completed') detail = `采集完成：${status.items_count || 0} 条原始记录、${status.events_count || 0} 个趋势、${status.selected_count || 0} 个判断候选。`;
     if (status.stage === 'failed') detail = status.error_summary || '本次采集未完成，请查看数据源状态后重试。';
     document.getElementById('run-detail').textContent = detail;
-    document.getElementById('run-output').textContent = `${status.items_count || 0} 条记录 · ${status.events_count || 0} 个事件`;
-
+    document.getElementById('run-output').textContent = `${status.items_count || 0} 条记录 · ${status.events_count || 0} 个趋势`;
     const sourceList = document.getElementById('run-source-list');
     sourceList.replaceChildren();
     (status.source_results || []).forEach(item => {
-      const row = document.createElement('div');
-      row.className = 'run-source-row';
-      const name = document.createElement('strong');
-      name.textContent = item.source;
-      const meta = document.createElement('span');
-      meta.textContent = `${item.market} · ${item.items_count || 0} 条 · ${item.latency_ms || 0} ms`;
-      const state = document.createElement('span');
-      state.className = `source-state ${item.success ? 'ok' : 'bad'}`;
-      state.textContent = item.success ? '已完成' : '失败';
-      row.append(name, meta, state);
-      sourceList.append(row);
+      const row = document.createElement('div'); row.className = 'run-source-row';
+      const name = document.createElement('strong'); name.textContent = item.source;
+      const meta = document.createElement('span'); meta.textContent = `${item.market} · ${item.items_count || 0} 条 · ${item.latency_ms || 0} ms`;
+      const state = document.createElement('span'); state.className = `source-state ${item.success ? 'ok' : 'bad'}`; state.textContent = item.success ? '已完成' : '失败';
+      row.append(name, meta, state); sourceList.append(row);
     });
-
     if (status.status !== 'running') {
-      clearInterval(runPoller);
-      runPoller = null;
-      runButton.disabled = false;
-      runButton.textContent = '再次运行采集';
-      if (status.status === 'completed') setTimeout(() => location.reload(), 1800);
+      clearInterval(runPoller); runPoller = null;
+      [runButton, emptyRunButton].filter(Boolean).forEach(button => { button.disabled = false; button.textContent = '再次运行趋势采集'; });
+      if (status.status === 'completed') window.setTimeout(() => location.reload(), 1800);
     }
   }
-
   async function fetchRunStatus() {
-    try {
-      const response = await fetch('/api/run/status', {cache: 'no-store'});
-      if (response.ok) renderRunStatus(await response.json());
-    } catch (_) {}
+    try { const response = await fetch('/api/run/status', {cache: 'no-store'}); if (response.ok) renderRunStatus(await response.json()); } catch (_) {}
   }
-
-  function startRunPolling() {
-    fetchRunStatus();
-    if (!runPoller) runPoller = setInterval(fetchRunStatus, 1500);
-  }
-
-  runButton?.addEventListener('click', async () => {
-    runButton.disabled = true; runButton.textContent = '采集中…';
-    runPanel.hidden = false;
-    const ok = await postAction('/api/run', '真实采集已启动，进度会持续更新');
-    if (!ok) { runButton.disabled = false; runButton.textContent = '立即运行真实采集'; return; }
+  function startRunPolling() { fetchRunStatus(); if (!runPoller) runPoller = window.setInterval(fetchRunStatus, 1500); }
+  async function startRun(event) {
+    const button = event.currentTarget; button.disabled = true; button.textContent = '采集中…'; runPanel.hidden = false;
+    const ok = await postAction('/api/run', '真实趋势采集已启动');
+    if (!ok) { button.disabled = false; button.textContent = '运行真实趋势采集'; return; }
     startRunPolling();
-  });
+  }
+  runButton?.addEventListener('click', startRun);
+  emptyRunButton?.addEventListener('click', startRun);
   if (runPanel?.dataset.running === 'true') startRunPolling();
-  document.getElementById('digest-button')?.addEventListener('click', async (event) => {
-    event.currentTarget.disabled = true;
-    const result = await postAction('/api/digest/push', null);
-    if (!result) { event.currentTarget.disabled = false; return; }
-    toast(result.status === 'already_sent' ? '当前双榜此前已推送' : result.status === 'in_progress' ? '双榜正在推送' : '双榜已推送到飞书');
-  });
 </script>
 {% endblock %}

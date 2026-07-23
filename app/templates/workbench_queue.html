@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ '判断记录' if processed else '判断任务' }} · 趋势机会判断训练器{% endblock %}
+{% block content %}
+<section class="hero compact-hero workbench-hero">
+  <div>
+    <p class="eyebrow">{{ '回看决定' if processed else '第二步 · 逐条判断' }}</p>
+    <h1>{{ '判断记录' if processed else '判断任务' }}</h1>
+    <p class="muted">{{ '查看已经确认的判断卡和你的最终决定。' if processed else '一次只处理一条趋势。先读 AI 整理的依据，再确认、补证或放弃。' }}</p>
+  </div>
+  <div class="hero-score"><strong>{{ items|length }}</strong><span>{{ '条已处理记录' if processed else '个待办任务' }}</span></div>
+</section>
+
+{% if not ai_configured and not processed %}
+<section class="notice setup-notice" role="status">
+  <strong>AI 判断尚未配置</strong>
+  <p>已准备好的证据仍然可以查看，但暂时不能生成新的判断卡。请配置 <code>OPENAI_API_KEY</code> 并重启服务。</p>
+</section>
+{% endif %}
+
+<section class="panel workbench-list">
+  <div class="panel-head"><div><p class="eyebrow">{{ '已完成' if processed else '按下一步排序' }}</p><h2>{{ '最近的判断' if processed else '现在需要处理' }}</h2></div><span>{{ items|length }} 条</span></div>
+  {% for item in items %}
+  <article class="workbench-row">
+    <div class="workbench-row-main">
+      <div class="workbench-row-meta">
+        <span class="status {{ item.workbench_state }}">{{ item.workbench_state_label }}</span>
+        <span>{{ item.market }} · 更新于 {{ item.updated_at[:16].replace('T',' ') }}</span>
+      </div>
+      <h3>{{ item.event_title }}</h3>
+      <p>{{ item.candidate_reason }}</p>
+      <div class="queue-evidence-summary">
+        <span><b>{{ item.full_text_count }}</b> 篇完整正文或公告</span>
+        <span><b>{{ item.independent_source_count }}</b> 个独立来源</span>
+      </div>
+      {% set gaps = (item.latest_assessment.missing_evidence if item.latest_assessment and item.latest_assessment.missing_evidence else item.missing_evidence) %}
+      {% if gaps %}<p class="queue-gaps"><b>仍缺：</b>{{ gaps[:2]|join('；') }}{% if gaps|length > 2 %} 等 {{ gaps|length }} 项{% endif %}</p>{% endif %}
+    </div>
+    <a class="button-link {{ 'primary' if item.workbench_state in ['ready_for_ai','awaiting_review','ai_failed'] else '' }}" href="/workbench/items/{{ item.id }}" aria-label="{{ item.primary_action_label }}：{{ item.event_title }}">{{ item.primary_action_label }}</a>
+  </article>
+  {% else %}
+  <div class="empty workbench-empty">
+    <h2>{{ '还没有判断记录' if processed else '当前没有需要判断的趋势' }}</h2>
+    <p>{{ '完成一次人工决定后，结果会保存在这里。' if processed else '零条待办是可靠流程的正常结果，不需要为了数量强行得出结论。' }}</p>
+    <a class="button-link primary" href="/">{{ '返回发现趋势' if processed else '去发现真实趋势' }}</a>
+  </div>
+  {% endfor %}
+</section>
+{% endblock %}

@@ -1,9 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "OpportunityAssessmentDraft",
+  "title": "OpportunityAssessmentDraftV2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["assessment_status", "evidence_ids", "missing_evidence", "abstention_reason"],
+  "required": [
+    "assessment_status",
+    "consumer_change_judgment",
+    "problem_judgment",
+    "research_recommendation",
+    "evidence_ids",
+    "missing_evidence",
+    "abstention_reason"
+  ],
   "properties": {
     "assessment_status": {
       "enum": ["worth_following", "abstained", "insufficient_evidence"]
@@ -14,8 +22,15 @@
     "lead_time_fit": {"type": "string"},
     "target_users": {"type": "array", "items": {"type": "string"}},
     "new_scenarios": {"type": "array", "items": {"type": "string"}},
+    "existing_solutions": {"type": "array", "items": {"type": "string"}},
+    "solution_gaps": {"type": "array", "items": {"type": "string"}},
     "unmet_needs": {"type": "array", "items": {"type": "string"}},
-    "related_product_categories": {"type": "array", "items": {"type": "string"}},
+    "related_product_categories": {"type": "array", "maxItems": 0},
+    "consumer_change_judgment": {
+      "$ref": "#/$defs/consumerChangeJudgment"
+    },
+    "problem_judgment": {"$ref": "#/$defs/problemJudgment"},
+    "research_recommendation": {"$ref": "#/$defs/researchRecommendation"},
     "fact_claims": {"type": "array", "items": {"$ref": "#/$defs/citedClaim"}},
     "inferences": {"type": "array", "items": {"$ref": "#/$defs/citedClaim"}},
     "evidence_ids": {"type": "array", "items": {"type": "integer"}},
@@ -35,6 +50,36 @@
           "minItems": 1,
           "items": {"type": "integer"}
         }
+      }
+    },
+    "consumerChangeJudgment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rationale", "evidence_ids"],
+      "properties": {
+        "status": {"enum": ["related", "unrelated", "uncertain"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "integer"}}
+      }
+    },
+    "problemJudgment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rationale", "evidence_ids"],
+      "properties": {
+        "status": {"enum": ["clear", "needs_evidence", "none"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "integer"}}
+      }
+    },
+    "researchRecommendation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rationale", "evidence_ids"],
+      "properties": {
+        "status": {"enum": ["continue_research", "defer", "abandon"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "integer"}}
       }
     }
   }

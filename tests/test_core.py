@@ -12,6 +12,7 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
+import app.cli as cli_app
 import app.main as main_app
 import app.pipeline as pipeline_module
 from app.amazon import is_search_term_ready, pick_search_term
@@ -124,6 +125,39 @@ def make_settings(tmp_path: Path) -> Settings:
         admin_token=None,
         enable_public_news_search=False,
     )
+
+
+def test_cli_run_starts_web_server_without_constructing_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {}
+
+    class ForbiddenPipeline:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("run command must not construct Pipeline")
+
+    def fake_uvicorn_run(app: str, **kwargs) -> None:
+        called.update({"app": app, **kwargs})
+
+    monkeypatch.setattr(cli_app, "Pipeline", ForbiddenPipeline)
+    monkeypatch.setattr(cli_app.uvicorn, "run", fake_uvicorn_run)
+    cli_app.main(["run"])
+
+    assert called == {"app": "app.main:app", "host": "127.0.0.1", "port": 8000}
+
+
+def test_cli_collect_is_the_explicit_pipeline_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = []
+
+    async def fake_collect_pipeline() -> None:
+        called.append("collect")
+
+    monkeypatch.setattr(cli_app, "collect_pipeline", fake_collect_pipeline)
+    cli_app.main(["collect"])
+
+    assert called == ["collect"]
 
 
 def test_title_normalization_and_clustering() -> None:
@@ -726,12 +760,13 @@ def test_market_validation_review_and_outcome_apis(
         assert outcome.status_code == 200
         detail = client.get(f"/events/{event_id}")
         assert detail.status_code == 200
-        assert "已验证推荐分" in detail.text
-        assert "SellerSprite export" in detail.text
+        assert "已验证推荐分" not in detail.text
+        assert "商品方向" not in detail.text
+        assert "SellerSprite export" not in detail.text
         dashboard = client.get("/")
         assert dashboard.status_code == 200
-        assert "中国趋势信号 Top 3" in dashboard.text
-        assert "海外趋势信号 Top 3" in dashboard.text
+        assert "先判断变化" in dashboard.text
+        assert "趋势信号 Top 3" not in dashboard.text
     saved = db.one("SELECT * FROM product_opportunities WHERE id=?", (opportunity_id,))
     assert saved["validation_status"] == "completed"
     assert saved["validated_recommendation_score"] is not None
@@ -970,10 +1005,10 @@ async def test_pipeline_stops_at_research_candidate_without_automatic_signal(
     assert "打开机会判断" in research_page.text
     assert "已有部分证据" in research_page.text
     assert "ResearchCandidate" not in research_page.text
-    assert "完成机会判断" in event_page.text
-    assert event_page.text.index("当前结论") < event_page.text.index("已采用的关键证据")
-    assert event_page.text.index("已采用的关键证据") < event_page.text.index("完成机会判断")
-    assert "系统与审计详情" in event_page.text
+    assert "进入判断任务" in event_page.text
+    assert event_page.text.index("当前进度") < event_page.text.index("已采用的关键证据")
+    assert "完成机会判断" not in event_page.text
+    assert "来源记录与技术信息" in event_page.text
     assert "人工创建一条可审计的机会线索" not in event_page.text
 
     class MissingModelExtractor:
@@ -1425,11 +1460,11 @@ def test_dashboard_and_health_report_candidate_pipeline_not_local_rules(
         dashboard = client.get("/")
         health = client.get("/healthz")
     assert dashboard.status_code == 200
-    assert "趋势发现" in dashboard.text
-    assert "机会判断" in dashboard.text
-    assert "商品方向" in dashboard.text
-    assert "已验证选品" in dashboard.text
-    assert 'class="system-menu"' in dashboard.text
+    assert "发现真实变化" in dashboard.text
+    assert "判断任务" in dashboard.text
+    assert "商品方向" not in dashboard.text
+    assert "已验证选品" not in dashboard.text
+    assert 'class="system-menu"' not in dashboard.text
     assert "Evidence → Candidate" not in dashboard.text
     assert "local-rules-v2" not in dashboard.text
     assert health.status_code == 200
@@ -1531,13 +1566,10 @@ def test_event_page_explains_title_only_evidence_and_negative_semantic_delta(
 
     assert page.status_code == 200
     assert "证据不足" in page.text
-    assert "完整正文 0" in page.text
-    assert "标题证据 3" in page.text
-    assert "正文过短" in page.text
-    assert "出行户外" in page.text and "0.7927" in page.text
-    assert "个护整理" in page.text and "0.7824" in page.text
-    assert "汽车配件" in page.text and "0.7725" in page.text
-    assert "负向判断略强" in page.text
+    assert "当前没有可用于判断的正文或可靠摘要" in page.text
+    assert "来源记录与技术信息" in page.text
+    assert "出行户外" not in page.text
+    assert "负向判断略强" not in page.text
 
 
 def test_event_page_explains_ready_evidence_without_semantic_feature(
@@ -1581,11 +1613,10 @@ def test_event_page_explains_ready_evidence_without_semantic_feature(
         page = client.get(f"/events/{event_id}")
 
     assert page.status_code == 200
-    assert "证据已准备，等待机会判断" in page.text
-    assert "完整正文 2" in page.text
-    assert "独立来源 2" in page.text
-    assert "语义状态：尚未运行" in page.text
-    assert page.text.index("当前结论") < page.text.index("已采用的关键证据")
+    assert "证据已准备，等待生成三级判断卡" in page.text
+    assert "已采用的关键证据" in page.text
+    assert "语义状态：尚未运行" not in page.text
+    assert page.text.index("当前进度") < page.text.index("已采用的关键证据")
 
 
 def test_evidence_metadata_migration_classifies_legacy_rows(tmp_path: Path) -> None:
@@ -2860,11 +2891,11 @@ def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit
 
     monkeypatch.setattr(main_app, "db", db)
     with TestClient(main_app.app) as client:
-        audited_page = client.get(f"/events/{event_id}")
-    assert "get_context" in audited_page.text
-    assert "工具调用（1）" in audited_page.text
-    assert "系统与审计详情" in audited_page.text
-    assert "公开页面 2" in audited_page.text
+        audited_page = client.get(f"/workbench/items/{candidate_id}")
+    assert audited_page.status_code == 200
+    assert "技术与审计信息" in audited_page.text
+    assert "EvidenceBundle" in audited_page.text
+    assert "audited-agent" in audited_page.text
 
     failed_run = start_research_run(
         db,
@@ -2877,11 +2908,10 @@ def test_research_run_keeps_insufficient_bundle_state_and_event_page_shows_audit
         ResearchRunCompleteInput(status="failed", error="provider unavailable"),
     )
     with TestClient(main_app.app) as client:
-        page = client.get(f"/events/{event_id}")
+        page = client.get(f"/workbench/items/{candidate_id}")
     assert page.status_code == 200
-    assert "自动执行器尚未接入" in page.text
     assert "failed-agent" in page.text
-    assert "运行失败" in page.text
+    assert "provider unavailable" in page.text
     assert "provider unavailable" in page.text
 
 
@@ -3080,8 +3110,9 @@ def test_event_workbench_completes_judgment_run_assessment_and_signal(
         after = client.get(f"/events/{event_id}")
 
     assert before.status_code == 200
-    assert 'id="opportunity-judgment-form"' in before.text
-    assert 'name="judgment-evidence"' in before.text
+    assert 'id="opportunity-judgment-form"' not in before.text
+    assert 'name="judgment-evidence"' not in before.text
+    assert "进入判断任务" in before.text
     assert "手填证据 ID" not in before.text
     assert result.status_code == 200
     body = result.json()
@@ -3095,7 +3126,8 @@ def test_event_workbench_completes_judgment_run_assessment_and_signal(
         "SELECT status FROM research_candidates WHERE id=?", (candidate_id,)
     )["status"] == "completed"
     assert 'id="opportunity-judgment-form"' not in after.text
-    assert 'class="product-direction-form"' in after.text
+    assert 'class="product-direction-form"' not in after.text
+    assert "判断已完成" in after.text
     assert "引用证据 ID" not in after.text
 
 
@@ -3310,6 +3342,48 @@ async def test_collect_related_news_falls_back_to_active_public_search(
     assert result["result"]["evidence_bundle"]["readiness_status"] == "ready_for_assessment"
 
 
+def test_opportunity_assessment_v2_requires_consistent_three_level_judgment() -> None:
+    evidence_ids = [1, 2]
+    value = OpportunityAssessmentDraft(
+        assessment_status="worth_following",
+        change_type="出行规则长期收紧",
+        consumer_relevance="普通旅客的携带方式受到影响。",
+        durability="长期政策变化。",
+        lead_time_fit="有时间继续研究。",
+        target_users=["经常乘坐廉价航空的旅客"],
+        new_scenarios=["登机前核对随身行李尺寸"],
+        existing_solutions=["标称登机尺寸的旅行包"],
+        solution_gaps=["装满后实际尺寸难以判断"],
+        unmet_needs=["出发前可靠确认是否超限"],
+        consumer_change_judgment={
+            "status": "related", "rationale": "影响消费者出行", "evidence_ids": evidence_ids
+        },
+        problem_judgment={
+            "status": "clear", "rationale": "出现额外费用和判断成本", "evidence_ids": evidence_ids
+        },
+        research_recommendation={
+            "status": "continue_research", "rationale": "值得继续核实消费者反馈", "evidence_ids": evidence_ids
+        },
+        fact_claims=[{"claim": "规则已开始执行。", "evidence_ids": evidence_ids}],
+        evidence_ids=evidence_ids,
+    )
+    value.require_v2()
+    with pytest.raises(ValueError, match="assessment status must be insufficient_evidence"):
+        OpportunityAssessmentDraft.model_validate(
+            {
+                **value.model_dump(),
+                "problem_judgment": {
+                    "status": "needs_evidence",
+                    "rationale": "仍缺消费者反馈",
+                    "evidence_ids": evidence_ids,
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="must not output product categories"):
+        forbidden = value.model_copy(update={"related_product_categories": ["旅行包"]})
+        forbidden.require_v2()
+
+
 @pytest.mark.asyncio
 async def test_cloud_assessment_preflight_gates_model_and_failure_is_explicit() -> None:
     class FakeResponses:
@@ -3371,6 +3445,7 @@ async def test_cloud_assessment_preflight_gates_model_and_failure_is_explicit() 
     assert failed.draft.assessment_status == "abstained"
     assert "provider unavailable" in failed.draft.abstention_reason
     assert failed.engine.endswith("-failed")
+    assert failed.generation_status == "failed"
 
 
 @pytest.mark.asyncio
@@ -3383,8 +3458,18 @@ async def test_cloud_assessment_unknown_citation_is_rejected_after_structured_ou
         lead_time_fit="匹配",
         target_users=["小空间住户"],
         new_scenarios=["动态收纳"],
+        existing_solutions=["固定层架"],
+        solution_gaps=["无法灵活调整"],
         unmet_needs=["灵活结构"],
-        related_product_categories=["家居收纳"],
+        consumer_change_judgment={
+            "status": "related", "rationale": "事实支持", "evidence_ids": [999]
+        },
+        problem_judgment={
+            "status": "clear", "rationale": "问题明确", "evidence_ids": [999]
+        },
+        research_recommendation={
+            "status": "continue_research", "rationale": "值得继续", "evidence_ids": [999]
+        },
         fact_claims=[{"claim": "事实", "evidence_ids": [999]}],
         evidence_ids=[999],
     )
@@ -3416,3 +3501,403 @@ async def test_cloud_assessment_unknown_citation_is_rejected_after_structured_ou
                 "product_hypothesis": {"name": "forbidden"},
             }
         )
+
+
+def test_research_workbench_generates_pending_ai_draft_then_approves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "research-workbench.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db)
+
+    class FakeCloudProvider:
+        def __init__(self, _api_key, model, **_kwargs):
+            self.model = model
+
+        async def assess(self, _event, _bundle, _candidate, _evidence):
+            return SimpleNamespace(
+                draft=OpportunityAssessmentDraft(
+                    assessment_status="worth_following",
+                    change_type="居住空间约束持续变化",
+                    consumer_relevance="住户持续调整收纳方式并产生重复购买。",
+                    durability="变化跨季节持续存在。",
+                    lead_time_fit="持续时间覆盖常规实体商品交付周期。",
+                    target_users=["小空间住户"],
+                    new_scenarios=["房间用途频繁切换"],
+                    existing_solutions=["固定收纳架"],
+                    solution_gaps=["无法随空间变化调整"],
+                    unmet_needs=["固定结构无法灵活调整"],
+                    consumer_change_judgment={
+                        "status": "related",
+                        "rationale": "两个来源记录了持续变化。",
+                        "evidence_ids": evidence_ids,
+                    },
+                    problem_judgment={
+                        "status": "clear",
+                        "rationale": "固定方案带来明确不便。",
+                        "evidence_ids": evidence_ids,
+                    },
+                    research_recommendation={
+                        "status": "continue_research",
+                        "rationale": "问题持续且仍需进一步验证。",
+                        "evidence_ids": evidence_ids,
+                    },
+                    fact_claims=[
+                        {"claim": "两个独立来源记录了持续的空间约束。", "evidence_ids": evidence_ids}
+                    ],
+                    inferences=[
+                        {"claim": "该变化值得继续研究。", "evidence_ids": evidence_ids}
+                    ],
+                    evidence_ids=evidence_ids,
+                    missing_evidence=["平台需求数据"],
+                ),
+                engine="cloud-opportunity-assessment",
+                model=self.model,
+                version="cloud-assessment-test",
+            )
+
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "CloudOpportunityAssessmentProvider", FakeCloudProvider)
+    monkeypatch.setattr(
+        main_app,
+        "settings",
+        replace(main_app.settings, openai_api_key="test-key", openai_model="test-model"),
+    )
+
+    with TestClient(main_app.app) as client:
+        pending_before = client.get("/workbench")
+        detail_before = client.get(f"/workbench/items/{candidate_id}")
+        generated = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/ai-draft"
+        )
+        detail_after = client.get(f"/workbench/items/{candidate_id}")
+        generated_again = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/ai-draft"
+        )
+        signals_after_draft = db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"]
+        reviewed = client.post(
+            f"/api/opportunity-assessments/{generated.json()['id']}/review",
+            json={
+                "review_status": "approved",
+                "fact_check": "accurate",
+                "problem_check": "real",
+                "durability_check": "sufficient",
+                "note": "已核对事实与引用",
+            },
+        )
+        pending_after = client.get("/workbench")
+        processed_after = client.get("/workbench/processed")
+
+    assert pending_before.status_code == 200
+    assert "Recurring small-space constraints" in pending_before.text
+    assert "生成 AI 判断卡" in pending_before.text
+    assert "生成三级判断卡" in detail_before.text
+    assert generated.status_code == 200
+    assert generated.json()["review_status"] == "pending"
+    assert generated_again.json()["id"] == generated.json()["id"]
+    assert signals_after_draft == 0
+    assert db.one("SELECT COUNT(*) n FROM opportunity_assessments")["n"] == 1
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 1
+    assert "居住空间约束持续变化" in detail_after.text
+    assert "小空间住户" in detail_after.text
+    assert "房间用途频繁切换" in detail_after.text
+    assert "固定结构无法灵活调整" in detail_after.text
+    assert "固定收纳架" in detail_after.text
+    assert "无法随空间变化调整" in detail_after.text
+    assert "平台需求数据" in detail_after.text
+    assert "证据 #" in detail_after.text
+    assert "继续研究" in detail_after.text
+    assert "补充证据" in detail_after.text
+    assert "放弃" in detail_after.text
+    assert "技术与审计信息" in detail_after.text
+    assert reviewed.status_code == 200
+    assert reviewed.json()["opportunity_signal"]["event_id"] == event_id
+    assert "Recurring small-space constraints" not in pending_after.text
+    assert "Recurring small-space constraints" in processed_after.text
+    assert "已决定继续研究" in processed_after.text
+
+
+@pytest.mark.parametrize(
+    ("review_status", "expected_candidate_status", "processed"),
+    [
+        ("needs_more_evidence", "insufficient_evidence", False),
+        ("rejected", "completed", True),
+    ],
+)
+def test_research_workbench_nonapproval_never_creates_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    review_status: str,
+    expected_candidate_status: str,
+    processed: bool,
+) -> None:
+    db = Database(tmp_path / f"workbench-{review_status}.db")
+    db.initialize()
+    _event_id, evidence_ids, candidate_id = make_research_chain(db)
+    run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="human", executor_name="workbench-test"),
+    )
+    completed_run = complete_research_run(
+        db, run, ResearchRunCompleteInput(status="completed")
+    )
+    monkeypatch.setattr(main_app, "db", db)
+    with TestClient(main_app.app) as client:
+        assessment = client.post(
+            f"/api/research-candidates/{candidate_id}/assessments",
+            json={
+                "assessment_status": "worth_following",
+                "change_type": "空间约束变化",
+                "consumer_relevance": "住户持续受到影响。",
+                "durability": "跨季节持续。",
+                "lead_time_fit": "匹配交付周期。",
+                "target_users": ["小空间住户"],
+                "new_scenarios": ["动态收纳"],
+                "unmet_needs": ["灵活结构"],
+                "related_product_categories": ["家居收纳"],
+                "fact_claims": [{"claim": "事实", "evidence_ids": evidence_ids}],
+                "inferences": [{"claim": "推断", "evidence_ids": evidence_ids}],
+                "evidence_ids": evidence_ids,
+                "research_run_id": completed_run["id"],
+            },
+        )
+        review = client.post(
+            f"/api/opportunity-assessments/{assessment.json()['id']}/review",
+            json={"review_status": review_status, "note": "页面审核"},
+        )
+        pending_page = client.get("/workbench")
+        processed_page = client.get("/workbench/processed")
+
+    assert review.status_code == 200
+    assert review.json()["opportunity_signal"] is None
+    assert db.one("SELECT COUNT(*) n FROM opportunity_signals")["n"] == 0
+    assert db.one(
+        "SELECT status FROM research_candidates WHERE id=?", (candidate_id,)
+    )["status"] == expected_candidate_status
+    assert ("Recurring small-space constraints" in processed_page.text) is processed
+    assert ("Recurring small-space constraints" in pending_page.text) is (not processed)
+
+
+def test_workbench_supplement_creates_versioned_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "workbench-supplement.db")
+    db.initialize()
+    event_id, evidence_ids, candidate_id = make_research_chain(db)
+    original_bundle_id = db.one(
+        "SELECT evidence_bundle_id FROM research_candidates WHERE id=?", (candidate_id,)
+    )["evidence_bundle_id"]
+    run = start_research_run(
+        db,
+        db.one("SELECT * FROM research_candidates WHERE id=?", (candidate_id,)),
+        ResearchRunInput(executor_type="human", executor_name="supplement-test"),
+    )
+    completed = complete_research_run(
+        db, run, ResearchRunCompleteInput(status="completed")
+    )
+
+    async def public_url(_url: str) -> bool:
+        return True
+
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "is_public_url", public_url)
+    assessment_payload = {
+        "assessment_status": "worth_following",
+        "change_type": "空间约束持续变化",
+        "consumer_relevance": "普通住户持续受到影响。",
+        "durability": "跨季节持续。",
+        "lead_time_fit": "适合继续研究。",
+        "target_users": ["小空间住户"],
+        "new_scenarios": ["动态调整收纳空间"],
+        "existing_solutions": ["固定收纳架"],
+        "solution_gaps": ["不能灵活调整"],
+        "unmet_needs": ["更灵活的处理方式"],
+        "consumer_change_judgment": {
+            "status": "related", "rationale": "影响普通消费者", "evidence_ids": evidence_ids,
+        },
+        "problem_judgment": {
+            "status": "clear", "rationale": "存在明确限制", "evidence_ids": evidence_ids,
+        },
+        "research_recommendation": {
+            "status": "continue_research", "rationale": "值得补充消费者反馈", "evidence_ids": evidence_ids,
+        },
+        "fact_claims": [{"claim": "多个来源记录了变化。", "evidence_ids": evidence_ids}],
+        "evidence_ids": evidence_ids,
+        "missing_evidence": ["缺少消费者真实使用反馈"],
+        "research_run_id": completed["id"],
+    }
+    with TestClient(main_app.app) as client:
+        assessment = client.post(
+            f"/api/research-candidates/{candidate_id}/assessments",
+            json=assessment_payload,
+        )
+        reviewed = client.post(
+            f"/api/opportunity-assessments/{assessment.json()['id']}/review",
+            json={
+                "review_status": "needs_more_evidence",
+                "fact_check": "accurate",
+                "problem_check": "uncertain",
+                "durability_check": "sufficient",
+                "selected_missing_evidence": ["缺少消费者真实使用反馈"],
+                "note": "先补一条消费者讨论",
+            },
+        )
+        supplemented = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/evidence",
+            json={
+                "source_name": "Consumer Forum",
+                "url": "https://consumer.example/discussion",
+                "title": "Residents discuss changing storage constraints",
+                "excerpt": "Residents repeatedly describe the same constraint and the time cost of rearranging fixed shelves. " * 4,
+                "is_consumer_voice": True,
+                "addressed_missing_evidence": ["缺少消费者真实使用反馈"],
+            },
+        )
+        duplicate = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/evidence",
+            json={
+                "source_name": "Consumer Forum",
+                "url": "https://consumer.example/discussion",
+                "title": "Duplicate",
+                "excerpt": "Duplicate evidence should not rewrite the old task. " * 4,
+                "is_consumer_voice": True,
+                "addressed_missing_evidence": ["缺少消费者真实使用反馈"],
+            },
+        )
+
+    assert assessment.status_code == 200
+    assert reviewed.status_code == 200
+    assert supplemented.status_code == 200
+    successor = supplemented.json()["candidate"]
+    assert successor["id"] != candidate_id
+    assert successor["evidence_bundle_id"] != original_bundle_id
+    assert supplemented.json()["redirect_url"] == f"/workbench/items/{successor['id']}"
+    assert db.one("SELECT status FROM research_candidates WHERE id=?", (candidate_id,))[
+        "status"
+    ] == "superseded"
+    stored_review = json.loads(
+        db.one(
+            "SELECT review_details_json FROM opportunity_assessments WHERE id=?",
+            (assessment.json()["id"],),
+        )["review_details_json"]
+    )
+    assert stored_review["superseded_by_candidate_id"] == successor["id"]
+    assert db.one("SELECT COUNT(*) n FROM evidence WHERE event_id=?", (event_id,))["n"] == 3
+    assert duplicate.status_code == 409
+
+
+def test_workbench_failed_generation_is_retryable_and_never_reviewable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "workbench-retry.db")
+    db.initialize()
+    _event_id, evidence_ids, candidate_id = make_research_chain(db)
+
+    class RetryProvider:
+        calls = 0
+
+        def __init__(self, _api_key, model, **_kwargs):
+            self.model = model
+
+        async def assess(self, _event, _bundle, _candidate, _evidence):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return SimpleNamespace(
+                    draft=OpportunityAssessmentDraft(
+                        assessment_status="abstained",
+                        evidence_ids=evidence_ids,
+                        abstention_reason="provider unavailable",
+                    ),
+                    engine="cloud-opportunity-assessment-failed",
+                    model=self.model,
+                    version="cloud-assessment-v2",
+                    generation_status="failed",
+                )
+            return SimpleNamespace(
+                draft=OpportunityAssessmentDraft(
+                    assessment_status="insufficient_evidence",
+                    change_type="空间约束变化",
+                    consumer_relevance="可能影响普通住户。",
+                    durability="持续性仍需核实。",
+                    lead_time_fit="暂不判断。",
+                    target_users=["小空间住户"],
+                    new_scenarios=["动态调整空间"],
+                    consumer_change_judgment={
+                        "status": "related", "rationale": "有事实支持", "evidence_ids": evidence_ids,
+                    },
+                    problem_judgment={
+                        "status": "needs_evidence", "rationale": "缺少用户反馈", "evidence_ids": evidence_ids,
+                    },
+                    research_recommendation={
+                        "status": "defer", "rationale": "先补证", "evidence_ids": evidence_ids,
+                    },
+                    fact_claims=[{"claim": "变化已发生。", "evidence_ids": evidence_ids}],
+                    evidence_ids=evidence_ids,
+                    missing_evidence=["消费者反馈"],
+                    abstention_reason="证据不足，暂缓判断。",
+                ),
+                engine="cloud-opportunity-assessment",
+                model=self.model,
+                version="cloud-assessment-v2",
+                generation_status="completed",
+            )
+
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(main_app, "CloudOpportunityAssessmentProvider", RetryProvider)
+    monkeypatch.setattr(
+        main_app,
+        "settings",
+        replace(main_app.settings, openai_api_key="test-key", openai_model="test-model"),
+    )
+    with TestClient(main_app.app) as client:
+        failed = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/ai-draft"
+        )
+        rejected_review = client.post(
+            f"/api/opportunity-assessments/{failed.json()['id']}/review",
+            json={"review_status": "rejected"},
+        )
+        retried = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/ai-draft"
+        )
+
+    assert failed.status_code == 200
+    assert failed.json()["generation_status"] == "failed"
+    assert failed.json()["review_status"] == "superseded"
+    assert rejected_review.status_code == 409
+    assert retried.status_code == 200
+    assert retried.json()["generation_status"] == "completed"
+    assert retried.json()["review_status"] == "pending"
+    assert db.one("SELECT COUNT(*) n FROM opportunity_assessments")["n"] == 2
+
+
+def test_research_workbench_blocks_ai_when_bundle_is_not_ready_and_hides_old_nav(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = Database(tmp_path / "workbench-insufficient.db")
+    db.initialize()
+    _event_id, _evidence_ids, candidate_id = make_research_chain(db, ready=False)
+    monkeypatch.setattr(main_app, "db", db)
+    monkeypatch.setattr(
+        main_app, "settings", replace(main_app.settings, openai_api_key="test-key")
+    )
+    with TestClient(main_app.app) as client:
+        page = client.get("/workbench")
+        detail = client.get(f"/workbench/items/{candidate_id}")
+        generated = client.post(
+            f"/api/workbench/research-candidates/{candidate_id}/ai-draft"
+        )
+        legacy = client.get("/research")
+
+    assert page.status_code == 200
+    assert "判断任务" in page.text and "判断记录" in page.text
+    assert ">商品方向<" not in page.text
+    assert ">市场验证<" not in page.text
+    assert ">已验证选品<" not in page.text
+    assert "关键证据尚未就绪" in page.text
+    assert "先补齐关键证据" in detail.text
+    assert generated.status_code == 409
+    assert db.one("SELECT COUNT(*) n FROM research_runs")["n"] == 0
+    assert db.one("SELECT COUNT(*) n FROM opportunity_assessments")["n"] == 0
+    assert legacy.status_code == 200

@@ -302,14 +302,21 @@ CREATE TABLE IF NOT EXISTS opportunity_assessments (
   lead_time_fit TEXT NOT NULL DEFAULT '',
   target_users_json TEXT NOT NULL DEFAULT '[]',
   new_scenarios_json TEXT NOT NULL DEFAULT '[]',
+  existing_solutions_json TEXT NOT NULL DEFAULT '[]',
+  solution_gaps_json TEXT NOT NULL DEFAULT '[]',
   unmet_needs_json TEXT NOT NULL DEFAULT '[]',
   related_product_categories_json TEXT NOT NULL DEFAULT '[]',
+  consumer_change_judgment_json TEXT NOT NULL DEFAULT '{}',
+  problem_judgment_json TEXT NOT NULL DEFAULT '{}',
+  research_recommendation_json TEXT NOT NULL DEFAULT '{}',
   fact_claims_json TEXT NOT NULL DEFAULT '[]',
   inferences_json TEXT NOT NULL DEFAULT '[]',
   evidence_ids_json TEXT NOT NULL DEFAULT '[]',
   missing_evidence_json TEXT NOT NULL DEFAULT '[]',
   abstention_reason TEXT NOT NULL DEFAULT '',
+  generation_status TEXT NOT NULL DEFAULT 'completed',
   review_status TEXT NOT NULL DEFAULT 'pending',
+  review_details_json TEXT NOT NULL DEFAULT '{}',
   engine TEXT NOT NULL,
   model TEXT NOT NULL DEFAULT '',
   version TEXT NOT NULL,
@@ -540,6 +547,28 @@ CREATE TABLE IF NOT EXISTS job_leases (
 """
 
 
+class TransactionDatabase:
+    """Small Database-compatible view bound to one SQLite transaction."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    @staticmethod
+    def json(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        cursor = self.conn.execute(sql, params)
+        return int(cursor.lastrowid or 0)
+
+    def one(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        row = self.conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def all(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -565,6 +594,19 @@ class Database:
             self._migrate_evidence_metadata(conn)
             self._ensure_column(conn, "analyses", "status", "TEXT NOT NULL DEFAULT 'succeeded'")
             self._ensure_column(conn, "analyses", "error", "TEXT")
+            assessment_columns = {
+                "existing_solutions_json": "TEXT NOT NULL DEFAULT '[]'",
+                "solution_gaps_json": "TEXT NOT NULL DEFAULT '[]'",
+                "consumer_change_judgment_json": "TEXT NOT NULL DEFAULT '{}'",
+                "problem_judgment_json": "TEXT NOT NULL DEFAULT '{}'",
+                "research_recommendation_json": "TEXT NOT NULL DEFAULT '{}'",
+                "generation_status": "TEXT NOT NULL DEFAULT 'completed'",
+                "review_details_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, definition in assessment_columns.items():
+                self._ensure_column(
+                    conn, "opportunity_assessments", column, definition
+                )
             self._ensure_column(
                 conn,
                 "opportunity_signals",
@@ -784,6 +826,12 @@ class Database:
             raise
         finally:
             conn.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[TransactionDatabase]:
+        with self._write_lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield TransactionDatabase(conn)
 
     def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         with self._write_lock, self.connect() as conn:

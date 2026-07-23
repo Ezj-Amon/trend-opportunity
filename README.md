@@ -1,8 +1,10 @@
-# 全球趋势驱动新品机会系统
+# 趋势机会判断训练器
 
-这是一个从国内外公开趋势中识别实体消费变化的个人研究项目。系统采集趋势信号、合并重复事件、执行规则初筛和有限证据采集，再把证据充分的事件交给结构化机会判断。
+> 项目状态：已于 2026-07-23 封存，不再继续开发。仓库保留为本次探索的最终实现与经验记录。
 
-第一阶段的核心闭环截止到：人工批准 OpportunityAssessment 后形成 OpportunitySignal。商品方向、Amazon 市场验证和已验证推荐属于后续验证链。
+这是一个帮助不具备专业选品经验的人，结构化完成趋势机会判断的个人研究项目。系统采集公开趋势、合并重复事件、执行规则初筛和有限证据采集，再由 AI 把证据整理成可核对的三级判断卡。
+
+当前用户侧闭环截止到“已审核判断卡”：确认事实是否准确、问题是否真实、持续性是否足够，然后选择继续研究、补充证据或放弃。系统不要求形成商品方向、Amazon 市场验证或推荐。
 
 ## 项目不是什么
 
@@ -28,40 +30,39 @@
 → 自动 Pipeline 结束
 ```
 
-后续由页面或显式 API 推进：
+后续由页面中的显式动作推进：
 
 ```text
 ResearchCandidate
 → ResearchRun
-→ OpportunityAssessment
-→ 人工审核
-→ OpportunitySignal
-→ ProductHypothesis
-→ MarketEvidence
-→ ValidatedRecommendation
+→ AI 三级 OpportunityAssessment 判断卡
+→ 人工确认事实、问题和持续性
+→ 继续研究 / 补充证据 / 放弃
+→ 已审核判断卡
 ```
 
-当前事件页面仍以人工填写 OpportunityAssessment 为主。页面的“完成机会判断”会建立 Human ResearchRun、保存人工 Assessment，并按人工选择完成审核。系统不会自动创建 OpportunitySignal。
+默认 UI 只有三个入口：`/` 发现趋势、`/workbench` 判断任务、`/workbench/processed` 判断记录。用户选择“继续研究”时，后端仍创建内部 `OpportunitySignal` 以兼容既有状态机，但默认 UI 不展示 Signal 或任何下游入口。旧下游页面和 API 暂时保留，只有直接 URL 可访问，便于回滚。
 
 ## 目标流程
 
-目标是在 EvidenceBundle 就绪后，由模型生成带证据引用的 OpportunityAssessment 草稿，再由人工独立审核；只有批准的 `worth_following` Assessment 才形成 OpportunitySignal。第一阶段以这个人工批准后的 Signal 为交付边界。
+在 EvidenceBundle 就绪后，模型生成带证据引用的 OpportunityAssessment v2 草稿，依次回答“是否为消费变化、是否产生新问题、是否值得继续研究”。人工只需核对三个明确问题并作出决定；已审核判断卡是当前用户侧交付物。
 
-商品方向和市场验证继续遵循独立证据链。没有合格事件、证据、判断或市场验证时，合法结果可以为空。
+没有合格事件、证据或判断时，合法结果可以为空。商品方向和市场验证代码仍作为兼容能力保留，但不属于当前产品流程。
 
 详细节点合同见 [业务流程合同](docs/workflow-contract.md)。
 
 ## 大模型使用边界
 
-`CloudOpportunityAssessmentProvider` 已存在，并通过 OpenAI Structured Outputs 基于既有 EvidenceBundle 生成结构化 Assessment。它不得补写无法访问的事实，不得自动批准 Assessment，不得直接生成 OpportunitySignal、ProductHypothesis 或推荐。
+`CloudOpportunityAssessmentProvider` 通过 OpenAI Structured Outputs 基于既有 EvidenceBundle 生成结构化 Assessment v2。它必须输出三级判断及依据，区分事实与推断，并明确现有解决方式、解决缺口和缺失证据；不得输出商品名、商品类目、平台查询词、价格或推荐。
 
-当前自动 Pipeline 不调用大模型，事件页面也尚未接入 Cloud Provider。云端 Assessment 目前只能通过显式 API 创建；没有云端模型时，人工流程仍可工作。可选 Embedding 只用于检索、类目联想和重复候选，不承担最终机会判断。
+当前自动 Pipeline 不调用大模型。判断任务通过显式按钮调用 Cloud Provider，并只保存待审核草稿；没有云端模型时页面会给出配置和重启指引。模型调用失败会保存技术审计并允许重试，不会伪装成一张可审核的“弃权判断卡”。
 
 ## 当前实现状态
 
-- 已实现：真实趋势采集、标题标准化、词面聚类、受保护的重复合并、趋势评分与 Top-N、规则初筛、有限公开证据采集、EvidenceBundle、ResearchCandidate、ResearchRun、人工/云端 Assessment Provider、引用校验、人工审核和 Signal 状态门。
-- 已实现后续能力：人工 ProductHypothesis、Seller Central CSV/人工 MarketEvidence、风险与经济性门、ValidatedRecommendation。
-- 尚未接入：事件页面上的云端 Assessment 草稿生成。
+- 已实现：真实趋势采集、标题标准化、词面聚类、受保护的重复合并、趋势评分与 Top-N、规则初筛、有限公开证据采集、EvidenceBundle、ResearchCandidate 和 ResearchRun。
+- 已实现：OpportunityAssessment v2 三级判断、引用校验、技术失败重试、结构化人工审核、判断记录和内部 Signal 兼容门。
+- 已实现：人工补证后原子创建新 Evidence、不可变 Bundle 和继任 Candidate；旧判断与决定不可改写。
+- 默认隐藏：ProductHypothesis、Seller Central CSV/人工 MarketEvidence、ValidatedRecommendation 及其他下游页面入口。
 - 尚未实现：完整自主 Research Agent、浏览器证据执行器和独立 Agent worker。
 - 当前冻结：自动语义合并、浏览器登录态、旧 Analyzer/固定商品模板，以及任何自动生成 Signal、商品或推荐的路径。
 - 兼容保留：旧 `analyses`、`product_opportunities`、`market_validations` 及部分旧 API；它们不是新主链的生产者。
@@ -73,10 +74,21 @@ ResearchCandidate
 ```powershell
 uv sync --extra dev
 uv run python -m app.cli run
-uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-访问 <http://127.0.0.1:8000>。配置示例见 `.env.example`；应用不会自动加载 `.env`。
+访问 <http://127.0.0.1:8000>，从“发现趋势”开始；判断任务位于 <http://127.0.0.1:8000/workbench>。配置示例见 `.env.example`；应用不会自动加载 `.env`。
+
+`app.cli run` 只启动 Web 服务，不会立即执行采集。需要手工采集时，可在首页点击“运行真实采集”，或显式执行：
+
+```powershell
+uv run python -m app.cli collect
+```
+
+也可以不经过 CLI，直接启动同一个 Web 应用：
+
+```powershell
+uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
 核心测试：
 

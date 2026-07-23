@@ -1,48 +1,27 @@
-# 当前开发交接
 
-更新时间：2026-07-22
+# 开发交接
 
-当前工作分支：`docs/workflow-governance`
+> 最终状态：项目已于 2026-07-23 封存。本文件仅保留最终实现、已知限制和未来新仓库可参考的经验，不再安排本仓库后续任务。
 
-当前 main 基线：`3cd94b3`（本轮开始时与 `origin/main` 一致）
+## 当前定位
 
-本文件只记录当前开发状态和下一项任务。业务流程以 [docs/workflow-contract.md](docs/workflow-contract.md) 为准，技术结构以 [docs/architecture.md](docs/architecture.md) 为准。
+产品已收缩为“趋势机会判断训练器”。默认用户流程为：发现趋势 → 证据就绪 → AI 三级判断卡 → 人工继续研究、补证或放弃 → 判断记录。用户侧终点是已审核判断卡，不进入商品构思、Seller Central、市场验证或推荐。
 
-## 当前真实实现
+## 本轮完成
 
-- 自动 Pipeline 已实现趋势采集、标题标准化、词面聚类、受保护重复合并、趋势评分、国内/海外 Top-N、规则初筛、有限公开证据采集、EvidenceBundle 和 ResearchCandidate。
-- 自动 Pipeline 在 ResearchCandidate 处结束，不自动启动 ResearchRun，不调用大模型，也不创建 Assessment、Signal、商品方向或推荐。
-- EvidenceBundle ready 的硬门槛是至少两个独立有效来源，并且至少一篇完整正文或官方公告；质量分只作诊断，不依赖 `EVIDENCE_READY_SCORE`。
-- ResearchRun、受控研究工具、HumanAssessmentProvider、CloudOpportunityAssessmentProvider、引用校验、人工审核和 OpportunitySignal 状态门均已实现。
-- 当前事件页面仍以人工填写 OpportunityAssessment 为主。人工快捷接口会建立 Human ResearchRun、保存 Assessment，并按人工选择完成审核。
-- ProductHypothesis、Seller Central CSV/人工 MarketEvidence、风险和经济性门、ValidatedRecommendation 已有独立新链。
-- 旧 `analyses`、`product_opportunities`、`market_validations` 和部分兼容 API仍保留，但不是当前自动 Pipeline 的下游生产者。
-- 自动语义合并、浏览器登录态、旧 Analyzer/固定商品模板和自动创建 Signal/商品/推荐均保持冻结。
+- 后端（主 agent）：OpportunityAssessment v2 三级枚举与总体状态一致性、Evidence ID 校验、商品内容拒绝、技术失败审计与安全重试。
+- 后端（主 agent）：事实/问题/持续性三项人工确认、动作约束、审核详情持久化，以及继续研究时内部 Signal 兼容写入。
+- 后端（主 agent）：工作台补证事务，原子保存人工 Evidence、重建不可变 Bundle、创建继任 Candidate，并保留旧版本。
+- UI（独立 agent）：品牌与三入口导航、发现趋势、判断队列、四步详情、三级判断卡、证据跳转、确认/补证/放弃交互、移动端与键盘可访问性测试。
+- 默认 UI 已移除全部商品方向、Signal、市场验证、推荐和语义复核入口；相关旧路由/API 仍可通过直接 URL 回滚。
+- README、业务流程合同、技术架构和研究 Skill 已同步到当前边界。
 
-## 当前缺口
+## 已知缺口
 
-- CloudOpportunityAssessmentProvider 尚未接入事件页面；当前只能通过显式 API 创建云端 Assessment 草稿。
-- 页面主路径尚未清晰分离“AI 生成草稿”和“人工独立审核”。
-- 尚未实现完整自主 Research Agent、独立 Agent worker、自动 Candidate 调度或浏览器证据执行器。
-- 写 API仍是本机/可信内网级保护，没有正式身份、角色和公网限流。
-- 新 Signal 仍受旧 `opportunity_signals.analysis_id` 非空外键约束，批准 Assessment 时需要写一条兼容 `analyses` 记录。
-- 旧链表和 API 的正式退役需要独立迁移任务，不应夹带在小功能中完成。
+- 当前本机未配置 `OPENAI_API_KEY`，因此尚未执行真实云端模型端到端样本；无模型时 UI 会明确提示配置并要求重启。
+- 当前未实现每日硬配额、完整自主 Research Agent 或浏览器证据执行器；仍使用现有 Top-N 和显式 AI 按钮。
+- 旧下游后端与页面代码尚未删除，只从默认体验隐藏，后续如需彻底退役应单独做数据迁移和 API 清理。
 
-## 本轮文档整理
+## 若在新仓库重新开始
 
-- 重写 `README.md`，只保留项目入口、真实/目标流程概览、模型边界、状态、启动和导航。
-- 新增根目录 `AGENTS.md`，规定文档职责、权威顺序和变更纪律。
-- 新增 `docs/workflow-contract.md`，作为业务节点、停止条件和 AI 边界的唯一真相来源。
-- 将产品边界与架构内容收敛为 `docs/architecture.md`，作为技术结构的唯一真相来源。
-- 将旧 Research 架构、实施计划和海外来源调研移入 `docs/archive/`，并标记为 Historical / Archived。
-- 保留并核对 `docs/amazon-first-party-validation.md`。
-- 保留 Research Skill，只修正 EvidenceBundle 门槛、模型权限和自主 Agent 状态。
-- 删除旧 HANDOFF 中容易失效的数据库数量、测试数量、历史工作树和未合并状态。
-
-## 下一项开发任务
-
-下一项开发任务是：将 `CloudOpportunityAssessmentProvider` 接入事件页面。
-
-该任务应让用户对满足前置条件的 ResearchCandidate 显式生成 AI OpportunityAssessment 草稿，展示调用中、成功、弃权和失败状态，再由人工独立批准、驳回或要求更多证据。不得让模型自动批准、直接创建 OpportunitySignal 或生成商品。
-
-完整自主 Research Agent 尚未实现，不属于上述页面接入已经具备的能力。
+先用 1–3 条手工准备的证据跑通最短闭环，再接真实 OpenAI 模型验证 Structured Outputs、引用约束、技术失败重试和人工补证重判。不要在这个验证完成前扩展数据源或加入商品、市场验证等下游流程。

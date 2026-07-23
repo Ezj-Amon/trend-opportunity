@@ -49,7 +49,7 @@ from .evidence_collectors import (
     decode_evidence,
     persist_collected_evidence,
 )
-from .evidence_types import ManualEvidenceInput
+from .evidence_types import EvidenceType, ManualEvidenceInput
 from .event_research import (
     EVIDENCE_TYPE_LABELS,
     build_event_research_view,
@@ -72,6 +72,7 @@ from .opportunity_assessment import (
     CloudOpportunityAssessmentProvider,
     HumanAssessmentProvider,
     OpportunityAssessmentDraft,
+    OpportunityAssessmentResult,
     decode_opportunity_assessment,
     persist_opportunity_assessment,
     validate_assessment_evidence,
@@ -103,6 +104,7 @@ from .research import (
 )
 from .research_candidates import (
     RESEARCH_CANDIDATE_STATUSES,
+    ResearchCandidateDraft,
     candidate_from_event,
     decode_research_candidate,
     persist_research_candidate,
@@ -196,7 +198,21 @@ class ResearchCandidateStatusInput(BaseModel):
 
 class AssessmentReviewInput(BaseModel):
     review_status: str = Field(min_length=1, max_length=64)
+    fact_check: str = Field(default="", max_length=32)
+    problem_check: str = Field(default="", max_length=32)
+    durability_check: str = Field(default="", max_length=32)
+    reason_code: str = Field(default="", max_length=64)
+    selected_missing_evidence: list[str] = Field(default_factory=list, max_length=30)
     note: str = Field(default="", max_length=2000)
+
+
+class WorkbenchEvidenceInput(BaseModel):
+    source_name: str = Field(min_length=1, max_length=200)
+    url: str = Field(min_length=1, max_length=2000)
+    title: str = Field(min_length=1, max_length=1000)
+    excerpt: str = Field(min_length=1, max_length=50_000)
+    is_consumer_voice: bool = False
+    addressed_missing_evidence: list[str] = Field(default_factory=list, max_length=30)
 
 
 class CloudAssessmentInput(BaseModel):
@@ -783,13 +799,12 @@ async def dashboard(request: Request, market: str = "ALL"):
     params = () if market == "ALL" else (market,)
     events = deduplicate_events(db.all(
         f"""SELECT e.*,
-        (SELECT COUNT(*) FROM opportunity_signals s
-         WHERE s.event_id=e.id AND s.review_status!='superseded') signal_count,
+        (SELECT id FROM research_candidates c
+         WHERE c.event_id=e.id AND c.status!='superseded'
+         ORDER BY c.id DESC LIMIT 1) latest_candidate_id,
         (SELECT status FROM research_candidates c
          WHERE c.event_id=e.id AND c.status!='superseded'
-         ORDER BY c.id DESC LIMIT 1) latest_research_status,
-        (SELECT MAX(product_opportunity_score) FROM opportunity_signals s
-         WHERE s.event_id=e.id AND s.review_status!='superseded') best_signal_score
+         ORDER BY c.id DESC LIMIT 1) latest_research_status
         FROM trend_events e {where}
         ORDER BY e.trend_score DESC, e.last_seen_at DESC LIMIT 800""",
         params,
@@ -806,20 +821,18 @@ async def dashboard(request: Request, market: str = "ALL"):
         *sorted({"CN", "GLOBAL", *settings.google_trends_geos, *market_counts}),
     )
     runs = db.all("SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 10")
-    journey_counts = {
-        "research": int(
+    discovery_counts = {
+        "needs_evidence": int(
             db.one(
-                "SELECT COUNT(*) count FROM research_candidates WHERE status!='superseded'"
+                """SELECT COUNT(*) count FROM research_candidates
+                WHERE status='insufficient_evidence'"""
             )["count"]
         ),
-        "signals": int(
+        "needs_judgment": int(
             db.one(
-                """SELECT COUNT(*) count FROM opportunity_signals
-                WHERE review_status NOT IN ('superseded','rejected')"""
+                """SELECT COUNT(*) count FROM research_candidates
+                WHERE status NOT IN ('completed','superseded')"""
             )["count"]
-        ),
-        "recommendations": int(
-            db.one("SELECT COUNT(*) count FROM validated_recommendations")["count"]
         ),
     }
     source_health = db.all(
@@ -827,12 +840,6 @@ async def dashboard(request: Request, market: str = "ALL"):
         JOIN (SELECT source, MAX(id) id FROM source_snapshots GROUP BY source) latest
         ON latest.id=s.id ORDER BY s.source"""
     )
-    digest = build_daily_digest(db)
-    if market == "CN":
-        digest["overseas_top3"] = []
-    elif market != "ALL":
-        digest["cn_top3"] = []
-        digest["overseas_top3"] = top_trend_signals(db, market)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -845,8 +852,7 @@ async def dashboard(request: Request, market: str = "ALL"):
             "selected_market": market,
             "market_counts": market_counts,
             "market_options": market_options,
-            "digest": digest,
-            "journey_counts": journey_counts,
+            "counts": discovery_counts,
         },
     )
 
@@ -1146,7 +1152,7 @@ async def api_event_evidence_bundles(event_id: int):
 
 
 def research_candidate_rows(status: str | None = None, limit: int = 500) -> list[dict]:
-    clause = ""
+    clause = "WHERE c.status!='superseded'"
     params: list[Any] = []
     if status:
         clause = "WHERE c.status=?"
@@ -1154,7 +1160,8 @@ def research_candidate_rows(status: str | None = None, limit: int = 500) -> list
     params.append(limit)
     rows = db.all(
         f"""SELECT c.*,e.canonical_title event_title,e.market,e.trend_score,
-        b.readiness_status,b.readiness_score
+        b.readiness_status,b.readiness_score,b.full_text_count,
+        b.independent_source_count
         FROM research_candidates c
         JOIN trend_events e ON e.id=c.event_id
         JOIN evidence_bundles b ON b.id=c.evidence_bundle_id
@@ -1174,13 +1181,238 @@ def research_candidate_rows(status: str | None = None, limit: int = 500) -> list
         item["latest_run"] = decode_research_run(run) if run else None
         assessment = db.one(
             """SELECT * FROM opportunity_assessments
-            WHERE candidate_id=? ORDER BY id DESC LIMIT 1""",
+            WHERE candidate_id=?
+            ORDER BY id DESC LIMIT 1""",
             (item["id"],),
         )
         item["latest_assessment"] = (
             decode_opportunity_assessment(assessment) if assessment else None
         )
     return decoded
+
+
+def _decorate_workbench_candidate(item: dict) -> dict:
+    value = dict(item)
+    assessment = value.get("latest_assessment")
+    review_status = str((assessment or {}).get("review_status") or "")
+    assessment_status = str((assessment or {}).get("assessment_status") or "")
+    generation_status = str((assessment or {}).get("generation_status") or "completed")
+    if generation_status == "failed":
+        code = "ai_failed"
+        label = "AI 判断卡生成失败"
+        action = "重新生成判断卡"
+    elif review_status == "pending":
+        code = "awaiting_review"
+        label = "AI 判断卡等待确认"
+        action = "确认判断卡"
+    elif review_status == "approved":
+        code = "approved"
+        label = "已决定继续研究"
+        action = "查看判断记录"
+    elif review_status == "rejected":
+        code = "rejected"
+        label = "已决定放弃"
+        action = "查看判断记录"
+    elif review_status == "needs_more_evidence":
+        code = "needs_more_evidence"
+        label = "需要更多证据"
+        action = "补充证据"
+    elif value.get("status") == "researching":
+        code = "researching"
+        label = "正在准备判断卡"
+        action = "查看当前状态"
+    elif value.get("readiness_status") == "ready_for_assessment":
+        code = "ready_for_ai"
+        label = "证据已就绪"
+        action = "生成 AI 判断卡"
+    elif value.get("status") == "failed":
+        code = "failed"
+        label = "研究记录失败"
+        action = "查看失败原因"
+    else:
+        code = "evidence_missing"
+        label = "关键证据尚未就绪"
+        action = "查看证据缺口"
+    value["workbench_state"] = code
+    value["workbench_state_label"] = label
+    value["primary_action_label"] = action
+    value["assessment_status"] = assessment_status
+    value["retryable"] = code == "ai_failed"
+    value["allowed_actions"] = {
+        "generate": code in {"ready_for_ai", "ai_failed"},
+        "review": code == "awaiting_review",
+        "supplement": code in {"needs_more_evidence", "evidence_missing"},
+    }
+    value["journey_step"] = (
+        4 if code in {"approved", "rejected"} else
+        3 if code in {"awaiting_review", "needs_more_evidence", "ai_failed"} else
+        2 if value.get("readiness_status") == "ready_for_assessment" else 1
+    )
+    return value
+
+
+def workbench_candidate_rows(*, processed: bool) -> list[dict]:
+    rows = [
+        _decorate_workbench_candidate(item)
+        for item in research_candidate_rows(limit=500)
+        if item["status"] != "superseded"
+    ]
+    if processed:
+        rows = [
+            item
+            for item in rows
+            if item["status"] == "completed"
+            and (item.get("latest_assessment") or {}).get("review_status")
+            in {"approved", "rejected"}
+        ]
+        return sorted(rows, key=lambda item: item["updated_at"], reverse=True)
+    rows = [item for item in rows if item["status"] != "completed"]
+    order = {
+        "awaiting_review": 0,
+        "ready_for_ai": 1,
+        "needs_more_evidence": 2,
+        "evidence_missing": 3,
+        "ai_failed": 4,
+        "researching": 5,
+        "failed": 6,
+    }
+    return sorted(
+        rows,
+        key=lambda item: (
+            order.get(item["workbench_state"], 99),
+            -float(item.get("priority") or 0),
+            -int(item["id"]),
+        ),
+    )
+
+
+def _workbench_item_or_404(candidate_id: int) -> dict:
+    candidate = _candidate_or_404(candidate_id)
+    event = _event_or_404(int(candidate["event_id"]))
+    bundle_row = db.one(
+        "SELECT * FROM evidence_bundles WHERE id=?",
+        (candidate["evidence_bundle_id"],),
+    )
+    if not bundle_row:
+        raise HTTPException(409, "candidate evidence bundle not found")
+    bundle = decode_evidence_bundle(bundle_row)
+    evidence = db.all(
+        "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+    )
+    run_row = db.one(
+        """SELECT * FROM research_runs
+        WHERE candidate_id=? ORDER BY started_at DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    assessment_row = db.one(
+        """SELECT * FROM opportunity_assessments
+        WHERE candidate_id=?
+        ORDER BY id DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    assessment = (
+        decode_opportunity_assessment(assessment_row) if assessment_row else None
+    )
+    assessment_history = [
+        decode_opportunity_assessment(row)
+        for row in db.all(
+            """SELECT a.* FROM opportunity_assessments a
+            JOIN research_candidates c ON c.id=a.candidate_id
+            WHERE c.event_id=? AND c.id<=?
+            ORDER BY c.id DESC,a.id DESC""",
+            (event["id"], candidate_id),
+        )
+    ]
+    signal = None
+    if assessment:
+        signal_row = db.one(
+            "SELECT * FROM opportunity_signals WHERE opportunity_assessment_id=?",
+            (assessment["id"],),
+        )
+        signal = decode_signal(signal_row) if signal_row else None
+    item = _decorate_workbench_candidate(
+        {
+            **candidate,
+            "event_title": event["canonical_title"],
+            "market": event["market"],
+            "trend_score": event["trend_score"],
+            "readiness_status": bundle["readiness_status"],
+            "readiness_score": bundle["readiness_score"],
+            "latest_run": decode_research_run(run_row) if run_row else None,
+            "latest_assessment": assessment,
+        }
+    )
+    evidence_by_id = {int(row["id"]): row for row in evidence}
+    cited_ids = {
+        int(value) for value in (assessment or {}).get("evidence_ids") or []
+    }
+    for judgment_name in (
+        "consumer_change_judgment",
+        "problem_judgment",
+        "research_recommendation",
+    ):
+        cited_ids.update(
+            int(value)
+            for value in ((assessment or {}).get(judgment_name) or {}).get(
+                "evidence_ids", []
+            )
+        )
+    display_evidence = select_key_evidence(evidence, limit=4)
+    displayed_ids = {int(row["id"]) for row in display_evidence}
+    display_evidence.extend(
+        evidence_by_id[evidence_id]
+        for evidence_id in sorted(cited_ids - displayed_ids)
+        if evidence_id in evidence_by_id
+    )
+    return {
+        "item": item,
+        "event": event,
+        "bundle": bundle,
+        "evidence": display_evidence,
+        "evidence_by_id": evidence_by_id,
+        "research_run": item["latest_run"],
+        "assessment": assessment,
+        "history": assessment_history,
+        "signal": signal,
+    }
+
+
+def _render_workbench_queue(request: Request, *, processed: bool):
+    items = workbench_candidate_rows(processed=processed)
+    return templates.TemplateResponse(
+        request,
+        "workbench_queue.html",
+        {
+            "items": items,
+            "processed": processed,
+            "ai_configured": bool(settings.openai_api_key),
+        },
+    )
+
+
+@app.get("/workbench", response_class=HTMLResponse)
+@app.get("/workbench/pending", response_class=HTMLResponse)
+async def workbench_pending_page(request: Request):
+    return _render_workbench_queue(request, processed=False)
+
+
+@app.get("/workbench/processed", response_class=HTMLResponse)
+async def workbench_processed_page(request: Request):
+    return _render_workbench_queue(request, processed=True)
+
+
+@app.get("/workbench/items/{candidate_id}", response_class=HTMLResponse)
+async def workbench_item_page(request: Request, candidate_id: int):
+    context = _workbench_item_or_404(candidate_id)
+    return templates.TemplateResponse(
+        request,
+        "workbench_item.html",
+        {
+            **context,
+            "ai_configured": bool(settings.openai_api_key),
+            "evidence_type_labels": EVIDENCE_TYPE_LABELS,
+        },
+    )
 
 
 @app.get("/research", response_class=HTMLResponse)
@@ -1490,7 +1722,19 @@ async def create_cloud_opportunity_assessment(
     if not settings.openai_api_key:
         raise HTTPException(409, "cloud opportunity assessment is not configured")
     candidate = _candidate_or_404(candidate_id)
-    _completed_candidate_run_or_409(candidate, value.research_run_id)
+    return await _persist_cloud_assessment(candidate, value.research_run_id)
+
+
+async def _persist_cloud_assessment(candidate: dict, research_run_id: str) -> dict:
+    pending = db.one(
+        """SELECT * FROM opportunity_assessments
+        WHERE candidate_id=? AND review_status='pending'
+        ORDER BY id DESC LIMIT 1""",
+        (candidate["id"],),
+    )
+    if pending:
+        return decode_opportunity_assessment(pending)
+    _completed_candidate_run_or_409(candidate, research_run_id)
     bundle = decode_evidence_bundle(
         db.one(
             "SELECT * FROM evidence_bundles WHERE id=?",
@@ -1506,15 +1750,204 @@ async def create_cloud_opportunity_assessment(
         settings.openai_model,
         base_url=settings.openai_base_url,
     )
+    if bundle["readiness_status"] != "ready_for_assessment":
+        raise HTTPException(409, "关键证据尚未就绪，不能生成 AI 判断卡")
     result = await provider.assess(event, bundle, candidate, evidence)
-    result.draft.research_run_id = value.research_run_id
+    result.draft.research_run_id = research_run_id
     try:
         validate_assessment_evidence(candidate, bundle, evidence, result.draft)
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        failed = OpportunityAssessmentResult(
+            draft=OpportunityAssessmentDraft(
+                assessment_status="abstained",
+                evidence_ids=list(bundle.get("evidence_ids") or []),
+                missing_evidence=list(bundle.get("missing_evidence") or []),
+                abstention_reason="模型返回的判断卡引用无法通过当前证据校验。",
+                research_run_id=research_run_id,
+            ),
+            engine="cloud-opportunity-assessment-failed",
+            model=settings.openai_model,
+            version="cloud-assessment-v2",
+            generation_status="failed",
+        )
+        persist_opportunity_assessment(db, candidate, bundle, failed)
+        raise HTTPException(400, "AI 判断卡引用无效，请重新生成") from exc
     assessment = persist_opportunity_assessment(db, candidate, bundle, result)
-    transition_research_candidate(db, candidate_id, "awaiting_review")
+    if getattr(result, "generation_status", "completed") == "completed":
+        transition_research_candidate(db, int(candidate["id"]), "awaiting_review")
     return assessment
+
+
+@app.post("/api/workbench/research-candidates/{candidate_id}/ai-draft")
+async def create_workbench_ai_draft(candidate_id: int):
+    """Create one reviewable cloud draft without approving it or creating a Signal."""
+    if not settings.openai_api_key:
+        raise HTTPException(409, "AI 机会判断尚未配置")
+    candidate = _candidate_or_404(candidate_id)
+    pending_row = db.one(
+        """SELECT * FROM opportunity_assessments
+        WHERE candidate_id=? AND review_status='pending'
+        ORDER BY id DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    if pending_row:
+        return decode_opportunity_assessment(pending_row)
+    bundle_row = db.one(
+        "SELECT * FROM evidence_bundles WHERE id=?",
+        (candidate["evidence_bundle_id"],),
+    )
+    if not bundle_row:
+        raise HTTPException(409, "待判断事件没有可用的 EvidenceBundle")
+    bundle = decode_evidence_bundle(bundle_row)
+    if bundle["readiness_status"] != "ready_for_assessment":
+        raise HTTPException(409, "关键证据尚未就绪，不能生成 AI 判断草稿")
+    if candidate["status"] in {"completed", "superseded", "awaiting_review"}:
+        raise HTTPException(409, "当前待判断事件不能生成新的 AI 草稿")
+
+    completed_run = db.one(
+        """SELECT * FROM research_runs
+        WHERE candidate_id=? AND status='completed'
+        ORDER BY started_at DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    if candidate["status"] != "evidence_ready" or completed_run is None:
+        try:
+            run = start_research_run(
+                db,
+                candidate,
+                ResearchRunInput(
+                    executor_type="human",
+                    executor_name="research-workbench-ai-draft",
+                    budget=ResearchBudget(
+                        max_search_queries=0,
+                        max_fetch_pages=0,
+                        max_browser_pages=0,
+                        timeout_seconds=settings.research_timeout_seconds,
+                        markets=[],
+                        languages=[],
+                    ),
+                ),
+            )
+            completed_run = complete_research_run(
+                db, run, ResearchRunCompleteInput(status="completed")
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    refreshed_candidate = _candidate_or_404(candidate_id)
+    return await _persist_cloud_assessment(refreshed_candidate, completed_run["id"])
+
+
+@app.post("/api/workbench/research-candidates/{candidate_id}/evidence")
+async def supplement_workbench_evidence(
+    candidate_id: int, value: WorkbenchEvidenceInput
+):
+    """Add evidence and create a versioned successor without rewriting history."""
+    candidate = _candidate_or_404(candidate_id)
+    if candidate["status"] in {"completed", "superseded"}:
+        raise HTTPException(409, "当前判断任务不能再补充证据")
+    latest_assessment = db.one(
+        """SELECT * FROM opportunity_assessments
+        WHERE candidate_id=? ORDER BY id DESC LIMIT 1""",
+        (candidate_id,),
+    )
+    if latest_assessment and latest_assessment["review_status"] not in {
+        "needs_more_evidence",
+        "superseded",
+    }:
+        raise HTTPException(409, "请先完成当前判断卡的人工决定")
+    if value.url and not await is_public_url(value.url):
+        raise HTTPException(400, "URL 必须是可公开访问的 HTTP(S) 地址")
+    event = _event_or_404(int(candidate["event_id"]))
+    manual = ManualEvidenceInput(
+        evidence_type=(
+            EvidenceType.CONSUMER_DISCUSSION
+            if value.is_consumer_voice
+            else EvidenceType.MANUAL_EVIDENCE
+        ),
+        source_name=value.source_name,
+        url=value.url,
+        title=value.title,
+        excerpt=value.excerpt,
+        is_consumer_voice=value.is_consumer_voice,
+        note=(
+            "用于验证：" + "；".join(value.addressed_missing_evidence)
+            if value.addressed_missing_evidence
+            else "工作台人工补证"
+        ),
+    )
+    collector = ManualEvidenceCollector([manual])
+    collected = await collector.collect(
+        event,
+        db.all("SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)),
+        ResearchBudget(
+            max_search_queries=0,
+            max_fetch_pages=0,
+            max_browser_pages=0,
+            timeout_seconds=settings.research_timeout_seconds,
+        ),
+    )
+    semantic_feature = db.one(
+        """SELECT * FROM semantic_event_features
+        WHERE event_id=? ORDER BY id DESC LIMIT 1""",
+        (event["id"],),
+    )
+    human_label = db.one(
+        "SELECT label FROM semantic_evaluation_labels WHERE event_id=?",
+        (event["id"],),
+    )
+    with db.transaction() as tx:
+        saved = persist_collected_evidence(
+            tx, int(event["id"]), collected[0], allow_upgrade=False
+        )
+        all_evidence = tx.all(
+            "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
+        )
+        bundle = persist_evidence_bundle(
+            tx,
+            build_evidence_bundle(
+                event,
+                all_evidence,
+                settings.evidence_bundle_version,
+                settings.evidence_ready_score,
+            ),
+        )
+        draft = candidate_from_event(
+            {**event, "human_label": (human_label or {}).get("label", "")},
+            bundle,
+            semantic_feature,
+            version=settings.research_candidate_version,
+        )
+        if draft is None:
+            draft = ResearchCandidateDraft(
+                event_id=int(event["id"]),
+                evidence_bundle_id=int(bundle["id"]),
+                semantic_feature_id=candidate.get("semantic_feature_id"),
+                candidate_reason=candidate["candidate_reason"],
+                category_candidates=candidate.get("category_candidates", []),
+                positive_similarity=candidate.get("positive_similarity"),
+                negative_similarity=candidate.get("negative_similarity"),
+                opportunity_delta=candidate.get("opportunity_delta"),
+                research_questions=candidate.get("research_questions", []),
+                missing_evidence=bundle["missing_evidence"],
+                priority=float(candidate.get("priority") or 0),
+                engine=candidate["engine"],
+                version=settings.research_candidate_version,
+            )
+        successor = persist_research_candidate(tx, draft)
+        if latest_assessment:
+            details = json.loads(latest_assessment.get("review_details_json") or "{}")
+            details["superseded_by_candidate_id"] = int(successor["id"])
+            tx.execute(
+                """UPDATE opportunity_assessments SET review_details_json=?,updated_at=?
+                WHERE id=?""",
+                (tx.json(details), utc_now(), latest_assessment["id"]),
+            )
+    return {
+        "evidence": saved,
+        "evidence_bundle": bundle,
+        "candidate": successor,
+        "redirect_url": f"/workbench/items/{successor['id']}",
+    }
 
 
 def _assessment_draft_from_row(assessment: dict) -> OpportunityAssessmentDraft:
@@ -1526,8 +1959,15 @@ def _assessment_draft_from_row(assessment: dict) -> OpportunityAssessmentDraft:
         lead_time_fit=assessment["lead_time_fit"],
         target_users=assessment["target_users"],
         new_scenarios=assessment["new_scenarios"],
+        existing_solutions=assessment.get("existing_solutions", []),
+        solution_gaps=assessment.get("solution_gaps", []),
         unmet_needs=assessment["unmet_needs"],
         related_product_categories=assessment["related_product_categories"],
+        consumer_change_judgment=(
+            assessment.get("consumer_change_judgment") or None
+        ),
+        problem_judgment=assessment.get("problem_judgment") or None,
+        research_recommendation=(assessment.get("research_recommendation") or None),
         fact_claims=assessment["fact_claims"],
         inferences=assessment["inferences"],
         evidence_ids=assessment["evidence_ids"],
@@ -1637,6 +2077,8 @@ async def review_opportunity_assessment(
     if not row:
         raise HTTPException(404, "opportunity assessment not found")
     assessment = decode_opportunity_assessment(row)
+    if assessment.get("generation_status") == "failed":
+        raise HTTPException(409, "AI 判断卡生成失败，请重新生成后再确认")
     if assessment["review_status"] == "superseded":
         raise HTTPException(409, "assessment has been superseded")
     if assessment["review_status"] != "pending":
@@ -1663,10 +2105,49 @@ async def review_opportunity_assessment(
     evidence = db.all(
         "SELECT * FROM evidence WHERE event_id=? ORDER BY id", (event["id"],)
     )
+    is_v2 = bool(
+        assessment.get("consumer_change_judgment")
+        and assessment.get("problem_judgment")
+        and assessment.get("research_recommendation")
+    )
+    review_details = {
+        "fact_check": value.fact_check,
+        "problem_check": value.problem_check,
+        "durability_check": value.durability_check,
+        "reason_code": value.reason_code,
+        "selected_missing_evidence": value.selected_missing_evidence,
+        "note": value.note.strip(),
+    }
+    if is_v2:
+        allowed_checks = {
+            "fact_check": {"accurate", "inaccurate", "uncertain"},
+            "problem_check": {"real", "doubtful", "uncertain"},
+            "durability_check": {"sufficient", "insufficient", "uncertain"},
+        }
+        for field, allowed in allowed_checks.items():
+            if getattr(value, field) not in allowed:
+                raise HTTPException(400, f"invalid {field}")
+        if value.review_status == "approved" and (
+            value.fact_check != "accurate"
+            or value.problem_check != "real"
+            or value.durability_check != "sufficient"
+        ):
+            raise HTTPException(409, "继续研究前必须逐项确认事实、问题和持续性")
+        if value.review_status == "needs_more_evidence" and not (
+            value.selected_missing_evidence or value.note.strip()
+        ):
+            raise HTTPException(400, "请选择需要补充的证据或填写说明")
+        if value.review_status == "rejected" and not value.reason_code:
+            raise HTTPException(400, "请选择放弃原因")
     signal = None
     if value.review_status == "approved":
         if assessment["assessment_status"] != "worth_following":
             raise HTTPException(409, "only worth-following assessments can be approved")
+        if is_v2 and (
+            assessment["research_recommendation"].get("status")
+            != "continue_research"
+        ):
+            raise HTTPException(409, "AI 未建议继续研究，请补证后重新判断或放弃")
         if bundle["readiness_status"] != "ready_for_assessment":
             raise HTTPException(409, "evidence bundle is not ready for approval")
         try:
@@ -1682,8 +2163,9 @@ async def review_opportunity_assessment(
         candidate_status = "completed"
     now = utc_now()
     db.execute(
-        "UPDATE opportunity_assessments SET review_status=?,updated_at=? WHERE id=?",
-        (value.review_status, now, assessment_id),
+        """UPDATE opportunity_assessments
+        SET review_status=?,review_details_json=?,updated_at=? WHERE id=?""",
+        (value.review_status, db.json(review_details), now, assessment_id),
     )
     reviewed_assessment = decode_opportunity_assessment(
         db.one("SELECT * FROM opportunity_assessments WHERE id=?", (assessment_id,))

@@ -8,12 +8,12 @@
 
 ## 全局原则
 
-- 趋势热度不等于消费需求，OpportunitySignal 也不等于商品或市场验证结论。
+- 趋势热度不等于消费需求，AI 判断草稿也不等于人工结论。
 - 系统不要求每天产出商品、机会线索或推荐。
 - 每个节点都允许停止；零 Candidate、零 Signal 和零推荐都是合法结果。
-- 第一阶段核心闭环截止到人工批准 OpportunityAssessment 后形成 OpportunitySignal。
+- 当前用户侧核心闭环截止到“已审核判断卡”；`OpportunitySignal` 只作为批准后的内部兼容对象，不是默认 UI 交付物。
 - 越接近推荐，证据门槛越高。不得用规则分、Embedding 相似度、模型置信度或商品假设分替代市场证据。
-- 大模型只能基于已保存的 EvidenceBundle 生成带引用的 OpportunityAssessment 草稿；不能自动批准、创建 Signal 或强制生成商品。
+- 大模型只能基于已保存的 EvidenceBundle 生成带引用的 OpportunityAssessment 草稿；不能自动批准、创建 Signal、输出商品名/类目/查询词/价格或强制生成推荐。
 
 ## Node 0：定时触发
 
@@ -25,7 +25,7 @@
 - **下一节点**：Node 1。
 - **停止条件**：已有运行、租约获取失败、配置或启动异常。
 - **是否调用大模型**：否。
-- **对应代码**：`app/main.py::scheduler_loop`、`POST /api/run`；`app/cli.py::run_pipeline`；`app/pipeline.py::Pipeline.run`。
+- **对应代码**：`app/main.py::scheduler_loop`、`POST /api/run`；`app/cli.py::collect_pipeline`（`app.cli collect`）；`app/pipeline.py::Pipeline.run`。`app.cli run` 只启动 Web 服务，不触发本节点。
 - **当前实现**：定时、CLI 和 Web API 入口均存在；调度器默认关闭。
 - **目标行为**：保持单实例租约、可观测进度和显式失败。
 - **当前差距**：没有独立任务队列或多节点调度；当前项目也不要求该能力。
@@ -125,7 +125,7 @@
 - **目的**：保存值得进一步判断的事件方向；Candidate 不是 OpportunitySignal，也不是商品结论。
 - **触发条件**：事件通过安全门，且 Bundle 至少为 `partial`；若语义特征 ready，证据不足时也可形成探索性 Candidate。
 - **输入**：TrendEvent、EvidenceBundle、可选语义特征和人工标签。
-- **处理**：生成研究原因、研究问题、缺失证据、可为空的类目联想和优先级；新 Bundle/版本可 supersede 未完成旧 Candidate。
+- **处理**：生成研究原因、研究问题、缺失证据和优先级；兼容类目字段可以为空且不得暴露到默认 UI；新 Bundle/版本可 supersede 未完成旧 Candidate。
 - **输出**：`research_candidates`，初始状态为 `pending`。
 - **下一节点**：当前自动 Pipeline 在此结束。后续显式启动 ResearchRun，补证或进入 Node 8。
 - **停止条件**：安全门阻断；无可用语义特征且 Bundle 为纯标题 `insufficient`；人工不继续；Candidate 被新版本替换。
@@ -135,37 +135,39 @@
 - **目标行为**：成为 AI 草稿或人工判断的受控入口，并完整保存证据版本。
 - **当前差距**：当前没有自动 Research Agent 调度；真实运行可能合法地产生零活跃 Candidate。
 
-## Node 8：AI OpportunityAssessment 草稿
+## Node 8：AI OpportunityAssessment v2 三级判断卡
 
-- **目的**：让模型只基于已保存 EvidenceBundle 生成结构化、带引用、可弃权的 OpportunityAssessment 草稿。
+- **目的**：让模型只基于已保存 EvidenceBundle 生成结构化、带引用、可弃权的三级判断草稿，降低非专业用户的判断难度。
 - **触发条件**：显式请求云端 Assessment；已配置 API Key；Candidate 有已完成 ResearchRun；Bundle ready；事件未命中商业研究安全门。
 - **输入**：事件摘要、Bundle 指标、Bundle 内 Evidence 摘录和证据 ID。
-- **处理**：调用 Structured Outputs；区分事实与推断；输出变化类型、消费关联、持续性、交付周期、用户、场景、需求、相关实体类目、缺失证据或弃权原因；校验所有引用属于当前 Event 和 Bundle。
-- **输出**：`review_status=pending` 的 `opportunity_assessments` 草稿。
+- **处理**：调用 Structured Outputs；区分事实与推断；固定输出消费变化 `related/unrelated/uncertain`、新问题 `clear/needs_evidence/none`、研究建议 `continue_research/defer/abandon`，并整理变化、单一主要用户、场景/约束、现有解决方式、解决缺口、未满足需求、持续性、交付周期和缺失证据。三级依据及事实/推断引用必须属于当前 Event 和 Bundle。
+- **输出**：`generation_status=completed` 且 `review_status=pending` 的 `opportunity_assessments` v2 草稿。总体状态只能按三级判断派生：`related + clear + continue_research` 为 `worth_following`；任一级不确定或需补证为 `insufficient_evidence`；不相关、无问题或放弃为 `abstained`。
 - **下一节点**：Node 9。
-- **停止条件**：Bundle 不 ready、敏感事件、未配置模型、调用失败、Schema 失败或引用非法；不得回退为本地商品模板。
+- **停止条件**：Bundle 不 ready、敏感事件、未配置模型、调用失败、Schema 失败、输出商品内容或引用非法；不得回退为本地商品模板。技术失败保存为不可审核的失败审计，可安全重试。
 - **是否调用大模型**：是，且这是当前业务代码中唯一云端大模型职责。
-- **对应代码**：`app/opportunity_assessment.py::CloudOpportunityAssessmentProvider`；`POST /api/research-candidates/{id}/assessments/cloud`。
-- **当前实现**：Provider、前置门、Schema、引用校验和 API 已实现。
-- **目标行为**：在事件页面提供明确的“生成 AI 草稿”入口，再交给人工独立审核。
-- **当前差距**：页面尚未接入 Cloud Provider；Pipeline 不调用它；当前页面仍以人工填写 Assessment 为主；没有完整自主 Agent，也没有真实模型灰度运行样本。
+- **对应代码**：`app/opportunity_assessment.py::CloudOpportunityAssessmentProvider`；`POST /api/research-candidates/{id}/assessments/cloud`；工作台薄编排 `POST /api/workbench/research-candidates/{id}/ai-draft`。
+- **当前实现**：Provider、v2 Schema、总体状态一致性、禁止商品输出、引用校验、失败审计和重试已实现；`/workbench` 对 ready Candidate 提供显式生成按钮，只保存待审核草稿。历史 v1 记录只读展示，不补造 v2 字段。
+- **目标行为**：保持 AI 草稿生成与人工审核分离，页面不得把草稿解释为最终结论。
+- **当前差距**：Pipeline 仍不调用模型；没有完整自主 Agent，也没有真实模型灰度运行样本。
 
-## Node 9：人工审核与 OpportunitySignal
+## Node 9：人工确认、补证与已审核判断卡
 
-- **目的**：由人确认 Assessment 是否值得跟进；只有批准后的判断才成为第一阶段核心产出。
-- **触发条件**：存在 pending OpportunityAssessment；或用户使用当前人工机会判断表单直接撰写 Assessment。
-- **输入**：Assessment、Candidate、EvidenceBundle、Evidence 引用和审核备注。
-- **处理**：复核 `worth_following`、证据 ready 和引用合法性；支持 `approved`、`rejected`、`needs_more_evidence`；审核决定不可改写。批准时映射结构化字段并保存完整审核快照。
-- **输出**：批准时创建唯一 `opportunity_signals`；其他决定只更新 Assessment/Candidate 状态。OpportunitySignal 的关键字段包括变化类型、用户、场景、未满足需求、相关类目、持续性、交付周期和证据 ID。
-- **下一节点**：批准后可进入 Node 10；需要更多证据时回到 Node 5/6；驳回则停止。
-- **停止条件**：Assessment 非 `worth_following`、Bundle 不 ready、引用无效、人工驳回或要求补证。系统不要求形成 Signal。
+- **目的**：让人只核对事实、问题和持续性，并保存继续研究、补证或放弃的不可改写决定。
+- **触发条件**：存在 `generation_status=completed`、`review_status=pending` 的 OpportunityAssessment v2。
+- **输入**：Assessment、Candidate、EvidenceBundle、Evidence 引用；三项人工确认；最终动作、原因代码、选中的缺失证据和备注。
+- **处理**：事实选择准确/不准确/不确定，问题选择真实/存疑/不确定，持续性选择足够/不足/不确定。只有 AI 建议 `continue_research` 且三项均为肯定时允许批准；AI 未建议继续时只能补证重判或放弃。审核决定不可改写。
+- **输出**：`approved`、`needs_more_evidence` 或 `rejected` 的已审核判断卡。批准时仍创建唯一内部 `opportunity_signals` 兼容对象，但默认 UI 不展示 Signal 或下游入口。
+- **下一节点**：补证时经工作台接口原子保存人工 Evidence、重建不可变 Bundle、创建继任 Candidate，并将旧 Candidate/Assessment 标记为已替代；新 Bundle ready 后回到 Node 8。批准或放弃后进入判断记录并停止用户流程。
+- **停止条件**：Assessment 技术失败、Bundle 不 ready、引用无效、人工放弃或要求补证。系统不要求形成 Signal。
 - **是否调用大模型**：审核本身否。
-- **对应代码**：`app/main.py::review_opportunity_assessment`、`_create_signal_from_assessment`；`POST /api/opportunity-assessments/{id}/review`。当前人工快捷流程为 `POST /api/research-candidates/{id}/opportunity-judgment`。
-- **当前实现**：独立审核 API和页面审核按钮已实现；事件页人工表单会在一次请求中建立 Human Run、人工 Assessment 并立即完成相应审核。
-- **目标行为**：AI 草稿和人工审核职责清晰分离；人工独立批准、驳回或要求更多证据后，系统再决定是否创建 Signal。
-- **当前差距**：页面主路径目前把“人工撰写”和“人工审核”合并，尚未形成 AI 草稿优先的两步交互。
+- **对应代码**：`app/main.py::review_opportunity_assessment`、`supplement_workbench_evidence`、`_create_signal_from_assessment`；`POST /api/opportunity-assessments/{id}/review`；`POST /api/workbench/research-candidates/{id}/evidence`。
+- **当前实现**：三级确认、动作约束、不可改写审核、补证版本链和内部 Signal 兼容门已实现。旧人工快捷 API 仍保留，但事件详情已移除旧完整 Assessment 表单和下游 CTA。
+- **目标行为**：已实现当前最小闭环；下一步只需用真实模型做灰度样本验证，不扩展下游产品流程。
+- **当前差距**：尚无真实模型端到端样本；当前不实现每日硬配额。
 
 ## Node 10：ProductHypothesis
+
+> 兼容边界：本节点不属于当前默认用户流程，默认导航与交叉链接已隐藏；旧路由/API 仅供直接 URL 回滚。
 
 - **目的**：把已确认消费变化转化为少量、可验证的实体商品方向；它仍不是推荐。
 - **触发条件**：Signal 来自 approved、`worth_following` Assessment；Candidate completed；Bundle ready；Signal 状态允许继续。
@@ -181,6 +183,8 @@
 - **当前差距**：没有商品方向生成模型；这不是第一阶段核心闭环的阻塞项。
 
 ## Node 11：市场验证与 ValidatedRecommendation
+
+> 兼容边界：本节点不属于当前默认用户流程，本轮无需上传 Seller Central CSV；旧路由/API 仅供直接 URL 回滚。
 
 - **目的**：用平台需求、竞争、单位经济、执行和证据完整度验证商品方向，并仅对完整结果形成推荐。
 - **触发条件**：ProductHypothesis 已审核为 `ready_for_validation`，目标站点和查询词满足要求。
